@@ -300,6 +300,38 @@ class ValidationConfig(ConfigBaseModel):
         "with the generated output. The reference comes from the input video, not from the model's output.",
     )
 
+    # Two-stage generation (optional, defaults to one-stage)
+    two_stage: bool = Field(
+        default=False,
+        description="Enable two-stage generation for higher quality validation samples. "
+        "Stage 1 generates at half resolution, then spatial upsampling + refinement in Stage 2.",
+    )
+
+    spatial_upsampler_path: str | None = Field(
+        default=None,
+        description="Path to spatial upsampler checkpoint (required if two_stage=True). "
+        "The upsampler scales latents from half to full resolution.",
+    )
+
+    distilled_lora_path: str | None = Field(
+        default=None,
+        description="Path to distilled LoRA checkpoint (required if two_stage=True). "
+        "The distilled LoRA is used for fast refinement in Stage 2.",
+    )
+
+    distilled_lora_strength: float = Field(
+        default=1.0,
+        description="Strength of distilled LoRA (0.0 to 1.0)",
+        ge=0.0,
+        le=1.0,
+    )
+
+    stage1_inference_steps: int = Field(
+        default=40,
+        description="Number of inference steps for Stage 1 (low-res generation with CFG)",
+        gt=0,
+    )
+
     @field_validator("images")
     @classmethod
     def validate_images(cls, v: list[str] | None, info: ValidationInfo) -> list[str] | None:
@@ -333,6 +365,23 @@ class ValidationConfig(ConfigBaseModel):
                 raise ValueError(f"Reference video path '{video_path}' does not exist")
 
         return v
+
+    @model_validator(mode="after")
+    def validate_two_stage_requirements(self) -> "ValidationConfig":
+        """Validate that upsampler and distilled LoRA are provided when two_stage=True."""
+        if self.two_stage:
+            if not self.spatial_upsampler_path:
+                raise ValueError("spatial_upsampler_path is required when two_stage=True")
+            if not self.distilled_lora_path:
+                raise ValueError("distilled_lora_path is required when two_stage=True")
+
+            # Validate that paths exist
+            if not Path(self.spatial_upsampler_path).exists():
+                raise ValueError(f"Spatial upsampler path '{self.spatial_upsampler_path}' does not exist")
+            if not Path(self.distilled_lora_path).exists():
+                raise ValueError(f"Distilled LoRA path '{self.distilled_lora_path}' does not exist")
+
+        return self
 
 
 class CheckpointsConfig(ConfigBaseModel):

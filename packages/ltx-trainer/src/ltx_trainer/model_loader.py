@@ -77,21 +77,28 @@ def load_video_vae_encoder(
     dtype: torch.dtype = torch.bfloat16,
 ) -> "VideoEncoder":
     """Load the video VAE encoder (for preprocessing).
+
+    Returns the encoder in eval mode (dropout disabled).
+
     Args:
         checkpoint_path: Path to the safetensors checkpoint file
         device: Device to load model on
         dtype: Data type for model weights
     Returns:
-        Loaded VideoEncoder
+        Loaded VideoEncoder in eval mode
     """
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
     from ltx_core.model.video_vae import VAE_ENCODER_COMFY_KEYS_FILTER, VideoEncoderConfigurator
 
-    return SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
-        model_class_configurator=VideoEncoderConfigurator,
-        model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
-    ).build(device=_to_torch_device(device), dtype=dtype)
+    return (
+        SingleGPUModelBuilder(
+            model_path=str(checkpoint_path),
+            model_class_configurator=VideoEncoderConfigurator,
+            model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
+        )
+        .build(device=_to_torch_device(device), dtype=dtype)
+        .eval()
+    )
 
 
 def load_video_vae_decoder(
@@ -100,21 +107,28 @@ def load_video_vae_decoder(
     dtype: torch.dtype = torch.bfloat16,
 ) -> "VideoDecoder":
     """Load the video VAE decoder (for inference/validation).
+
+    Returns the decoder in eval mode (dropout disabled).
+
     Args:
         checkpoint_path: Path to the safetensors checkpoint file
         device: Device to load model on
         dtype: Data type for model weights
     Returns:
-        Loaded VideoDecoder
+        Loaded VideoDecoder in eval mode
     """
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
     from ltx_core.model.video_vae import VAE_DECODER_COMFY_KEYS_FILTER, VideoDecoderConfigurator
 
-    return SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
-        model_class_configurator=VideoDecoderConfigurator,
-        model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER,
-    ).build(device=_to_torch_device(device), dtype=dtype)
+    return (
+        SingleGPUModelBuilder(
+            model_path=str(checkpoint_path),
+            model_class_configurator=VideoDecoderConfigurator,
+            model_sd_ops=VAE_DECODER_COMFY_KEYS_FILTER,
+        )
+        .build(device=_to_torch_device(device), dtype=dtype)
+        .eval()
+    )
 
 
 def load_audio_vae_encoder(
@@ -123,21 +137,28 @@ def load_audio_vae_encoder(
     dtype: torch.dtype = torch.bfloat16,
 ) -> "AudioEncoder":
     """Load the audio VAE encoder (for preprocessing).
+
+    Returns the encoder in eval mode (dropout disabled).
+
     Args:
         checkpoint_path: Path to the safetensors checkpoint file
         device: Device to load model on
         dtype: Data type for model weights (default bfloat16, but float32 recommended for quality)
     Returns:
-        Loaded AudioEncoder
+        Loaded AudioEncoder in eval mode
     """
     from ltx_core.loader import SingleGPUModelBuilder
     from ltx_core.model.audio_vae import AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER, AudioEncoderConfigurator
 
-    return SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
-        model_class_configurator=AudioEncoderConfigurator,
-        model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
-    ).build(device=_to_torch_device(device), dtype=dtype)
+    return (
+        SingleGPUModelBuilder(
+            model_path=str(checkpoint_path),
+            model_class_configurator=AudioEncoderConfigurator,
+            model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+        )
+        .build(device=_to_torch_device(device), dtype=dtype)
+        .eval()
+    )
 
 
 def load_audio_vae_decoder(
@@ -146,21 +167,28 @@ def load_audio_vae_decoder(
     dtype: torch.dtype = torch.bfloat16,
 ) -> "AudioDecoder":
     """Load the audio VAE decoder.
+
+    Returns the decoder in eval mode (dropout disabled).
+
     Args:
         checkpoint_path: Path to the safetensors checkpoint file
         device: Device to load model on
         dtype: Data type for model weights
     Returns:
-        Loaded AudioDecoder
+        Loaded AudioDecoder in eval mode
     """
     from ltx_core.loader import SingleGPUModelBuilder
     from ltx_core.model.audio_vae import AUDIO_VAE_DECODER_COMFY_KEYS_FILTER, AudioDecoderConfigurator
 
-    return SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
-        model_class_configurator=AudioDecoderConfigurator,
-        model_sd_ops=AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
-    ).build(device=_to_torch_device(device), dtype=dtype)
+    return (
+        SingleGPUModelBuilder(
+            model_path=str(checkpoint_path),
+            model_class_configurator=AudioDecoderConfigurator,
+            model_sd_ops=AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
+        )
+        .build(device=_to_torch_device(device), dtype=dtype)
+        .eval()
+    )
 
 
 def load_vocoder(
@@ -169,21 +197,58 @@ def load_vocoder(
     dtype: torch.dtype = torch.bfloat16,
 ) -> "Vocoder":
     """Load the vocoder (for audio waveform generation).
+
+    Returns the vocoder in eval mode (dropout disabled).
+
     Args:
         checkpoint_path: Path to the safetensors checkpoint file
         device: Device to load model on
         dtype: Data type for model weights
     Returns:
-        Loaded Vocoder
+        Loaded Vocoder in eval mode
     """
     from ltx_core.loader import SingleGPUModelBuilder
     from ltx_core.model.audio_vae import VOCODER_COMFY_KEYS_FILTER, VocoderConfigurator
 
-    return SingleGPUModelBuilder(
-        model_path=str(checkpoint_path),
-        model_class_configurator=VocoderConfigurator,
-        model_sd_ops=VOCODER_COMFY_KEYS_FILTER,
-    ).build(device=_to_torch_device(device), dtype=dtype)
+    return (
+        SingleGPUModelBuilder(
+            model_path=str(checkpoint_path),
+            model_class_configurator=VocoderConfigurator,
+            model_sd_ops=VOCODER_COMFY_KEYS_FILTER,
+        )
+        .build(device=_to_torch_device(device), dtype=dtype)
+        .eval()
+    )
+
+
+def load_spatial_upsampler(
+    checkpoint_path: str | Path,
+    device: Device = "cpu",
+    dtype: torch.dtype = torch.bfloat16,
+) -> "LatentUpsampler":
+    """Load the spatial upsampler for two-stage generation.
+
+    Returns the upsampler in eval mode (dropout disabled).
+
+    Args:
+        checkpoint_path: Path to the spatial upsampler checkpoint
+        device: Device to load model on
+        dtype: Data type for model weights
+    Returns:
+        Loaded LatentUpsampler in eval mode
+    """
+    from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder
+    from ltx_core.model.upsampler import LatentUpsamplerConfigurator
+
+    return (
+        SingleGPUModelBuilder(
+            model_path=str(checkpoint_path),
+            model_class_configurator=LatentUpsamplerConfigurator,
+            model_sd_ops=None,  # No key remapping needed for upsampler
+        )
+        .build(device=_to_torch_device(device), dtype=dtype)
+        .eval()
+    )
 
 
 def load_text_encoder(
@@ -249,6 +314,7 @@ class LtxModelComponents:
     vocoder: "Vocoder | None" = None
     text_encoder: "AVGemmaTextEncoderModel | None" = None
     scheduler: "LTX2Scheduler | None" = None
+    spatial_upsampler: "LatentUpsampler | None" = None
 
 
 def load_model(
@@ -261,6 +327,8 @@ def load_model(
     with_audio_vae_decoder: bool = True,
     with_vocoder: bool = True,
     with_text_encoder: bool = True,
+    with_spatial_upsampler: bool = False,
+    spatial_upsampler_path: str | Path | None = None,
 ) -> LtxModelComponents:
     """
     Load LTX-2 model components from a safetensors checkpoint.
@@ -272,6 +340,7 @@ def load_model(
     - load_audio_vae_decoder()
     - load_vocoder()
     - load_text_encoder()
+    - load_spatial_upsampler()
     Args:
         checkpoint_path: Path to the safetensors checkpoint file
         text_encoder_path: Path to Gemma model directory (required if with_text_encoder=True)
@@ -282,6 +351,8 @@ def load_model(
         with_audio_vae_decoder: Whether to load the audio VAE decoder
         with_vocoder: Whether to load the vocoder
         with_text_encoder: Whether to load the text encoder
+        with_spatial_upsampler: Whether to load the spatial upsampler (for two-stage generation)
+        spatial_upsampler_path: Path to spatial upsampler checkpoint (required if with_spatial_upsampler=True)
     Returns:
         LtxModelComponents containing all loaded model components
     """
@@ -333,6 +404,14 @@ def load_model(
         logger.debug("Loading Gemma text encoder...")
         text_encoder = load_text_encoder(checkpoint_path, text_encoder_path, torch_device, dtype)
 
+    # Load spatial upsampler
+    spatial_upsampler = None
+    if with_spatial_upsampler:
+        if spatial_upsampler_path is None:
+            raise ValueError("spatial_upsampler_path must be provided when with_spatial_upsampler=True")
+        logger.debug("Loading spatial upsampler...")
+        spatial_upsampler = load_spatial_upsampler(spatial_upsampler_path, torch_device, dtype)
+
     # Create scheduler (stateless, no loading needed)
     scheduler = LTX2Scheduler()
 
@@ -344,4 +423,5 @@ def load_model(
         vocoder=vocoder,
         text_encoder=text_encoder,
         scheduler=scheduler,
+        spatial_upsampler=spatial_upsampler,
     )

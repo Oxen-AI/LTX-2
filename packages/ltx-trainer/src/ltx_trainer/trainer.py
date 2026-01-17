@@ -2,7 +2,8 @@ import os
 import time
 import warnings
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol, runtime_checkable
+from contextlib import contextmanager
 
 import torch
 import wandb
@@ -63,6 +64,76 @@ StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[samp
 MEMORY_CHECK_INTERVAL = 200
 
 
+@runtime_checkable
+class TrainingCallback(Protocol):
+    """Protocol for training callbacks to enable custom integrations."""
+
+    def on_train_begin(self, trainer: "LtxvTrainer", config: "LtxTrainerConfig") -> None:
+        """Called at the start of training.
+
+        Args:
+            trainer: The trainer instance
+            config: The training configuration
+        """
+        ...
+
+    def on_step_end(
+        self,
+        step: int,
+        total_steps: int,
+        metrics: dict[str, float],
+        video_paths: list[Path]
+    ) -> None:
+        """Called after each training step.
+
+        Args:
+            step: Current training step
+            total_steps: Total number of training steps
+            metrics: Dictionary of training metrics (loss, lr, etc.)
+            video_paths: List of paths to validation videos (if any)
+        """
+        ...
+
+    def on_save(self, step: int, checkpoint_dir: Path) -> None:
+        """Called after a checkpoint is saved.
+
+        Args:
+            step: Current training step
+            checkpoint_dir: Path to the saved checkpoint directory
+        """
+        ...
+
+    def on_validation_begin(self, step: int) -> None:
+        """Called before validation sampling starts.
+
+        Args:
+            step: Current training step
+        """
+        ...
+
+    def on_validation_end(self, step: int, video_paths: list[Path]) -> None:
+        """Called after validation sampling completes.
+
+        Args:
+            step: Current training step
+            video_paths: List of paths to generated validation videos
+        """
+        ...
+
+    def on_train_end(self) -> None:
+        """Called at the end of training.
+        """
+        ...
+
+    def should_stop_training(self) -> bool:
+        """Check if training should be stopped early.
+
+        Returns:
+            True if training should stop, False otherwise
+        """
+        ...
+
+
 class TrainingStats(BaseModel):
     """Statistics collected during training"""
 
@@ -75,14 +146,15 @@ class TrainingStats(BaseModel):
 
 
 class LtxvTrainer:
-    def __init__(self, trainer_config: LtxTrainerConfig) -> None:
+    def __init__(self, trainer_config: LtxTrainerConfig, callbacks: list[TrainingCallback] | None = None) -> None:
         self._config = trainer_config
+        self._callbacks = callbacks or []
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
+        self._setup_accelerator()
         self._cached_validation_embeddings = self._load_text_encoder_and_cache_embeddings()
         self._load_models()
-        self._setup_accelerator()
         self._collect_trainable_params()
         self._load_checkpoint()
         self._prepare_models_for_training()
@@ -126,6 +198,10 @@ class LtxvTrainer:
 
         logger.info("🚀 Starting training...")
 
+        # Notify callbacks that training is starting
+        for callback in self._callbacks:
+            callback.on_train_begin(self, cfg)
+
         # Create progress tracking (disabled for non-main processes or when explicitly disabled)
         progress_enabled = IS_MAIN_PROCESS and not disable_progress_bars
         progress = TrainingProgress(
@@ -141,18 +217,34 @@ class LtxvTrainer:
 
         peak_mem_during_training = start_mem
 
+        saved_path = None
         sampled_videos_paths = None
 
         with progress:
             # Initial validation before training starts
             if cfg.validation.interval and not cfg.validation.skip_initial_validation:
+                for callback in self._callbacks:
+                    callback.on_validation_begin(self._global_step)
                 sampled_videos_paths = self._sample_videos(progress)
                 if IS_MAIN_PROCESS and sampled_videos_paths and self._config.wandb.log_validation_videos:
                     self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
+                for callback in self._callbacks:
+                    callback.on_validation_end(self._global_step, sampled_videos_paths or [])
 
             self._accelerator.wait_for_everyone()
 
             for step in range(cfg.optimization.steps * cfg.optimization.gradient_accumulation_steps):
+                # Check callbacks for stop signal
+                should_stop = False
+                for callback in self._callbacks:
+                    if callback.should_stop_training():
+                        logger.info(f"Training stopped by callback at step {self._global_step}")
+                        should_stop = True
+                        break
+
+                if should_stop:
+                    break
+
                 # Get next batch, reset the dataloader if needed
                 try:
                     batch = next(data_iter)
@@ -188,6 +280,8 @@ class LtxvTrainer:
                         and self._global_step % cfg.validation.interval == 0
                         and is_optimization_step
                     ):
+                        for callback in self._callbacks:
+                            callback.on_validation_begin(self._global_step)
                         if self._accelerator.distributed_type == DistributedType.FSDP:
                             # FSDP: All processes must participate in validation
                             sampled_videos_paths = self._sample_videos(progress)
@@ -198,23 +292,42 @@ class LtxvTrainer:
                             sampled_videos_paths = self._sample_videos(progress)
                             if sampled_videos_paths and self._config.wandb.log_validation_videos:
                                 self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
+                        for callback in self._callbacks:
+                            callback.on_validation_end(self._global_step, sampled_videos_paths or [])
 
                     # Save checkpoint if needed
                     if (
                         cfg.checkpoints.interval
-                        and self._global_step > 0
+                        # and self._global_step > 0
                         and self._global_step % cfg.checkpoints.interval == 0
                         and is_optimization_step
-                    ):
-                        self._save_checkpoint()
+                    ) or self._global_step == 1 and is_optimization_step:
+                        saved_path = self._save_checkpoint()
 
                     self._accelerator.wait_for_everyone()
+
+                    metrics = {
+                        "loss": loss.item(),
+                        "learning_rate": self._optimizer.param_groups[0]["lr"],
+                        "step": self._global_step,
+                    }
+
+                    # Notify callbacks of step completion
+                    for callback in self._callbacks:
+                        callback.on_step_end(
+                            self._global_step,
+                            cfg.optimization.steps,
+                            metrics,
+                            sampled_videos_paths or []
+                        )
 
                     # Call step callback if provided
                     if step_callback and is_optimization_step:
                         step_callback(self._global_step, cfg.optimization.steps, sampled_videos_paths)
 
                     self._accelerator.wait_for_everyone()
+
+                    sampled_videos_paths = None
 
                     # Update progress and log metrics
                     current_lr = self._optimizer.param_groups[0]["lr"]
@@ -303,6 +416,9 @@ class LtxvTrainer:
         self._accelerator.wait_for_everyone()
         self._accelerator.end_training()
 
+        for callback in self._callbacks:
+            callback.on_train_end()
+
         return saved_path, stats
 
     def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> Tensor:
@@ -348,7 +464,7 @@ class LtxvTrainer:
         self._text_encoder = load_text_encoder(
             checkpoint_path=self._config.model.model_path,
             gemma_model_path=self._config.model.text_encoder_path,
-            device="cuda",
+            device=self._accelerator.device,
             dtype=torch.bfloat16,
             load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
         )
@@ -397,7 +513,7 @@ class LtxvTrainer:
             checkpoint_path=self._config.model.model_path,
             device="cpu",
             dtype=torch.bfloat16,
-            with_video_vae_encoder=need_vae_encoder,  # Needed for image conditioning
+            with_video_vae_encoder=True, #need_vae_encoder,  # Needed for image conditioning
             with_video_vae_decoder=True,  # Needed for validation sampling
             with_audio_vae_decoder=load_audio,
             with_vocoder=load_audio,
@@ -414,6 +530,18 @@ class LtxvTrainer:
         self._audio_vae = components.audio_vae_decoder
         self._vocoder = components.vocoder
         # Note: self._text_encoder was set in _load_text_encoder_and_cache_embeddings
+
+        # Load spatial upsampler if two-stage validation is enabled
+        self._spatial_upsampler = None
+        if self._config.validation.two_stage:
+            logger.info("Loading spatial upsampler for two-stage validation...")
+            from ltx_trainer.model_loader import load_spatial_upsampler
+
+            self._spatial_upsampler = load_spatial_upsampler(
+                self._config.validation.spatial_upsampler_path,
+                device="cpu",  # Start on CPU, move to GPU during validation
+                dtype=torch.bfloat16,
+            )
 
         # Determine initial dtype based on training mode.
         # Note: For FSDP + LoRA, we'll cast to FP32 later in _prepare_models_for_training()
@@ -733,104 +861,150 @@ class LtxvTrainer:
         self._optimizer.zero_grad(set_to_none=True)
         free_gpu_memory()
 
-        # Start sampling progress tracking
-        sampling_ctx = progress.start_sampling(
-            num_prompts=len(self._config.validation.prompts),
-            num_steps=inference_steps,
-        )
+        # Set models to eval mode for validation (disables dropout, etc.)
+        # Save original training state to restore later
+        transformer_training = self._transformer.training
+        vae_decoder_training = self._vae_decoder.training if self._vae_decoder else None
+        vae_encoder_training = self._vae_encoder.training if self._vae_encoder else None
+        audio_vae_training = self._audio_vae.training if self._audio_vae else None
+        vocoder_training = self._vocoder.training if self._vocoder else None
+        upsampler_training = self._spatial_upsampler.training if self._spatial_upsampler else None
 
-        # Create validation sampler with loaded models and progress tracking
-        sampler = ValidationSampler(
-            transformer=self._transformer,
-            vae_decoder=self._vae_decoder,
-            vae_encoder=self._vae_encoder,
-            text_encoder=None,
-            audio_decoder=self._audio_vae if generate_audio else None,
-            vocoder=self._vocoder if generate_audio else None,
-            sampling_context=sampling_ctx,
-        )
+        self._transformer.eval()
+        if self._vae_decoder:
+            self._vae_decoder.eval()
+        if self._vae_encoder:
+            self._vae_encoder.eval()
+        if self._audio_vae:
+            self._audio_vae.eval()
+        if self._vocoder:
+            self._vocoder.eval()
+        if self._spatial_upsampler:
+            self._spatial_upsampler.eval()
 
-        output_dir = Path(self._config.output_dir) / "samples"
-        output_dir.mkdir(exist_ok=True, parents=True)
-
-        video_paths = []
-        width, height, num_frames = self._config.validation.video_dims
-
-        for prompt_idx, prompt in enumerate(self._config.validation.prompts):
-            # Update progress to show current video
-            sampling_ctx.start_video(prompt_idx)
-
-            # Load conditioning image if provided
-            condition_image = None
-            if use_images:
-                image_path = self._config.validation.images[prompt_idx]
-                image = open_image_as_srgb(image_path)
-                # Convert PIL image to tensor [C, H, W] in [0, 1]
-                condition_image = F.to_tensor(image)
-
-            # Load reference video if provided (for IC-LoRA)
-            reference_video = None
-            if use_reference_videos:
-                ref_video_path = self._config.validation.reference_videos[prompt_idx]
-                # read_video returns [F, C, H, W] in [0, 1]
-                reference_video, _ = read_video(ref_video_path, max_frames=num_frames)
-
-            # Get cached embeddings for this prompt if available
-            cached_embeddings = (
-                self._cached_validation_embeddings[prompt_idx]
-                if self._cached_validation_embeddings is not None
-                else None
+        try:
+            # Start sampling progress tracking
+            sampling_ctx = progress.start_sampling(
+                num_prompts=len(self._config.validation.prompts),
+                num_steps=inference_steps,
             )
 
-            # Create generation config
-            gen_config = GenerationConfig(
-                prompt=prompt,
-                negative_prompt=self._config.validation.negative_prompt,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=self._config.validation.frame_rate,
-                num_inference_steps=inference_steps,
-                guidance_scale=self._config.validation.guidance_scale,
-                seed=self._config.validation.seed,
-                condition_image=condition_image,
-                reference_video=reference_video,
-                generate_audio=generate_audio,
-                include_reference_in_output=self._config.validation.include_reference_in_output,
-                cached_embeddings=cached_embeddings,
-                stg_scale=self._config.validation.stg_scale,
-                stg_blocks=self._config.validation.stg_blocks,
-                stg_mode=self._config.validation.stg_mode,
+            # Create validation sampler with loaded models and progress tracking
+            sampler = ValidationSampler(
+                transformer=self._transformer,
+                vae_decoder=self._vae_decoder,
+                vae_encoder=self._vae_encoder,
+                text_encoder=None,
+                audio_decoder=self._audio_vae if generate_audio else None,
+                vocoder=self._vocoder if generate_audio else None,
+                spatial_upsampler=self._spatial_upsampler,
+                checkpoint_path=self._config.model.model_path,
+                sampling_context=sampling_ctx,
             )
 
-            # Generate sample
-            video, audio = sampler.generate(
-                config=gen_config,
-                device=self._accelerator.device,
-            )
+            # If two-stage validation, prepare distilled LoRA configuration
+            if self._config.validation.two_stage:
+                sampler.prepare_distilled_lora(
+                    lora_path=self._config.validation.distilled_lora_path,
+                    lora_strength=self._config.validation.distilled_lora_strength,
+                )
 
-            # Save output (image for single frame, video otherwise)
-            if IS_MAIN_PROCESS:
-                ext = "png" if num_frames == 1 else "mp4"
-                output_path = output_dir / f"step_{self._global_step:06d}_{prompt_idx + 1}.{ext}"
-                if num_frames == 1:
-                    save_image(video, output_path)
-                else:
-                    save_video(
-                        video_tensor=video,
-                        output_path=output_path,
-                        fps=self._config.validation.frame_rate,
-                        audio=audio,
-                        audio_sample_rate=self._vocoder.output_sample_rate if audio is not None else None,
-                    )
-                video_paths.append(output_path)
+            output_dir = Path(self._config.output_dir) / "samples"
+            output_dir.mkdir(exist_ok=True, parents=True)
 
-        # Clean up progress tasks
-        sampling_ctx.cleanup()
+            video_paths = []
+            width, height, num_frames = self._config.validation.video_dims
 
-        rel_outputs_path = output_dir.relative_to(self._config.output_dir)
-        logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
-        return video_paths
+            for prompt_idx, prompt in enumerate(self._config.validation.prompts):
+                # Update progress to show current video
+                sampling_ctx.start_video(prompt_idx)
+
+                # Load conditioning image if provided
+                condition_image = None
+                if use_images:
+                    image_path = self._config.validation.images[prompt_idx]
+                    image = open_image_as_srgb(image_path)
+                    # Convert PIL image to tensor [C, H, W] in [0, 1]
+                    condition_image = F.to_tensor(image)
+
+                # Load reference video if provided (for IC-LoRA)
+                reference_video = None
+                if use_reference_videos:
+                    ref_video_path = self._config.validation.reference_videos[prompt_idx]
+                    # read_video returns [F, C, H, W] in [0, 1]
+                    reference_video, _ = read_video(ref_video_path, max_frames=num_frames)
+
+                # Get cached embeddings for this prompt if available
+                cached_embeddings = (
+                    self._cached_validation_embeddings[prompt_idx]
+                    if self._cached_validation_embeddings is not None
+                    else None
+                )
+
+                # Create generation config
+                gen_config = GenerationConfig(
+                    prompt=prompt,
+                    negative_prompt=self._config.validation.negative_prompt,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    frame_rate=self._config.validation.frame_rate,
+                    num_inference_steps=inference_steps,
+                    guidance_scale=self._config.validation.guidance_scale,
+                    seed=self._config.validation.seed,
+                    condition_image=condition_image,
+                    reference_video=reference_video,
+                    generate_audio=generate_audio,
+                    include_reference_in_output=self._config.validation.include_reference_in_output,
+                    cached_embeddings=cached_embeddings,
+                    stg_scale=self._config.validation.stg_scale,
+                    stg_blocks=self._config.validation.stg_blocks,
+                    stg_mode=self._config.validation.stg_mode,
+                    tiled_decoding=False,
+                    two_stage=self._config.validation.two_stage,
+                )
+
+                # Generate sample
+                video, audio = sampler.generate(
+                    config=gen_config,
+                    device=self._accelerator.device,
+                )
+
+                # Save output (image for single frame, video otherwise)
+                if IS_MAIN_PROCESS:
+                    ext = "png" if num_frames == 1 else "mp4"
+                    output_path = output_dir / f"step_{self._global_step:06d}_{prompt_idx + 1}.{ext}"
+                    if num_frames == 1:
+                        save_image(video, output_path)
+                    else:
+                        save_video(
+                            video_tensor=video,
+                            output_path=output_path,
+                            fps=self._config.validation.frame_rate,
+                            audio=audio,
+                            audio_sample_rate=self._vocoder.output_sample_rate if audio is not None else None,
+                        )
+                    video_paths.append(output_path)
+
+            # Clean up progress tasks
+            sampling_ctx.cleanup()
+
+            rel_outputs_path = output_dir.relative_to(self._config.output_dir)
+            logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
+            return video_paths
+        finally:
+            # Restore original training state
+            self._transformer.train(transformer_training)
+            if self._vae_decoder:
+                self._vae_decoder.train(vae_decoder_training)
+            if self._vae_encoder:
+                self._vae_encoder.train(vae_encoder_training)
+            if self._audio_vae:
+                self._audio_vae.train(audio_vae_training)
+            if self._vocoder:
+                self._vocoder.train(vocoder_training)
+            if self._spatial_upsampler:
+                self._spatial_upsampler.train(upsampler_training)
 
     @staticmethod
     def _log_training_stats(stats: TrainingStats) -> None:
@@ -847,6 +1021,79 @@ class LtxvTrainer:
             stats_str += f" - Global batch size: {stats.global_batch_size}"
         logger.info(stats_str)
 
+    @contextmanager
+    def _offload_to_cpu(self):
+        """Offload models and optimizer states to CPU to maximize available GPU memory."""
+        # Log GPU memory before offloading to CPU
+        gpu_memory_gb = get_gpu_memory_gb(self._accelerator.device)
+        logger.info(f"GPU memory before offloading to CPU: {gpu_memory_gb:.2f} GB")
+
+        # Zero gradients and free memory
+        self._optimizer.zero_grad(set_to_none=True)
+
+        # Unwrap transformer from Accelerate for proper CPU offload
+        unwrapped_transformer = self._accelerator.unwrap_model(self._transformer)
+        transformer_device = next(unwrapped_transformer.parameters()).device
+        print(f"Transformer device before offload: {transformer_device}")
+
+        # Offload transformer
+        unwrapped_transformer.to("cpu")
+
+        print(f"Transformer device after offload: {next(unwrapped_transformer.parameters()).device}")
+
+        # Offload text encoder embedding connectors if present
+        text_encoder_state = {}
+        if self._text_encoder is not None:
+            if hasattr(self._text_encoder, 'video_connector') and self._text_encoder.video_connector is not None:
+                text_encoder_state['video_connector'] = self._text_encoder.video_connector.weight.device
+                self._text_encoder.video_connector.to("cpu")
+            if hasattr(self._text_encoder, 'audio_connector') and self._text_encoder.audio_connector is not None:
+                text_encoder_state['audio_connector'] = self._text_encoder.audio_connector.weight.device
+                self._text_encoder.audio_connector.to("cpu")
+
+        # Offload optimizer states (can be significant for Adam/AdamW)
+        optimizer_state_backup = []
+        for param_group in self._optimizer.param_groups:
+            for param in param_group['params']:
+                if param in self._optimizer.state:
+                    state = self._optimizer.state[param]
+                    state_device = {}
+                    for key, value in state.items():
+                        if isinstance(value, torch.Tensor):
+                            state_device[key] = value.device
+                            state[key] = value.cpu()
+                    optimizer_state_backup.append((param, state_device))
+
+        free_gpu_memory()
+
+        # Log GPU memory after offloading to CPU
+        gpu_memory_gb = get_gpu_memory_gb(self._accelerator.device)
+        logger.info(f"GPU memory after offloading to CPU: {gpu_memory_gb:.2f} GB")
+
+        # Detailed memory breakdown for debugging
+        if torch.cuda.is_available():
+            logger.info("\n" + torch.cuda.memory_summary(device=self._accelerator.device, abbreviated=True))
+
+        try:
+            yield
+        finally:
+            free_gpu_memory()
+
+            # Restore optimizer states
+            for param, state_devices in optimizer_state_backup:
+                state = self._optimizer.state[param]
+                for key, device in state_devices.items():
+                    state[key] = state[key].to(device)
+
+            # Restore text encoder connectors
+            if hasattr(self._text_encoder, 'video_connector') and 'video_connector' in text_encoder_state:
+                self._text_encoder.video_connector.to(text_encoder_state['video_connector'])
+            if hasattr(self._text_encoder, 'audio_connector') and 'audio_connector' in text_encoder_state:
+                self._text_encoder.audio_connector.to(text_encoder_state['audio_connector'])
+
+            # Restore transformer
+            unwrapped_transformer.to(transformer_device)
+
     def _save_checkpoint(self) -> Path | None:
         """Save the model weights."""
         is_lora = self._config.model.training_mode == "lora"
@@ -854,6 +1101,7 @@ class LtxvTrainer:
 
         # Prepare paths
         save_dir = Path(self._config.output_dir) / "checkpoints"
+
         prefix = "lora" if is_lora else "model"
         filename = f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
         saved_weights_path = save_dir / filename
@@ -887,6 +1135,11 @@ class LtxvTrainer:
 
             # Save to disk
             save_file(state_dict, saved_weights_path)
+
+            # Free state dict memory immediately after saving
+            del state_dict
+            del full_state_dict
+            free_gpu_memory()
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}
@@ -894,12 +1147,22 @@ class LtxvTrainer:
             # Save to disk
             self._accelerator.save(full_state_dict, saved_weights_path)
 
+            # Free state dict memory immediately after saving
+            del full_state_dict
+            free_gpu_memory()
+
         rel_path = saved_weights_path.relative_to(self._config.output_dir)
         logger.info(f"💾 {prefix.capitalize()} weights for step {self._global_step} saved in {rel_path}")
 
         # Keep track of checkpoint paths, and cleanup old checkpoints if needed
         self._checkpoint_paths.append(saved_weights_path)
         self._cleanup_checkpoints()
+
+        # Offload models to cpu so the on_save can run the pipeline on gpu
+        with self._offload_to_cpu():
+            for callback in self._callbacks:
+                callback.on_save(self._global_step, saved_weights_path)
+
         return saved_weights_path
 
     def _cleanup_checkpoints(self) -> None:
