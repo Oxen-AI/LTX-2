@@ -1,4 +1,5 @@
 import os
+import shutil
 import time
 import warnings
 from pathlib import Path
@@ -391,7 +392,7 @@ class LtxvTrainer:
             global_batch_size=cfg.optimization.batch_size * self._accelerator.num_processes,
         )
 
-        saved_path = self._save_checkpoint()
+        saved_path = self._save_checkpoint(is_final=True)
 
         if IS_MAIN_PROCESS:
             # Log the training statistics
@@ -1094,8 +1095,12 @@ class LtxvTrainer:
             # Restore transformer
             unwrapped_transformer.to(transformer_device)
 
-    def _save_checkpoint(self) -> Path | None:
-        """Save the model weights."""
+    def _save_checkpoint(self, is_final: bool = False) -> Path | None:
+        """Save the model weights.
+        
+        Args:
+            is_final: If True, also save a copy to {output_dir}/model.safetensors
+        """
         is_lora = self._config.model.training_mode == "lora"
         is_fsdp = self._accelerator.distributed_type == DistributedType.FSDP
 
@@ -1153,6 +1158,12 @@ class LtxvTrainer:
 
         rel_path = saved_weights_path.relative_to(self._config.output_dir)
         logger.info(f"💾 {prefix.capitalize()} weights for step {self._global_step} saved in {rel_path}")
+
+        # If this is the final checkpoint, also save to model.safetensors
+        if is_final:
+            final_model_path = Path(self._config.output_dir) / "model.safetensors"
+            shutil.copy2(saved_weights_path, final_model_path)
+            logger.info(f"💾 Final model saved to {final_model_path}")
 
         # Keep track of checkpoint paths, and cleanup old checkpoints if needed
         self._checkpoint_paths.append(saved_weights_path)
