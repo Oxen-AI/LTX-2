@@ -586,8 +586,8 @@ class LtxvTrainer:
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
-        self._trainable_vision_params = [p for p in self._transformer.named_parameters() if p.requires_grad and 'audio' not in p.name.lower()]
-        self._trainable_audio_params = [p for p in self._transformer.named_parameters() if p.requires_grad and 'audio' in p.name.lower()]
+        self._trainable_vision_params = [p for (name, p) in self._transformer.named_parameters() if p.requires_grad and 'audio' not in name.lower()]
+        self._trainable_audio_params = [p for (name, p) in self._transformer.named_parameters() if p.requires_grad and 'audio' in name.lower()]
         all_params = self._trainable_audio_params + self._trainable_vision_params
         logger.debug(f"Trainable params count: {sum(p.numel() for p in all_params):,} (audio params: {sum(p.numel() for p in self._trainable_audio_params):,})")
 
