@@ -178,6 +178,7 @@ class TrainingProgress:
         *,
         loss: float,
         lr: float,
+        audio_lr: float,
         step_time: float,
         advance: bool = True,
     ) -> None:
@@ -191,7 +192,7 @@ class TrainingProgress:
         if self._progress is None or self._train_task is None:
             return
 
-        info = f"Loss: {loss:.4f} | LR: {lr:.2e} | {step_time:.2f}s/step"
+        info = f"Loss: {loss:.4f} | LR: {lr:.2e} | Audio LR: {audio_lr:.2e} | {step_time:.2f}s/step"
         self._progress.update(
             self._train_task,
             advance=1 if advance else 0,
