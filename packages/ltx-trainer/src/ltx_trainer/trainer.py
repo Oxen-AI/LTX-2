@@ -264,7 +264,7 @@ class LtxvTrainer:
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
                         self._accelerator.clip_grad_norm_(
-                            self._trainable_params,
+                            self._trainable_vision_params + self._trainable_audio_params,
                             cfg.optimization.max_grad_norm,
                         )
 
@@ -310,6 +310,7 @@ class LtxvTrainer:
                     metrics = {
                         "loss": loss.item(),
                         "learning_rate": self._optimizer.param_groups[0]["lr"],
+                        "audio_learning_rate": self._optimizer.param_groups[1]["lr"],
                         "step": self._global_step,
                     }
 
@@ -332,11 +333,13 @@ class LtxvTrainer:
 
                     # Update progress and log metrics
                     current_lr = self._optimizer.param_groups[0]["lr"]
+                    current_audio_lr = self._optimizer.param_groups[1]["lr"]
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
 
                     progress.update_training(
                         loss=loss.item(),
                         lr=current_lr,
+                        audio_lr=current_audio_lr,
                         step_time=step_time,
                         advance=is_optimization_step,
                     )
@@ -347,6 +350,7 @@ class LtxvTrainer:
                             {
                                 "train/loss": loss.item(),
                                 "train/learning_rate": current_lr,
+                                "train/audio_learning_rate": current_audio_lr,
                                 "train/step_time": step_time,
                                 "train/global_step": self._global_step,
                             }
@@ -363,7 +367,7 @@ class LtxvTrainer:
                             total_time = "calculating..."
                         logger.info(
                             f"Step {self._global_step}/{cfg.optimization.steps} - "
-                            f"Loss: {loss.item():.4f}, LR: {current_lr:.2e}, "
+                            f"Loss: {loss.item():.4f}, LR: {current_lr:.2e}, Audio LR: {current_audio_lr:.2e}, "
                             f"Time/Step: {step_time:.2f}s, Total Time: {total_time}",
                         )
 
@@ -582,8 +586,10 @@ class LtxvTrainer:
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
-        self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
-        logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+        self._trainable_vision_params = [p for (name, p) in self._transformer.named_parameters() if p.requires_grad and 'audio' not in name.lower()]
+        self._trainable_audio_params = [p for (name, p) in self._transformer.named_parameters() if p.requires_grad and 'audio' in name.lower()]
+        all_params = self._trainable_audio_params + self._trainable_vision_params
+        logger.debug(f"Trainable params count: {sum(p.numel() for p in all_params):,} (audio params: {sum(p.numel() for p in self._trainable_audio_params):,})")
 
     def _init_timestep_sampler(self) -> None:
         """Initialize the timestep sampler based on the config."""
@@ -739,13 +745,20 @@ class LtxvTrainer:
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
+        audio_lr = opt_cfg.audio_learning_rate
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW(self._trainable_params, lr=lr)
+            optimizer = AdamW([{"params": self._trainable_vision_params,
+                                "lr": lr},
+                               {"params": self._trainable_audio_params,
+                                "lr": audio_lr}])
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
-            optimizer = AdamW8bit(self._trainable_params, lr=lr)
+            optimizer = AdamW8bit([{"params": self._trainable_vision_params,
+                                "lr": lr},
+                               {"params": self._trainable_audio_params,
+                                "lr": audio_lr}])
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 

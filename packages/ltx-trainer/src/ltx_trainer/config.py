@@ -102,6 +102,11 @@ class OptimizationConfig(ConfigBaseModel):
         description="Learning rate for optimization",
     )
 
+    audio_learning_rate: float = Field(
+        default=5e-4,
+        description="Learning rate for optimization (audio layers)",
+    )
+
     steps: int = Field(
         default=3000,
         description="Number of training steps",
