@@ -1117,12 +1117,12 @@ class LtxvTrainer:
         is_lora = self._config.model.training_mode == "lora"
         is_fsdp = self._accelerator.distributed_type == DistributedType.FSDP
 
-        # Prepare paths
-        save_dir = Path(self._config.output_dir) / "checkpoints"
+        # Prepare paths — save into checkpoints/step_{N}/ for consistency
+        step_dir = Path(self._config.output_dir) / "checkpoints" / f"step_{self._global_step}"
 
         prefix = "lora" if is_lora else "model"
         filename = f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
-        saved_weights_path = save_dir / filename
+        saved_weights_path = step_dir / filename
 
         # Get state dict (collective operation - all processes must participate)
         self._accelerator.wait_for_everyone()
@@ -1131,7 +1131,7 @@ class LtxvTrainer:
         if not IS_MAIN_PROCESS:
             return None
 
-        save_dir.mkdir(exist_ok=True, parents=True)
+        step_dir.mkdir(exist_ok=True, parents=True)
 
         # Determine save precision
         save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
@@ -1178,25 +1178,25 @@ class LtxvTrainer:
             shutil.copy2(saved_weights_path, final_model_path)
             logger.info(f"💾 Final model saved to {final_model_path}")
 
-        # Keep track of checkpoint paths, and cleanup old checkpoints if needed
-        self._checkpoint_paths.append(saved_weights_path)
+        # Keep track of checkpoint step directories, and cleanup old checkpoints if needed
+        self._checkpoint_paths.append(step_dir)
         self._cleanup_checkpoints()
 
         # Offload models to cpu so the on_save can run the pipeline on gpu
         with self._offload_to_cpu():
             for callback in self._callbacks:
-                callback.on_save(self._global_step, saved_weights_path)
+                callback.on_save(self._global_step, step_dir)
 
         return saved_weights_path
 
     def _cleanup_checkpoints(self) -> None:
-        """Clean up old checkpoints."""
+        """Clean up old checkpoint directories."""
         if 0 < self._config.checkpoints.keep_last_n < len(self._checkpoint_paths):
             checkpoints_to_remove = self._checkpoint_paths[: -self._config.checkpoints.keep_last_n]
             for old_checkpoint in checkpoints_to_remove:
                 if old_checkpoint.exists():
-                    old_checkpoint.unlink()
-                    logger.info(f"Removed old checkpoints: {old_checkpoint}")
+                    shutil.rmtree(old_checkpoint)
+                    logger.info(f"Removed old checkpoint: {old_checkpoint}")
             # Update the list to only contain kept checkpoints
             self._checkpoint_paths = self._checkpoint_paths[-self._config.checkpoints.keep_last_n :]
 
