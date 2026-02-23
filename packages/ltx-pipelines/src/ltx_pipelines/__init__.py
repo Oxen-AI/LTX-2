@@ -16,6 +16,7 @@ from ltx_pipelines.ic_lora import ICLoraPipeline
 from ltx_pipelines.keyframe_interpolation import KeyframeInterpolationPipeline
 from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
+from ltx_pipelines.ti2vid_two_stages_inference import TI2VidTwoStagesInferencePipeline
 
 __all__ = [
     "DistilledPipeline",
@@ -23,4 +24,5 @@ __all__ = [
     "KeyframeInterpolationPipeline",
     "TI2VidOneStagePipeline",
     "TI2VidTwoStagesPipeline",
+    "TI2VidTwoStagesInferencePipeline",
 ]
