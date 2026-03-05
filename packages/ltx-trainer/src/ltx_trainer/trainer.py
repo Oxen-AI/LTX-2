@@ -1079,15 +1079,15 @@ class LtxvTrainer:
 
         print(f"Transformer device after offload: {next(unwrapped_transformer.parameters()).device}")
 
-        # Offload text encoder embedding connectors if present
+        # Offload embeddings processor connectors if present
         text_encoder_state = {}
-        if self._text_encoder is not None:
-            if hasattr(self._text_encoder, 'video_connector') and self._text_encoder.video_connector is not None:
-                text_encoder_state['video_connector'] = self._text_encoder.video_connector.weight.device
-                self._text_encoder.video_connector.to("cpu")
-            if hasattr(self._text_encoder, 'audio_connector') and self._text_encoder.audio_connector is not None:
-                text_encoder_state['audio_connector'] = self._text_encoder.audio_connector.weight.device
-                self._text_encoder.audio_connector.to("cpu")
+        if self._embeddings_processor is not None:
+            if hasattr(self._embeddings_processor, 'video_connector') and self._embeddings_processor.video_connector is not None:
+                text_encoder_state['video_connector'] = self._embeddings_processor.video_connector.weight.device
+                self._embeddings_processor.video_connector.to("cpu")
+            if hasattr(self._embeddings_processor, 'audio_connector') and self._embeddings_processor.audio_connector is not None:
+                text_encoder_state['audio_connector'] = self._embeddings_processor.audio_connector.weight.device
+                self._embeddings_processor.audio_connector.to("cpu")
 
         # Offload optimizer states (can be significant for Adam/AdamW)
         optimizer_state_backup = []
@@ -1123,11 +1123,11 @@ class LtxvTrainer:
                 for key, device in state_devices.items():
                     state[key] = state[key].to(device)
 
-            # Restore text encoder connectors
-            if hasattr(self._text_encoder, 'video_connector') and 'video_connector' in text_encoder_state:
-                self._text_encoder.video_connector.to(text_encoder_state['video_connector'])
-            if hasattr(self._text_encoder, 'audio_connector') and 'audio_connector' in text_encoder_state:
-                self._text_encoder.audio_connector.to(text_encoder_state['audio_connector'])
+            # Restore embeddings processor connectors
+            if hasattr(self._embeddings_processor, 'video_connector') and 'video_connector' in text_encoder_state:
+                self._embeddings_processor.video_connector.to(text_encoder_state['video_connector'])
+            if hasattr(self._embeddings_processor, 'audio_connector') and 'audio_connector' in text_encoder_state:
+                self._embeddings_processor.audio_connector.to(text_encoder_state['audio_connector'])
 
             # Restore transformer
             unwrapped_transformer.to(transformer_device)
