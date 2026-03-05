@@ -19,7 +19,6 @@ from ltx_pipelines.keyframe_interpolation import KeyframeInterpolationPipeline
 from ltx_pipelines.retake import RetakePipeline
 from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
-from ltx_pipelines.ti2vid_two_stages_inference import TI2VidTwoStagesInferencePipeline
 
 __all__ = [
     "A2VidPipelineTwoStage",
@@ -29,5 +28,4 @@ __all__ = [
     "RetakePipeline",
     "TI2VidOneStagePipeline",
     "TI2VidTwoStagesPipeline",
-    "TI2VidTwoStagesInferencePipeline",
 ]
