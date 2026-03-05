@@ -1083,10 +1083,10 @@ class LtxvTrainer:
         text_encoder_state = {}
         if self._embeddings_processor is not None:
             if hasattr(self._embeddings_processor, 'video_connector') and self._embeddings_processor.video_connector is not None:
-                text_encoder_state['video_connector'] = self._embeddings_processor.video_connector.weight.device
+                text_encoder_state['video_connector'] = next(self._embeddings_processor.video_connector.parameters()).device
                 self._embeddings_processor.video_connector.to("cpu")
             if hasattr(self._embeddings_processor, 'audio_connector') and self._embeddings_processor.audio_connector is not None:
-                text_encoder_state['audio_connector'] = self._embeddings_processor.audio_connector.weight.device
+                text_encoder_state['audio_connector'] = next(self._embeddings_processor.audio_connector.parameters()).device
                 self._embeddings_processor.audio_connector.to("cpu")
 
         # Offload optimizer states (can be significant for Adam/AdamW)
