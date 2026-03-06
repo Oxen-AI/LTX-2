@@ -27,13 +27,17 @@ class SafetensorsStateDictLoader(StateDictLoader):
         device = device or torch.device("cpu")
         model_paths = path if isinstance(path, list) else [path]
         for shard_path in model_paths:
-            with safetensors.safe_open(shard_path, framework="pt", device=str(device)) as f:
+            # Always open with device="cpu" to avoid CUDA memory-mapping failures on
+            # network filesystems (NFS, etc.), which return errno 19 (ENXIO) when
+            # safetensors tries to mmap directly into CUDA device memory. Tensors are
+            # moved to the target device after loading.
+            with safetensors.safe_open(shard_path, framework="pt", device="cpu") as f:
                 safetensor_keys = f.keys()
                 for name in safetensor_keys:
                     expected_name = name if sd_ops is None else sd_ops.apply_to_key(name)
                     if expected_name is None:
                         continue
-                    value = f.get_tensor(name).to(device=device, non_blocking=True, copy=False)
+                    value = f.get_tensor(name).to(device=device, non_blocking=True)
                     key_value_pairs = ((expected_name, value),)
                     if sd_ops is not None:
                         key_value_pairs = sd_ops.apply_to_key_value(expected_name, value)
