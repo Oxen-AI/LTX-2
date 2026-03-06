@@ -1,6 +1,7 @@
 import json
 
 import safetensors
+import safetensors.torch
 import torch
 
 from ltx_core.loader.primitives import StateDict, StateDictLoader
@@ -27,24 +28,24 @@ class SafetensorsStateDictLoader(StateDictLoader):
         device = device or torch.device("cpu")
         model_paths = path if isinstance(path, list) else [path]
         for shard_path in model_paths:
-            # Always open with device="cpu" to avoid CUDA memory-mapping failures on
-            # network filesystems (NFS, etc.), which return errno 19 (ENXIO) when
-            # safetensors tries to mmap directly into CUDA device memory. Tensors are
-            # moved to the target device after loading.
-            with safetensors.safe_open(shard_path, framework="pt", device="cpu") as f:
-                safetensor_keys = f.keys()
-                for name in safetensor_keys:
-                    expected_name = name if sd_ops is None else sd_ops.apply_to_key(name)
-                    if expected_name is None:
-                        continue
-                    value = f.get_tensor(name).to(device=device, non_blocking=True)
-                    key_value_pairs = ((expected_name, value),)
-                    if sd_ops is not None:
-                        key_value_pairs = sd_ops.apply_to_key_value(expected_name, value)
-                    for key, value in key_value_pairs:
-                        size += value.nbytes
-                        dtype.add(value.dtype)
-                        sd[key] = value
+            # Read the file into memory before parsing instead of using
+            # safetensors.safe_open(), in order to avoid mmap failures on
+            # network-mounted filesystems (triggering os error 19).
+            with open(shard_path, "rb") as shard_file:
+                shard_content = shard_file.read()
+            shard_tensors = safetensors.torch.load(shard_content)
+            for name, value in shard_tensors.items():
+                expected_name = name if sd_ops is None else sd_ops.apply_to_key(name)
+                if expected_name is None:
+                    continue
+                value = value.to(device=device, non_blocking=True)
+                key_value_pairs = ((expected_name, value),)
+                if sd_ops is not None:
+                    key_value_pairs = sd_ops.apply_to_key_value(expected_name, value)
+                for key, value in key_value_pairs:
+                    size += value.nbytes
+                    dtype.add(value.dtype)
+                    sd[key] = value
 
         return StateDict(sd=sd, device=device, size=size, dtype=dtype)
 
