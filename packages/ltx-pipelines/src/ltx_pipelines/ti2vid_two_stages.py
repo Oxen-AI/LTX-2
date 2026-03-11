@@ -36,6 +36,8 @@ from ltx_pipelines.utils.constants import STAGE_2_DISTILLED_SIGMA_VALUES, detect
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 
+from time import time
+
 device = get_device()
 
 
@@ -97,11 +99,16 @@ class TI2VidTwoStagesPipeline:
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
+        print("Init...")
+        start_time = time()
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
         stepper = EulerDiffusionStep()
         dtype = torch.bfloat16
+        print(f"Init time: {time() - start_time:.3f}")
 
+        print("Encode prompts...")
+        start_time = time()
         ctx_p, ctx_n = encode_prompts(
             [prompt, negative_prompt],
             self.stage_1_model_ledger,
@@ -111,7 +118,10 @@ class TI2VidTwoStagesPipeline:
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
+        print(f"Encode time: {time() - start_time:.3f}")
 
+        print("Init video encoder...")
+        start_time = time()
         # Stage 1: encode image conditionings with the VAE encoder, then free it
         # before loading the transformer to reduce peak VRAM.
         stage_1_output_shape = VideoPixelShape(
@@ -122,6 +132,9 @@ class TI2VidTwoStagesPipeline:
             fps=frame_rate,
         )
         video_encoder = self.stage_1_model_ledger.video_encoder()
+        print(f"Init video encoder time: {time() - start_time:.3f}")
+        print("Stage 1 conditionings...")
+        start_time = time()
         stage_1_conditionings = combined_image_conditionings(
             images=images,
             height=stage_1_output_shape.height,
@@ -131,11 +144,18 @@ class TI2VidTwoStagesPipeline:
             device=self.device,
         )
         torch.cuda.synchronize()
+        print(f"Stage 1 conditionings time: {time() - start_time:.3f}")
+        print("Clean up memory...")
+        start_time = time()
         del video_encoder
         cleanup_memory()
+        print(f"Clean up memory time: {time() - start_time:.3f}")
 
+        print("Init transformer...")
+        start_time = time()
         transformer = self.stage_1_model_ledger.transformer()
         sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
+        print(f"Init transformer time: {time() - start_time:.3f}")
 
         def first_stage_denoising_loop(
             sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
@@ -160,6 +180,8 @@ class TI2VidTwoStagesPipeline:
                 ),
             )
 
+        print("Denoise...")
+        start_time = time()
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
             conditionings=stage_1_conditionings,
@@ -173,17 +195,26 @@ class TI2VidTwoStagesPipeline:
         )
 
         torch.cuda.synchronize()
+        print(f"Denoise time: {time() - start_time:.3f}")
+        print("Clean up memory...")
+        start_time = time()
         del transformer
         cleanup_memory()
+        print(f"Clear up memory time: {time() - start_time:.3f}")
 
+        print("Stage 2 load video encoder...")
+        start_time = time()
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
         video_encoder = self.stage_1_model_ledger.video_encoder()
+        print(f"Stage 2 load video encoder time: {time() - start_time:.3f}")
         upscaled_video_latent = upsample_video(
             latent=video_state.latent[:1],
             video_encoder=video_encoder,
             upsampler=self.stage_2_model_ledger.spatial_upsampler(),
         )
 
+        print("Stage 2 image conditionings...")
+        start_time = time()
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
         stage_2_conditionings = combined_image_conditionings(
             images=images,
@@ -196,9 +227,13 @@ class TI2VidTwoStagesPipeline:
         del video_encoder
         torch.cuda.synchronize()
         cleanup_memory()
+        print(f"Stage 2 image conditionings time: {time() - start_time:.3f}")
 
+        print("Init stage 2 transformer...")
+        start_time = time()
         transformer = self.stage_2_model_ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+        print(f"Init stage 2 transformer time: {time() - start_time:.3f}")
 
         def second_stage_denoising_loop(
             sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
@@ -215,6 +250,8 @@ class TI2VidTwoStagesPipeline:
                 ),
             )
 
+        print("Stage 2 Denoise")
+        start_time = time()
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_2_output_shape,
             conditionings=stage_2_conditionings,
@@ -231,15 +268,25 @@ class TI2VidTwoStagesPipeline:
         )
 
         torch.cuda.synchronize()
+        print(f"Stage 2 Denoise time: {time() - start_time:.3f}")
+        print("Stage 2 cleanup...")
+        start_time = time()
         del transformer
         cleanup_memory()
+        print(f"Stage 2 cleanup time: {time() - start_time:.3f}")
 
+        print("Decode video...")
+        start_time = time()
         decoded_video = vae_decode_video(
             video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
         )
+        print(f"Decode video time: {time() - start_time:.3f}")
+        print("Decode audio...")
+        start_time = time()
         decoded_audio = vae_decode_audio(
             audio_state.latent, self.stage_2_model_ledger.audio_decoder(), self.stage_2_model_ledger.vocoder()
         )
+        print(f"Decode audio time: {time() - start_time:.3f}")
         return decoded_video, decoded_audio
 
 
