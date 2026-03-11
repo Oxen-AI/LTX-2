@@ -1,6 +1,7 @@
 import json
 
 import safetensors
+import safetensors.torch
 import torch
 
 from ltx_core.loader.primitives import StateDict, StateDictLoader
@@ -27,20 +28,24 @@ class SafetensorsStateDictLoader(StateDictLoader):
         device = device or torch.device("cpu")
         model_paths = path if isinstance(path, list) else [path]
         for shard_path in model_paths:
-            with safetensors.safe_open(shard_path, framework="pt", device=str(device)) as f:
-                safetensor_keys = f.keys()
-                for name in safetensor_keys:
-                    expected_name = name if sd_ops is None else sd_ops.apply_to_key(name)
-                    if expected_name is None:
-                        continue
-                    value = f.get_tensor(name).to(device=device, non_blocking=True, copy=False)
-                    key_value_pairs = ((expected_name, value),)
-                    if sd_ops is not None:
-                        key_value_pairs = sd_ops.apply_to_key_value(expected_name, value)
-                    for key, value in key_value_pairs:
-                        size += value.nbytes
-                        dtype.add(value.dtype)
-                        sd[key] = value
+            # Read the file into memory before parsing instead of using
+            # safetensors.safe_open(), in order to avoid mmap failures on
+            # network-mounted filesystems (triggering os error 19).
+            with open(shard_path, "rb") as shard_file:
+                shard_content = shard_file.read()
+            shard_tensors = safetensors.torch.load(shard_content)
+            for name, value in shard_tensors.items():
+                expected_name = name if sd_ops is None else sd_ops.apply_to_key(name)
+                if expected_name is None:
+                    continue
+                value = value.to(device=device, non_blocking=True)
+                key_value_pairs = ((expected_name, value),)
+                if sd_ops is not None:
+                    key_value_pairs = sd_ops.apply_to_key_value(expected_name, value)
+                for key, value in key_value_pairs:
+                    size += value.nbytes
+                    dtype.add(value.dtype)
+                    sd[key] = value
 
         return StateDict(sd=sd, device=device, size=size, dtype=dtype)
 
@@ -57,7 +62,10 @@ class SafetensorsModelStateDictLoader(StateDictLoader):
 
     def metadata(self, path: str) -> dict:
         with safetensors.safe_open(path, framework="pt") as f:
-            return json.loads(f.metadata()["config"])
+            meta = f.metadata()
+            if meta is None or "config" not in meta:
+                return {}
+            return json.loads(meta["config"])
 
     def load(self, path: str | list[str], sd_ops: SDOps | None = None, device: torch.device | None = None) -> StateDict:
         return self.weight_loader.load(path, sd_ops, device)
