@@ -177,7 +177,7 @@ class LtxvTrainer:
         """
         device = self._accelerator.device
         cfg = self._config
-        start_mem = get_gpu_memory_gb(device)
+        start_mem = current_mem = get_gpu_memory_gb(device)
 
         train_start_time = time.time()
 
@@ -261,6 +261,11 @@ class LtxvTrainer:
                         self._global_step += 1
 
                     loss = self._training_step(batch)
+                    video_loss, audio_loss = loss if type(loss) is tuple else (loss, None)
+                    split_loss = isinstance(video_loss, Tensor) and isinstance(audio_loss, Tensor)
+                    if split_loss:
+                        loss = video_loss + audio_loss
+
                     self._accelerator.backward(loss)
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
@@ -313,7 +318,12 @@ class LtxvTrainer:
                         "learning_rate": self._optimizer.param_groups[0]["lr"],
                         "audio_learning_rate": self._optimizer.param_groups[1]["lr"],
                         "step": self._global_step,
+                        "current_mem_gb": current_mem,
                     }
+                    if split_loss:
+                        metrics["video_loss"] = video_loss.item()
+                        metrics["audio_loss"] = audio_loss.item()
+                        video_loss = audio_loss = None
 
                     # Notify callbacks of step completion
                     for callback in self._callbacks:
@@ -427,7 +437,7 @@ class LtxvTrainer:
 
         return saved_path, stats
 
-    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> Tensor:
+    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> Tensor | tuple[Tensor, Tensor | None]:
         """Perform a single training step using the configured strategy."""
         # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
@@ -1134,7 +1144,7 @@ class LtxvTrainer:
 
     def _save_checkpoint(self, is_final: bool = False) -> Path | None:
         """Save the model weights.
-        
+
         Args:
             is_final: If True, also save a copy to {output_dir}/model.safetensors
         """
