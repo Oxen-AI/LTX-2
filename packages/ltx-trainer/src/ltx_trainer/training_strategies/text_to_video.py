@@ -272,7 +272,7 @@ class TextToVideoStrategy(TrainingStrategy):
         video_pred: Tensor,
         audio_pred: Tensor | None,
         inputs: ModelInputs,
-    ) -> Tensor:
+    ) -> Tensor | tuple[Tensor, Tensor|None]:
         """Compute masked MSE loss for video and optionally audio."""
         # Video loss
         video_loss = (video_pred - inputs.video_targets).pow(2)
@@ -282,10 +282,13 @@ class TextToVideoStrategy(TrainingStrategy):
 
         # If no audio, return video loss only
         if not self.config.with_audio or audio_pred is None or inputs.audio_targets is None:
-            return video_loss
+            return video_loss if not self.config.separate_audio_loss else (video_loss, None)
 
         # Audio loss (no conditioning mask)
         audio_loss = (audio_pred - inputs.audio_targets).pow(2).mean()
 
         # Combined loss
-        return video_loss + audio_loss
+        if self.config.separate_audio_loss:
+            return (video_loss, audio_loss)
+        else:
+            return video_loss + audio_loss

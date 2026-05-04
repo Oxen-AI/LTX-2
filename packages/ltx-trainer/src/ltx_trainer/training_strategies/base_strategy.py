@@ -39,6 +39,11 @@ class TrainingStrategyConfigBase(BaseModel):
         description="Unique name identifying the training strategy type"
     )
 
+    separate_audio_loss: bool = Field(
+        default=False,
+        description="Whether strategy.compute_loss should return video and audio losses as a tuple"
+    )
+
 
 @dataclass
 class ModelInputs:
@@ -118,14 +123,14 @@ class TrainingStrategy(ABC):
         video_pred: Tensor,
         audio_pred: Tensor | None,
         inputs: ModelInputs,
-    ) -> Tensor:
+    ) -> Tensor | tuple[Tensor, Tensor|None]:
         """Compute the training loss.
         Args:
             video_pred: Video prediction from the transformer model
             audio_pred: Audio prediction from the transformer model (None for video-only)
             inputs: The prepared model inputs containing targets and masks
         Returns:
-            Scalar loss tensor
+            Scalar loss tensor, or (video_loss, audio_loss) tuple (if config.separate_audio_loss)
         """
 
     def get_checkpoint_metadata(self) -> dict[str, Any]:

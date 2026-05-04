@@ -239,7 +239,7 @@ class VideoToVideoStrategy(TrainingStrategy):
         video_pred: Tensor,
         _audio_pred: Tensor | None,
         inputs: ModelInputs,
-    ) -> Tensor:
+    ) -> Tensor | tuple[Tensor, Tensor|None]:
         """Compute masked loss only on target portion."""
         # Extract target portion of prediction
         ref_seq_len = inputs.ref_seq_len
