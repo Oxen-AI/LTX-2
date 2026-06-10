@@ -150,6 +150,7 @@ class LtxvTrainer:
         self._dataset = None
         self._global_step = -1
         self._checkpoint_paths: list[Path] = []
+        self._last_saved_step: int | None = None
         self._training_state_paths: list[Path] = []
         self._training_state_size_warned = False
         self._wandb_run = None
@@ -1218,6 +1219,17 @@ class LtxvTrainer:
 
     def _save_checkpoint(self) -> Path | None:
         """Save the model weights."""
+        # The final save after the training loop runs unconditionally. If the last step
+        # already saved (it landed on the checkpoint interval), repeating the save would
+        # redo the state-dict gather, rewrite the same file, and append a duplicate path
+        # to _checkpoint_paths, where _cleanup_checkpoints could unlink the file it then
+        # keeps. Return the existing checkpoint instead. The check reads only the
+        # globally-consistent step counters, so every rank returns here together and
+        # none enters the collective ops below.
+        if self._last_saved_step == self._global_step:
+            return self._checkpoint_paths[-1] if self._checkpoint_paths else None
+        self._last_saved_step = self._global_step
+
         is_lora = self._config.model.training_mode == "lora"
         is_fsdp = self._accelerator.distributed_type == DistributedType.FSDP
 
