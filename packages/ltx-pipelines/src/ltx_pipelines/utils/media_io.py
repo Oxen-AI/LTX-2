@@ -10,7 +10,6 @@ from queue import Queue
 
 import av
 import numpy as np
-import OpenImageIO
 import torch
 from einops import rearrange
 from PIL import Image
@@ -691,6 +690,10 @@ def save_exr_tensor(tensor: torch.Tensor, file_path: str | Path, half: bool = Fa
         file_path: Output path (e.g. ``frame_0000.exr``).
         half: Force float16 output with ZIP compression.
     """
+    # Imported here so the module works without OpenImageIO, whose wheels require
+    # numpy>=2; only EXR export needs it.
+    import OpenImageIO
+
     if tensor.dim() == 3 and tensor.shape[0] == 3:
         tensor = tensor.permute(1, 2, 0)
     use_half = half or tensor.dtype in (torch.float16, torch.half)
