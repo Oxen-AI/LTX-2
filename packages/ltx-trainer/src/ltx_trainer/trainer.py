@@ -66,7 +66,8 @@ if not IS_MAIN_PROCESS:
 
     disable_progress_bar()
 
-StepCallback = Callable[[int, int, list[Path] | None], None]  # (step, total, sampled paths or None) -> None
+# (step, total, sampled paths or None) -> truthy to stop training after this step
+StepCallback = Callable[[int, int, list[Path] | None], bool | None]
 
 MEMORY_CHECK_INTERVAL = 200
 
@@ -245,8 +246,11 @@ class LtxvTrainer:
                     self._accelerator.wait_for_everyone()
 
                     # Call step callback if provided
+                    stop_requested = False
                     if step_callback and is_optimization_step:
-                        step_callback(self._global_step, cfg.optimization.steps, sampled_videos_paths)
+                        stop_requested = bool(
+                            step_callback(self._global_step, cfg.optimization.steps, sampled_videos_paths)
+                        )
 
                     self._accelerator.wait_for_everyone()
 
@@ -294,6 +298,10 @@ class LtxvTrainer:
                     if step % MEMORY_CHECK_INTERVAL == 0:
                         current_mem = get_gpu_memory_gb(device)
                         peak_mem_during_training = max(peak_mem_during_training, current_mem)
+
+                if stop_requested:
+                    logger.info(f"🛑 Step callback requested stop at step {self._global_step}")
+                    break
 
         # Collect final stats
         train_end_time = time.time()
