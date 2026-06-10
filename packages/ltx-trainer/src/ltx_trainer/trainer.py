@@ -1,16 +1,19 @@
+import contextlib
+import math
 import os
-import shutil
+import re
 import time
 import warnings
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol, runtime_checkable
-from contextlib import contextmanager
+from typing import Any, Callable
 
 import torch
 import wandb
 import yaml
-from accelerate import Accelerator, DistributedType
-from accelerate.utils import set_seed
+from accelerate import Accelerator, DistributedDataParallelKwargs, DistributedType
+from accelerate.utils import gather_object, set_seed
 from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
 from peft.tuners.tuners_utils import BaseTunerLayer
 from peft.utils import ModulesToSaveWrapper
@@ -40,7 +43,9 @@ from ltx_trainer.model_loader import load_embeddings_processor, load_text_encode
 from ltx_trainer.model_loader import load_model as load_ltx_model
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
+from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
+from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
 from ltx_trainer.training_strategies import get_training_strategy
 from ltx_trainer.utils import open_image_as_srgb, save_image
 from ltx_trainer.validation_sampler import CachedPromptEmbeddings, GenerationConfig, ValidationSampler
@@ -61,79 +66,9 @@ if not IS_MAIN_PROCESS:
 
     disable_progress_bar()
 
-StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[sampled_video_path]) -> None
+StepCallback = Callable[[int, int, list[Path] | None], None]  # (step, total, sampled paths or None) -> None
 
 MEMORY_CHECK_INTERVAL = 200
-
-
-@runtime_checkable
-class TrainingCallback(Protocol):
-    """Protocol for training callbacks to enable custom integrations."""
-
-    def on_train_begin(self, trainer: "LtxvTrainer", config: "LtxTrainerConfig") -> None:
-        """Called at the start of training.
-
-        Args:
-            trainer: The trainer instance
-            config: The training configuration
-        """
-        ...
-
-    def on_step_end(
-        self,
-        step: int,
-        total_steps: int,
-        metrics: dict[str, float],
-        video_paths: list[Path]
-    ) -> None:
-        """Called after each training step.
-
-        Args:
-            step: Current training step
-            total_steps: Total number of training steps
-            metrics: Dictionary of training metrics (loss, lr, etc.)
-            video_paths: List of paths to validation videos (if any)
-        """
-        ...
-
-    def on_save(self, step: int, checkpoint_dir: Path) -> None:
-        """Called after a checkpoint is saved.
-
-        Args:
-            step: Current training step
-            checkpoint_dir: Path to the saved checkpoint directory
-        """
-        ...
-
-    def on_validation_begin(self, step: int) -> None:
-        """Called before validation sampling starts.
-
-        Args:
-            step: Current training step
-        """
-        ...
-
-    def on_validation_end(self, step: int, video_paths: list[Path]) -> None:
-        """Called after validation sampling completes.
-
-        Args:
-            step: Current training step
-            video_paths: List of paths to generated validation videos
-        """
-        ...
-
-    def on_train_end(self) -> None:
-        """Called at the end of training.
-        """
-        ...
-
-    def should_stop_training(self) -> bool:
-        """Check if training should be stopped early.
-
-        Returns:
-            True if training should stop, False otherwise
-        """
-        ...
 
 
 class TrainingStats(BaseModel):
@@ -147,23 +82,34 @@ class TrainingStats(BaseModel):
     num_processes: int
 
 
+@dataclass(frozen=True)
+class TrainingStepOutput:
+    """Output from a single training step."""
+
+    loss: Tensor  # [B,] per-element loss (unreduced)
+    sigma: Tensor  # [B,] sampled sigma, detached from computational graph
+
+
 class LtxvTrainer:
-    def __init__(self, trainer_config: LtxTrainerConfig, callbacks: list[TrainingCallback] | None = None) -> None:
+    def __init__(self, trainer_config: LtxTrainerConfig) -> None:
         self._config = trainer_config
-        self._callbacks = callbacks or []
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
-        self._setup_accelerator()
         self._cached_validation_embeddings = self._load_text_encoder_and_cache_embeddings()
         self._load_models()
+        self._setup_accelerator()
         self._collect_trainable_params()
+        self._loaded_checkpoint_path: Path | None = None
         self._load_checkpoint()
         self._prepare_models_for_training()
         self._dataset = None
         self._global_step = -1
-        self._checkpoint_paths = []
-        self._init_wandb()
+        self._checkpoint_paths: list[Path] = []
+        self._training_state_paths: list[Path] = []
+        self._training_state_size_warned = False
+        self._wandb_run = None
+        self._sigma_tracker = SigmaBucketTracker()
 
     def train(  # noqa: PLR0912, PLR0915
         self,
@@ -172,6 +118,9 @@ class LtxvTrainer:
     ) -> tuple[Path, TrainingStats]:
         """
         Start the training process.
+        Args:
+            disable_progress_bars: Disable Rich progress bars (useful for multi-process runs).
+            step_callback: Optional callback invoked after each optimization step.
         Returns:
             Tuple of (saved_model_path, training_stats)
         """
@@ -181,11 +130,22 @@ class LtxvTrainer:
 
         train_start_time = time.time()
 
-        # Use the same seed for all processes and ensure deterministic operations
+        initial_step, training_state = self._resume_state
+        resuming = training_state is not None
+
         set_seed(cfg.seed)
         logger.debug(f"Process {self._accelerator.process_index} using seed: {cfg.seed}")
 
         self._init_optimizer()
+
+        if training_state is not None and not self._restore_training_state(training_state):
+            initial_step = 0
+            resuming = False
+
+        # Initialize W&B after restore so we only resume the run when state restore succeeds.
+        resume_run_id = training_state.wandb_run_id if resuming and training_state is not None else None
+        self._init_wandb(resume_run_id=resume_run_id)
+
         self._init_dataloader()
         data_iter = iter(self._dataloader)
         self._init_timestep_sampler()
@@ -198,55 +158,43 @@ class LtxvTrainer:
         # Save the training configuration as YAML
         self._save_config()
 
-        logger.info("🚀 Starting training...")
+        remaining_steps = cfg.optimization.steps - initial_step
+        if remaining_steps <= 0:
+            raise ValueError(
+                f"No remaining training steps: initial_step={initial_step} >= "
+                f"target_steps={cfg.optimization.steps}. Nothing to train."
+            )
 
-        # Notify callbacks that training is starting
-        for callback in self._callbacks:
-            callback.on_train_begin(self, cfg)
+        if resuming:
+            logger.info(f"🚀 Resuming training from step {initial_step} → {cfg.optimization.steps}")
+        else:
+            logger.info("🚀 Starting training...")
 
         # Create progress tracking (disabled for non-main processes or when explicitly disabled)
         progress_enabled = IS_MAIN_PROCESS and not disable_progress_bars
         progress = TrainingProgress(
             enabled=progress_enabled,
-            total_steps=cfg.optimization.steps,
+            total_steps=remaining_steps,
         )
 
         if IS_MAIN_PROCESS and disable_progress_bars:
             logger.warning("Progress bars disabled. Intermediate status messages will be logged instead.")
 
         self._transformer.train()
-        self._global_step = 0
+        self._global_step = initial_step
 
         peak_mem_during_training = start_mem
 
-        saved_path = None
         sampled_videos_paths = None
 
         with progress:
-            # Initial validation before training starts
             if cfg.validation.interval and not cfg.validation.skip_initial_validation:
-                for callback in self._callbacks:
-                    callback.on_validation_begin(self._global_step)
-                sampled_videos_paths = self._sample_videos(progress)
-                if IS_MAIN_PROCESS and sampled_videos_paths and self._config.wandb.log_validation_videos:
-                    self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
-                for callback in self._callbacks:
-                    callback.on_validation_end(self._global_step, sampled_videos_paths or [])
+                with self._offloaded_optimizer_state():
+                    sampled_videos_paths = self._run_distributed_validation(progress)
 
             self._accelerator.wait_for_everyone()
 
-            for step in range(cfg.optimization.steps * cfg.optimization.gradient_accumulation_steps):
-                # Check callbacks for stop signal
-                should_stop = False
-                for callback in self._callbacks:
-                    if callback.should_stop_training():
-                        logger.info(f"Training stopped by callback at step {self._global_step}")
-                        should_stop = True
-                        break
-
-                if should_stop:
-                    break
-
+            for step in range(remaining_steps * cfg.optimization.gradient_accumulation_steps):
                 # Get next batch, reset the dataloader if needed
                 try:
                     batch = next(data_iter)
@@ -260,12 +208,12 @@ class LtxvTrainer:
                     if is_optimization_step:
                         self._global_step += 1
 
-                    loss = self._training_step(batch)
-                    self._accelerator.backward(loss)
+                    output = self._training_step(batch)
+                    self._accelerator.backward(output.loss.mean())
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
                         self._accelerator.clip_grad_norm_(
-                            self._trainable_vision_params + self._trainable_audio_params,
+                            self._trainable_params,
                             cfg.optimization.max_grad_norm,
                         )
 
@@ -282,47 +230,19 @@ class LtxvTrainer:
                         and self._global_step % cfg.validation.interval == 0
                         and is_optimization_step
                     ):
-                        for callback in self._callbacks:
-                            callback.on_validation_begin(self._global_step)
-                        if self._accelerator.distributed_type == DistributedType.FSDP:
-                            # FSDP: All processes must participate in validation
-                            sampled_videos_paths = self._sample_videos(progress)
-                            if IS_MAIN_PROCESS and sampled_videos_paths and self._config.wandb.log_validation_videos:
-                                self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
-                        # DDP: Only main process runs validation
-                        elif IS_MAIN_PROCESS:
-                            sampled_videos_paths = self._sample_videos(progress)
-                            if sampled_videos_paths and self._config.wandb.log_validation_videos:
-                                self._log_validation_samples(sampled_videos_paths, cfg.validation.prompts)
-                        for callback in self._callbacks:
-                            callback.on_validation_end(self._global_step, sampled_videos_paths or [])
+                        with self._offloaded_optimizer_state():
+                            sampled_videos_paths = self._run_distributed_validation(progress)
 
                     # Save checkpoint if needed
                     if (
                         cfg.checkpoints.interval
-                        # and self._global_step > 0
+                        and self._global_step > 0
                         and self._global_step % cfg.checkpoints.interval == 0
                         and is_optimization_step
-                    ) or self._global_step == 1 and is_optimization_step:
-                        saved_path = self._save_checkpoint()
+                    ):
+                        self._save_checkpoint()
 
                     self._accelerator.wait_for_everyone()
-
-                    metrics = {
-                        "loss": loss.item(),
-                        "learning_rate": self._optimizer.param_groups[0]["lr"],
-                        "audio_learning_rate": self._optimizer.param_groups[1]["lr"],
-                        "step": self._global_step,
-                    }
-
-                    # Notify callbacks of step completion
-                    for callback in self._callbacks:
-                        callback.on_step_end(
-                            self._global_step,
-                            cfg.optimization.steps,
-                            metrics,
-                            sampled_videos_paths or []
-                        )
 
                     # Call step callback if provided
                     if step_callback and is_optimization_step:
@@ -330,45 +250,43 @@ class LtxvTrainer:
 
                     self._accelerator.wait_for_everyone()
 
-                    sampled_videos_paths = None
-
                     # Update progress and log metrics
                     current_lr = self._optimizer.param_groups[0]["lr"]
-                    current_audio_lr = self._optimizer.param_groups[1]["lr"]
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
+                    step_loss = output.loss.detach().mean().item()
 
                     progress.update_training(
-                        loss=loss.item(),
+                        loss=step_loss,
                         lr=current_lr,
-                        audio_lr=current_audio_lr,
                         step_time=step_time,
                         advance=is_optimization_step,
                     )
 
                     # Log metrics to W&B (only on main process and optimization steps)
                     if IS_MAIN_PROCESS and is_optimization_step:
-                        self._log_metrics(
-                            {
-                                "train/loss": loss.item(),
-                                "train/learning_rate": current_lr,
-                                "train/audio_learning_rate": current_audio_lr,
-                                "train/step_time": step_time,
-                                "train/global_step": self._global_step,
-                            }
-                        )
+                        # Track per-element loss by sigma bucket
+                        self._sigma_tracker.update(output.sigma.cpu().tolist(), output.loss.detach().cpu().tolist())
+                        metrics = {
+                            "train/loss": step_loss,
+                            "train/learning_rate": current_lr,
+                            "train/step_time": step_time,
+                            "train/global_step": self._global_step,
+                        }
+                        metrics.update(self._sigma_tracker.get_metrics())
+                        self._log_metrics(metrics)
 
                     # Fallback logging when progress bars are disabled
                     if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 20 == 0:
                         elapsed = time.time() - train_start_time
-                        progress_percentage = self._global_step / cfg.optimization.steps
-                        if progress_percentage > 0:
-                            total_estimated = elapsed / progress_percentage
+                        steps_done = self._global_step - initial_step
+                        if steps_done > 0:
+                            total_estimated = elapsed / steps_done * remaining_steps
                             total_time = f"{total_estimated // 3600:.0f}h {(total_estimated % 3600) // 60:.0f}m"
                         else:
                             total_time = "calculating..."
                         logger.info(
                             f"Step {self._global_step}/{cfg.optimization.steps} - "
-                            f"Loss: {loss.item():.4f}, LR: {current_lr:.2e}, Audio LR: {current_audio_lr:.2e}, "
+                            f"Loss: {step_loss:.4f}, LR: {current_lr:.2e}, "
                             f"Time/Step: {step_time:.2f}s, Total Time: {total_time}",
                         )
 
@@ -384,7 +302,7 @@ class LtxvTrainer:
 
         # Calculate steps/second over entire training
         total_time_seconds = train_end_time - train_start_time
-        steps_per_second = cfg.optimization.steps / total_time_seconds
+        steps_per_second = remaining_steps / total_time_seconds
 
         samples_per_second = steps_per_second * self._accelerator.num_processes * cfg.optimization.batch_size
 
@@ -397,7 +315,7 @@ class LtxvTrainer:
             global_batch_size=cfg.optimization.batch_size * self._accelerator.num_processes,
         )
 
-        saved_path = self._save_checkpoint(is_final=True)
+        saved_path = self._save_checkpoint()
 
         if IS_MAIN_PROCESS:
             # Log the training statistics
@@ -422,12 +340,9 @@ class LtxvTrainer:
         self._accelerator.wait_for_everyone()
         self._accelerator.end_training()
 
-        for callback in self._callbacks:
-            callback.on_train_end()
-
         return saved_path, stats
 
-    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> Tensor:
+    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
         """Perform a single training step using the configured strategy."""
         # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
@@ -463,8 +378,9 @@ class LtxvTrainer:
 
         # Use strategy to compute loss
         loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
+        sigma = model_inputs.video.sigma.detach() if model_inputs.video.enabled else model_inputs.audio.sigma.detach()
 
-        return loss
+        return TrainingStepOutput(loss=loss, sigma=sigma)
 
     @free_gpu_memory_context(after=True)
     def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:
@@ -476,11 +392,14 @@ class LtxvTrainer:
         #   3. If validation prompts are configured, computes and caches their embeddings
         #   4. Unloads the Gemma model entirely, keeps the embeddings processor for training
 
-        # Load text encoder (pure Gemma LLM) on GPU
+        # Load text encoder (pure Gemma LLM) on GPU — LOCAL_RANK before Accelerator exists
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        init_device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+
         logger.debug("Loading text encoder...")
         text_encoder = load_text_encoder(
             gemma_model_path=self._config.model.text_encoder_path,
-            device=self._accelerator.device,
+            device=init_device,
             dtype=torch.bfloat16,
             load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
         )
@@ -489,7 +408,7 @@ class LtxvTrainer:
         logger.debug("Loading embeddings processor...")
         self._embeddings_processor = load_embeddings_processor(
             checkpoint_path=self._config.model.model_path,
-            device="cuda",
+            device=init_device,
             dtype=torch.bfloat16,
         )
 
@@ -541,7 +460,7 @@ class LtxvTrainer:
             checkpoint_path=self._config.model.model_path,
             device="cpu",
             dtype=torch.bfloat16,
-            with_video_vae_encoder=True, #need_vae_encoder,  # Needed for image conditioning
+            with_video_vae_encoder=need_vae_encoder,  # Needed for image conditioning
             with_video_vae_decoder=True,  # Needed for validation sampling
             with_audio_vae_decoder=load_audio,
             with_vocoder=load_audio,
@@ -558,18 +477,6 @@ class LtxvTrainer:
         self._audio_vae = components.audio_vae_decoder
         self._vocoder = components.vocoder
         # Note: self._embeddings_processor was set in _load_text_encoder_and_cache_embeddings
-
-        # Load spatial upsampler if two-stage validation is enabled
-        self._spatial_upsampler = None
-        if self._config.validation.two_stage:
-            logger.info("Loading spatial upsampler for two-stage validation...")
-            from ltx_trainer.model_loader import load_spatial_upsampler
-
-            self._spatial_upsampler = load_spatial_upsampler(
-                self._config.validation.spatial_upsampler_path,
-                device="cpu",  # Start on CPU, move to GPU during validation
-                dtype=torch.bfloat16,
-            )
 
         # Determine initial dtype based on training mode.
         # Note: For FSDP + LoRA, we'll cast to FP32 later in _prepare_models_for_training()
@@ -609,10 +516,8 @@ class LtxvTrainer:
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
-        self._trainable_vision_params = [p for (name, p) in self._transformer.named_parameters() if p.requires_grad and 'audio' not in name.lower()]
-        self._trainable_audio_params = [p for (name, p) in self._transformer.named_parameters() if p.requires_grad and 'audio' in name.lower()]
-        all_params = self._trainable_audio_params + self._trainable_vision_params
-        logger.debug(f"Trainable params count: {sum(p.numel() for p in all_params):,} (audio params: {sum(p.numel() for p in self._trainable_audio_params):,})")
+        self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
+        logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
 
     def _init_timestep_sampler(self) -> None:
         """Initialize the timestep sampler based on the config."""
@@ -634,21 +539,26 @@ class LtxvTrainer:
         self._transformer = get_peft_model(self._transformer, lora_config)
 
     def _load_checkpoint(self) -> None:
-        """Load checkpoint if specified in config."""
+        """Load checkpoint if specified in config, then resolve resume state."""
         if not self._config.model.load_checkpoint:
+            self._resume_state: tuple[int, TrainingState | None] = (0, None)
             return
 
         checkpoint_path = self._find_checkpoint(self._config.model.load_checkpoint)
         if not checkpoint_path:
             logger.warning(f"⚠️ Could not find checkpoint at {self._config.model.load_checkpoint}")
+            self._resume_state = (0, None)
             return
 
+        self._loaded_checkpoint_path = checkpoint_path
         logger.info(f"📥 Loading checkpoint from {checkpoint_path}")
 
         if self._config.model.training_mode == "full":
             self._load_full_checkpoint(checkpoint_path)
         else:  # LoRA mode
             self._load_lora_checkpoint(checkpoint_path)
+
+        self._resume_state = self._resolve_resume_state()
 
     def _load_full_checkpoint(self, checkpoint_path: Path) -> None:
         """Load full model checkpoint."""
@@ -670,6 +580,98 @@ class LtxvTrainer:
         set_peft_model_state_dict(base_model, state_dict)
 
         logger.info("✅ LoRA checkpoint loaded successfully")
+
+    def _resolve_resume_state(self) -> tuple[int, TrainingState | None]:
+        """Determine resume state by looking for a training state file next to the loaded checkpoint.
+        Returns (initial_step, TrainingState or None).
+        If no_resume config is set, no checkpoint loaded, or no state file found: returns (0, None).
+        """
+        if self._config.checkpoints.no_resume or self._loaded_checkpoint_path is None:
+            return 0, None
+
+        state = self._load_training_state(self._loaded_checkpoint_path)
+        if state is None:
+            return 0, None
+
+        fp = state.config_fingerprint
+        cfg = self._config
+        mismatches: list[str] = []
+        if fp.optimizer_type != cfg.optimization.optimizer_type:
+            mismatches.append(f"optimizer_type: {fp.optimizer_type} → {cfg.optimization.optimizer_type}")
+        if fp.scheduler_type != cfg.optimization.scheduler_type:
+            mismatches.append(f"scheduler_type: {fp.scheduler_type} → {cfg.optimization.scheduler_type}")
+        if fp.training_mode != cfg.model.training_mode:
+            mismatches.append(f"training_mode: {fp.training_mode} → {cfg.model.training_mode}")
+        if (
+            cfg.model.training_mode == "lora"
+            and cfg.lora is not None
+            and fp.lora_rank is not None
+            and fp.lora_rank != cfg.lora.rank
+        ):
+            mismatches.append(f"lora_rank: {fp.lora_rank} → {cfg.lora.rank}")
+        if mismatches:
+            logger.warning(
+                f"⚠️ Training state config mismatch ({', '.join(mismatches)}). "
+                "Starting from step 0. Set checkpoints.no_resume=true to silence this warning."
+            )
+            return 0, None
+
+        if state.global_step < 0:
+            logger.warning(f"⚠️ Training state has invalid global_step={state.global_step!r}. Starting from step 0.")
+            return 0, None
+        logger.info(f"📌 Resuming from step {state.global_step}")
+        return state.global_step, state
+
+    @staticmethod
+    def _load_training_state(checkpoint_path: Path) -> TrainingState | None:
+        """Load training state file that corresponds to a checkpoint weights file."""
+        match = re.search(r"step_(\d+)", checkpoint_path.name)
+        if not match:
+            return None
+
+        step_str = match.group(1)
+        state_path = checkpoint_path.parent / f"training_state_step_{step_str}.pt"
+
+        if not state_path.exists():
+            return None
+
+        try:
+            raw: dict = torch.load(state_path, map_location="cpu", weights_only=False)
+            state = TrainingState.from_save_dict(raw)
+            logger.info(f"📥 Loaded training state from {state_path}")
+            return state
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to load training state from {state_path}: {e}. Starting from step 0.")
+            return None
+
+    def _restore_training_state(self, training_state: TrainingState) -> bool:
+        """Restore optimizer, scheduler, and RNG states from a loaded TrainingState.
+        Must be called after _init_optimizer() (which calls accelerator.prepare).
+        Returns True if restore succeeded, False if it failed (caller should fall back to step 0).
+        """
+        try:
+            if training_state.optimizer_state_dict is not None:
+                self._optimizer.load_state_dict(training_state.optimizer_state_dict)
+                logger.debug("Restored optimizer state (full mode)")
+
+            if training_state.lr_scheduler_state_dict is not None and self._lr_scheduler is not None:
+                self._lr_scheduler.load_state_dict(training_state.lr_scheduler_state_dict)
+                logger.debug("Restored LR scheduler state")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to restore training state: {e}. Starting from step 0.")
+            return False
+
+        rng = training_state.rng_states
+        if self._accelerator.num_processes > 1:
+            logger.debug("Skipping RNG restore in multi-process mode (only main process state was saved)")
+        else:
+            if rng.torch_state is not None:
+                torch.random.set_rng_state(rng.torch_state)
+            if rng.cuda_state is not None and torch.cuda.is_available():
+                torch.cuda.set_rng_state(rng.cuda_state)
+            logger.debug("Restored RNG states")
+
+        return True
 
     def _prepare_models_for_training(self) -> None:
         """Prepare models for training with Accelerate."""
@@ -768,28 +770,55 @@ class LtxvTrainer:
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
-        audio_lr = opt_cfg.audio_learning_rate
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW([{"params": self._trainable_vision_params,
-                                "lr": lr},
-                               {"params": self._trainable_audio_params,
-                                "lr": audio_lr}])
+            optimizer = AdamW(self._trainable_params, lr=lr)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
-            optimizer = AdamW8bit([{"params": self._trainable_vision_params,
-                                "lr": lr},
-                               {"params": self._trainable_audio_params,
-                                "lr": audio_lr}])
+            optimizer = AdamW8bit(self._trainable_params, lr=lr)
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 
-        # Add scheduler initialization
         lr_scheduler = self._create_scheduler(optimizer)
 
         # noinspection PyTypeChecker
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
+
+    @contextlib.contextmanager
+    def _offloaded_optimizer_state(self) -> Iterator[None]:
+        """Context manager that offloads optimizer state to CPU during validation.
+        Opt-in via `acceleration.offload_optimizer_during_validation`. Frees VRAM for
+        validation video generation when optimizer state is large (e.g. full fine-tune
+        AdamW, high-rank LoRA). No-op for FSDP (sharded state -- manual `.cpu()` breaks
+        metadata).
+        """
+        enabled = (
+            self._config.acceleration.offload_optimizer_during_validation
+            and self._accelerator.distributed_type != DistributedType.FSDP
+        )
+
+        # Track exactly which tensors we move so we don't promote ones that were
+        # intentionally on CPU (e.g. AdamW's `step` scalar on recent PyTorch).
+        offloaded: list[tuple[dict, str]] = []
+        if enabled:
+            offloaded_bytes = 0
+            for state in self._optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor) and v.is_cuda:
+                        offloaded.append((state, k))
+                        offloaded_bytes += v.nbytes
+            if offloaded:
+                logger.info(f"Offloading optimizer state to CPU ({offloaded_bytes / 1e9:.1f} GB)")
+                for state, k in offloaded:
+                    state[k] = state[k].cpu()
+
+        try:
+            yield
+        finally:
+            device = self._accelerator.device
+            for state, k in offloaded:
+                state[k] = state[k].to(device)
 
     def _create_scheduler(self, optimizer: torch.optim.Optimizer) -> LRScheduler | None:
         """Create learning rate scheduler based on config."""
@@ -818,8 +847,8 @@ class LtxvTrainer:
         elif scheduler_type == "cosine_with_restarts":
             scheduler = CosineAnnealingWarmRestarts(
                 optimizer,
-                T_0=params.pop("T_0", steps // 4),  # First restart cycle length
-                T_mult=params.pop("T_mult", 1),  # Multiplicative factor for cycle lengths
+                T_0=params.pop("T_0", steps // 4),
+                T_mult=params.pop("T_mult", 1),
                 eta_min=params.pop("eta_min", 5e-5),
                 **params,
             )
@@ -847,11 +876,18 @@ class LtxvTrainer:
     def _setup_accelerator(self) -> None:
         """Initialize the Accelerator with the appropriate settings."""
 
+        # find_unused_parameters=True keeps DDP happy when LoRA targets a branch the forward
+        # pass skips (e.g. audio LoRA with `with_audio: false`, or short module patterns like
+        # "to_k" that match the audio branch unintentionally). It's a no-op for FSDP and
+        # single-GPU runs. The probing cost is paid only on the first step.
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+
         # All distributed setup (DDP/FSDP, number of processes, etc.) is controlled by
         # the user's Accelerate configuration (accelerate config / accelerate launch).
         self._accelerator = Accelerator(
             mixed_precision=self._config.acceleration.mixed_precision_mode,
             gradient_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
+            kwargs_handlers=[ddp_kwargs],
         )
 
         if self._accelerator.num_processes > 1:
@@ -884,11 +920,42 @@ class LtxvTrainer:
                 "Monitor training stability and consider disabling quantization if issues arise."
             )
 
+    def _run_distributed_validation(self, progress: TrainingProgress) -> list[Path]:
+        """Run validation across all ranks and log gathered results on rank 0.
+        Each rank generates only its assigned subset of prompts (see `_sample_videos`),
+        so all GPUs stay busy and no rank idles long enough to trigger NCCL timeouts.
+        Paths are gathered across ranks so rank 0 has the full list for W&B logging.
+        Note: Multi-node training requires a shared filesystem so rank 0 can read
+        videos written by other ranks.
+        """
+        sampled = self._sample_videos(progress)
+
+        if self._accelerator.num_processes > 1:
+            # gather_object returns a flat list from all ranks
+            sampled = sorted(gather_object(sampled), key=lambda x: x[0])
+
+        paths = [p for _, p in sampled]
+
+        if self._accelerator.is_main_process and paths:
+            self._log_validation_samples(paths, self._config.validation.prompts)
+
+        # Non-main ranks must not reach checkpoint collectives while main is still logging to W&B.
+        self._accelerator.wait_for_everyone()
+
+        return paths
+
     # Note: Use @torch.no_grad() instead of @torch.inference_mode() to avoid FSDP inplace update errors after validation
     @torch.no_grad()
     @free_gpu_memory_context(after=True)
-    def _sample_videos(self, progress: TrainingProgress) -> list[Path] | None:
-        """Run validation by generating videos from validation prompts."""
+    def _sample_videos(self, progress: TrainingProgress) -> list[tuple[int, Path]]:
+        """Run validation by generating videos from this rank's share of the validation prompts.
+        Prompts are split round-robin across ranks via `process_index` / `num_processes`,
+        which collapses to "all prompts" when running on a single GPU. Returns
+        (prompt_idx, path) tuples so the caller can reconstruct global order without
+        relying on filename conventions.
+        Under FSDP with multiple processes, ranks pad with extra generate passes (same prompt,
+        no disk write) so every rank runs the same number of forwards — avoids collective mismatch.
+        """
         use_images = self._config.validation.images is not None
         use_reference_videos = self._config.validation.reference_videos is not None
         generate_audio = self._config.validation.generate_audio
@@ -898,151 +965,118 @@ class LtxvTrainer:
         self._optimizer.zero_grad(set_to_none=True)
         free_gpu_memory()
 
-        # Set models to eval mode for validation (disables dropout, etc.)
-        # Save original training state to restore later
-        transformer_training = self._transformer.training
-        vae_decoder_training = self._vae_decoder.training if self._vae_decoder else None
-        vae_encoder_training = self._vae_encoder.training if self._vae_encoder else None
-        audio_vae_training = self._audio_vae.training if self._audio_vae else None
-        vocoder_training = self._vocoder.training if self._vocoder else None
-        upsampler_training = self._spatial_upsampler.training if self._spatial_upsampler else None
+        prompts = self._config.validation.prompts
+        rank = self._accelerator.process_index
+        world_size = self._accelerator.num_processes
+        rank_indices = list(range(rank, len(prompts), world_size))
 
-        self._transformer.eval()
-        if self._vae_decoder:
-            self._vae_decoder.eval()
-        if self._vae_encoder:
-            self._vae_encoder.eval()
-        if self._audio_vae:
-            self._audio_vae.eval()
-        if self._vocoder:
-            self._vocoder.eval()
-        if self._spatial_upsampler:
-            self._spatial_upsampler.eval()
+        # FSDP: every rank must run the same number of forwards; pad with duplicate generates (no save).
+        work: list[tuple[int, bool]] = [(i, True) for i in rank_indices]
+        if self._accelerator.distributed_type == DistributedType.FSDP and world_size > 1:
+            max_per_rank = math.ceil(len(prompts) / world_size)
+            pad_seed = rank_indices[-1] if rank_indices else 0
+            work += [(pad_seed, False)] * (max_per_rank - len(work))
 
-        try:
-            # Start sampling progress tracking
-            sampling_ctx = progress.start_sampling(
-                num_prompts=len(self._config.validation.prompts),
-                num_steps=inference_steps,
+        sampling_ctx = progress.start_sampling(
+            num_prompts=len(work),
+            num_steps=inference_steps,
+        )
+
+        # Create a validation sampler with loaded models and progress tracking
+        sampler = ValidationSampler(
+            transformer=self._transformer,
+            vae_decoder=self._vae_decoder,
+            vae_encoder=self._vae_encoder,
+            text_encoder=None,
+            audio_decoder=self._audio_vae if generate_audio else None,
+            vocoder=self._vocoder if generate_audio else None,
+            sampling_context=sampling_ctx,
+        )
+
+        output_dir = Path(self._config.output_dir) / "samples"
+        output_dir.mkdir(exist_ok=True, parents=True)
+
+        results: list[tuple[int, Path]] = []
+        width, height, num_frames = self._config.validation.video_dims
+
+        for local_i, (prompt_idx, save_output) in enumerate(work):
+            prompt = prompts[prompt_idx]
+            sampling_ctx.start_video(local_i)
+
+            # Load conditioning image if provided
+            condition_image = None
+            if use_images:
+                image_path = self._config.validation.images[prompt_idx]
+                image = open_image_as_srgb(image_path)
+                # Convert PIL image to tensor [C, H, W] in [0, 1]
+                condition_image = F.to_tensor(image)
+
+            # Load reference video if provided (for IC-LoRA)
+            reference_video = None
+            if use_reference_videos:
+                ref_video_path = self._config.validation.reference_videos[prompt_idx]
+                # read_video returns [F, C, H, W] in [0, 1]
+                reference_video, _ = read_video(ref_video_path, max_frames=num_frames)
+
+            # Get cached embeddings for this prompt if available
+            cached_embeddings = (
+                self._cached_validation_embeddings[prompt_idx]
+                if self._cached_validation_embeddings is not None
+                else None
             )
 
-            # Create validation sampler with loaded models and progress tracking
-            sampler = ValidationSampler(
-                transformer=self._transformer,
-                vae_decoder=self._vae_decoder,
-                vae_encoder=self._vae_encoder,
-                text_encoder=None,
-                audio_decoder=self._audio_vae if generate_audio else None,
-                vocoder=self._vocoder if generate_audio else None,
-                spatial_upsampler=self._spatial_upsampler,
-                checkpoint_path=self._config.model.model_path,
-                sampling_context=sampling_ctx,
+            # Create generation config
+            gen_config = GenerationConfig(
+                prompt=prompt,
+                negative_prompt=self._config.validation.negative_prompt,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=self._config.validation.frame_rate,
+                num_inference_steps=inference_steps,
+                guidance_scale=self._config.validation.guidance_scale,
+                seed=self._config.validation.seed,
+                condition_image=condition_image,
+                reference_video=reference_video,
+                reference_downscale_factor=self._config.validation.reference_downscale_factor,
+                generate_audio=generate_audio,
+                include_reference_in_output=self._config.validation.include_reference_in_output,
+                cached_embeddings=cached_embeddings,
+                stg_scale=self._config.validation.stg_scale,
+                stg_blocks=self._config.validation.stg_blocks,
+                stg_mode=self._config.validation.stg_mode,
             )
 
-            # If two-stage validation, prepare distilled LoRA configuration
-            if self._config.validation.two_stage:
-                sampler.prepare_distilled_lora(
-                    lora_path=self._config.validation.distilled_lora_path,
-                    lora_strength=self._config.validation.distilled_lora_strength,
+            # Generate sample
+            video, audio = sampler.generate(
+                config=gen_config,
+                device=self._accelerator.device,
+            )
+
+            if not save_output:
+                continue
+
+            # Save output (image for single frame, video otherwise)
+            ext = "png" if num_frames == 1 else "mp4"
+            output_path = output_dir / f"step_{self._global_step:06d}_{prompt_idx + 1:02d}.{ext}"
+            if num_frames == 1:
+                save_image(video, output_path)
+            else:
+                save_video(
+                    video_tensor=video,
+                    output_path=output_path,
+                    fps=self._config.validation.frame_rate,
+                    audio=audio,
+                    audio_sample_rate=self._vocoder.output_sampling_rate if audio is not None else None,
                 )
+            results.append((prompt_idx, output_path))
 
-            output_dir = Path(self._config.output_dir) / "samples"
-            output_dir.mkdir(exist_ok=True, parents=True)
+        # Clean up progress tasks
+        sampling_ctx.cleanup()
 
-            video_paths = []
-            width, height, num_frames = self._config.validation.video_dims
-
-            for prompt_idx, prompt in enumerate(self._config.validation.prompts):
-                # Update progress to show current video
-                sampling_ctx.start_video(prompt_idx)
-
-                # Load conditioning image if provided
-                condition_image = None
-                if use_images:
-                    image_path = self._config.validation.images[prompt_idx]
-                    image = open_image_as_srgb(image_path)
-                    # Convert PIL image to tensor [C, H, W] in [0, 1]
-                    condition_image = F.to_tensor(image)
-
-                # Load reference video if provided (for IC-LoRA)
-                reference_video = None
-                if use_reference_videos:
-                    ref_video_path = self._config.validation.reference_videos[prompt_idx]
-                    # read_video returns [F, C, H, W] in [0, 1]
-                    reference_video, _ = read_video(ref_video_path, max_frames=num_frames)
-
-                # Get cached embeddings for this prompt if available
-                cached_embeddings = (
-                    self._cached_validation_embeddings[prompt_idx]
-                    if self._cached_validation_embeddings is not None
-                    else None
-                )
-
-                # Create generation config
-                gen_config = GenerationConfig(
-                    prompt=prompt,
-                    negative_prompt=self._config.validation.negative_prompt,
-                    height=height,
-                    width=width,
-                    num_frames=num_frames,
-                    frame_rate=self._config.validation.frame_rate,
-                    num_inference_steps=inference_steps,
-                    guidance_scale=self._config.validation.guidance_scale,
-                    seed=self._config.validation.seed,
-                    condition_image=condition_image,
-                    reference_video=reference_video,
-                    reference_downscale_factor=self._config.validation.reference_downscale_factor,
-                    generate_audio=generate_audio,
-                    include_reference_in_output=self._config.validation.include_reference_in_output,
-                    cached_embeddings=cached_embeddings,
-                    stg_scale=self._config.validation.stg_scale,
-                    stg_blocks=self._config.validation.stg_blocks,
-                    stg_mode=self._config.validation.stg_mode,
-                    tiled_decoding=False,
-                    two_stage=self._config.validation.two_stage,
-                )
-
-                # Generate sample
-                video, audio = sampler.generate(
-                    config=gen_config,
-                    device=self._accelerator.device,
-                )
-
-                # Save output (image for single frame, video otherwise)
-                if IS_MAIN_PROCESS:
-                    ext = "png" if num_frames == 1 else "mp4"
-                    output_path = output_dir / f"step_{self._global_step:06d}_{prompt_idx + 1}.{ext}"
-                    if num_frames == 1:
-                        save_image(video, output_path)
-                    else:
-                        save_video(
-                            video_tensor=video,
-                            output_path=output_path,
-                            fps=self._config.validation.frame_rate,
-                            audio=audio,
-                            audio_sample_rate=self._vocoder.output_sample_rate if audio is not None else None,
-                        )
-                    video_paths.append(output_path)
-
-            # Clean up progress tasks
-            sampling_ctx.cleanup()
-
-            rel_outputs_path = output_dir.relative_to(self._config.output_dir)
-            logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
-            return video_paths
-        finally:
-            # Restore original training state
-            self._transformer.train(transformer_training)
-            if self._vae_decoder:
-                self._vae_decoder.train(vae_decoder_training)
-            if self._vae_encoder:
-                self._vae_encoder.train(vae_encoder_training)
-            if self._audio_vae:
-                self._audio_vae.train(audio_vae_training)
-            if self._vocoder:
-                self._vocoder.train(vocoder_training)
-            if self._spatial_upsampler:
-                self._spatial_upsampler.train(upsampler_training)
+        rel_outputs_path = output_dir.relative_to(self._config.output_dir)
+        logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
+        return results
 
     @staticmethod
     def _log_training_stats(stats: TrainingStats) -> None:
@@ -1059,94 +1093,16 @@ class LtxvTrainer:
             stats_str += f" - Global batch size: {stats.global_batch_size}"
         logger.info(stats_str)
 
-    @contextmanager
-    def _offload_to_cpu(self):
-        """Offload models and optimizer states to CPU to maximize available GPU memory."""
-        # Log GPU memory before offloading to CPU
-        gpu_memory_gb = get_gpu_memory_gb(self._accelerator.device)
-        logger.info(f"GPU memory before offloading to CPU: {gpu_memory_gb:.2f} GB")
-
-        # Zero gradients and free memory
-        self._optimizer.zero_grad(set_to_none=True)
-
-        # Unwrap transformer from Accelerate for proper CPU offload
-        unwrapped_transformer = self._accelerator.unwrap_model(self._transformer)
-        transformer_device = next(unwrapped_transformer.parameters()).device
-        print(f"Transformer device before offload: {transformer_device}")
-
-        # Offload transformer
-        unwrapped_transformer.to("cpu")
-
-        print(f"Transformer device after offload: {next(unwrapped_transformer.parameters()).device}")
-
-        # Offload embeddings processor connectors if present
-        text_encoder_state = {}
-        if self._embeddings_processor is not None:
-            if hasattr(self._embeddings_processor, 'video_connector') and self._embeddings_processor.video_connector is not None:
-                text_encoder_state['video_connector'] = next(self._embeddings_processor.video_connector.parameters()).device
-                self._embeddings_processor.video_connector.to("cpu")
-            if hasattr(self._embeddings_processor, 'audio_connector') and self._embeddings_processor.audio_connector is not None:
-                text_encoder_state['audio_connector'] = next(self._embeddings_processor.audio_connector.parameters()).device
-                self._embeddings_processor.audio_connector.to("cpu")
-
-        # Offload optimizer states (can be significant for Adam/AdamW)
-        optimizer_state_backup = []
-        for param_group in self._optimizer.param_groups:
-            for param in param_group['params']:
-                if param in self._optimizer.state:
-                    state = self._optimizer.state[param]
-                    state_device = {}
-                    for key, value in state.items():
-                        if isinstance(value, torch.Tensor):
-                            state_device[key] = value.device
-                            state[key] = value.cpu()
-                    optimizer_state_backup.append((param, state_device))
-
-        free_gpu_memory()
-
-        # Log GPU memory after offloading to CPU
-        gpu_memory_gb = get_gpu_memory_gb(self._accelerator.device)
-        logger.info(f"GPU memory after offloading to CPU: {gpu_memory_gb:.2f} GB")
-
-        # Detailed memory breakdown for debugging
-        if torch.cuda.is_available():
-            logger.info("\n" + torch.cuda.memory_summary(device=self._accelerator.device, abbreviated=True))
-
-        try:
-            yield
-        finally:
-            free_gpu_memory()
-
-            # Restore optimizer states
-            for param, state_devices in optimizer_state_backup:
-                state = self._optimizer.state[param]
-                for key, device in state_devices.items():
-                    state[key] = state[key].to(device)
-
-            # Restore embeddings processor connectors
-            if hasattr(self._embeddings_processor, 'video_connector') and 'video_connector' in text_encoder_state:
-                self._embeddings_processor.video_connector.to(text_encoder_state['video_connector'])
-            if hasattr(self._embeddings_processor, 'audio_connector') and 'audio_connector' in text_encoder_state:
-                self._embeddings_processor.audio_connector.to(text_encoder_state['audio_connector'])
-
-            # Restore transformer
-            unwrapped_transformer.to(transformer_device)
-
-    def _save_checkpoint(self, is_final: bool = False) -> Path | None:
-        """Save the model weights.
-        
-        Args:
-            is_final: If True, also save a copy to {output_dir}/model.safetensors
-        """
+    def _save_checkpoint(self) -> Path | None:
+        """Save the model weights."""
         is_lora = self._config.model.training_mode == "lora"
         is_fsdp = self._accelerator.distributed_type == DistributedType.FSDP
 
-        # Prepare paths — save into checkpoints/step_{N}/ for consistency
-        step_dir = Path(self._config.output_dir) / "checkpoints" / f"step_{self._global_step}"
-
+        # Prepare paths
+        save_dir = Path(self._config.output_dir) / "checkpoints"
         prefix = "lora" if is_lora else "model"
         filename = f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
-        saved_weights_path = step_dir / filename
+        saved_weights_path = save_dir / filename
 
         # Get state dict (collective operation - all processes must participate)
         self._accelerator.wait_for_everyone()
@@ -1155,7 +1111,7 @@ class LtxvTrainer:
         if not IS_MAIN_PROCESS:
             return None
 
-        step_dir.mkdir(exist_ok=True, parents=True)
+        save_dir.mkdir(exist_ok=True, parents=True)
 
         # Determine save precision
         save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32
@@ -1180,11 +1136,6 @@ class LtxvTrainer:
 
             # Save to disk with metadata
             save_file(state_dict, saved_weights_path, metadata=metadata)
-
-            # Free state dict memory immediately after saving
-            del state_dict
-            del full_state_dict
-            free_gpu_memory()
         else:
             # Cast to configured precision
             full_state_dict = {k: v.to(save_dtype) if isinstance(v, Tensor) else v for k, v in full_state_dict.items()}
@@ -1192,40 +1143,105 @@ class LtxvTrainer:
             # Save to disk
             self._accelerator.save(full_state_dict, saved_weights_path)
 
-            # Free state dict memory immediately after saving
-            del full_state_dict
-            free_gpu_memory()
-
         rel_path = saved_weights_path.relative_to(self._config.output_dir)
         logger.info(f"💾 {prefix.capitalize()} weights for step {self._global_step} saved in {rel_path}")
 
-        # If this is the final checkpoint, also save to model.safetensors
-        if is_final:
-            final_model_path = Path(self._config.output_dir) / "model.safetensors"
-            shutil.copy2(saved_weights_path, final_model_path)
-            logger.info(f"💾 Final model saved to {final_model_path}")
-
-        # Keep track of checkpoint step directories, and cleanup old checkpoints if needed
-        self._checkpoint_paths.append(step_dir)
+        self._checkpoint_paths.append(saved_weights_path)
         self._cleanup_checkpoints()
 
-        # Offload models to cpu so the on_save can run the pipeline on gpu
-        with self._offload_to_cpu():
-            for callback in self._callbacks:
-                callback.on_save(self._global_step, step_dir)
+        self._save_training_state(save_dir)
 
         return saved_weights_path
 
     def _cleanup_checkpoints(self) -> None:
-        """Clean up old checkpoint directories."""
+        """Clean up old checkpoints."""
         if 0 < self._config.checkpoints.keep_last_n < len(self._checkpoint_paths):
             checkpoints_to_remove = self._checkpoint_paths[: -self._config.checkpoints.keep_last_n]
             for old_checkpoint in checkpoints_to_remove:
                 if old_checkpoint.exists():
-                    shutil.rmtree(old_checkpoint)
+                    old_checkpoint.unlink()
                     logger.info(f"Removed old checkpoint: {old_checkpoint}")
-            # Update the list to only contain kept checkpoints
             self._checkpoint_paths = self._checkpoint_paths[-self._config.checkpoints.keep_last_n :]
+
+    def _save_training_state(self, save_dir: Path) -> None:
+        """Save training state alongside checkpoint for resume.
+        Respects checkpoints.save_training_state config:
+        - "full": optimizer + scheduler + RNG + step + wandb_run_id
+        - "minimal": scheduler + RNG + step + wandb_run_id
+        - "off": skip entirely
+        """
+        if not IS_MAIN_PROCESS:
+            return
+
+        mode = self._config.checkpoints.save_training_state
+        if mode == "off":
+            return
+
+        is_fsdp = self._accelerator.distributed_type == DistributedType.FSDP
+
+        optimizer_state = None
+        if mode == "full":
+            if is_fsdp:
+                logger.warning(
+                    "⚠️ save_training_state='full' is not supported with FSDP. "
+                    "Saving 'minimal' state (scheduler + RNG only)."
+                )
+            else:
+                optimizer_state = self._optimizer.state_dict()
+
+        state = TrainingState(
+            global_step=self._global_step,
+            config_fingerprint=ConfigFingerprint(
+                optimizer_type=self._config.optimization.optimizer_type,
+                scheduler_type=self._config.optimization.scheduler_type,
+                training_mode=self._config.model.training_mode,
+                lora_rank=self._config.lora.rank if self._config.lora is not None else None,
+            ),
+            rng_states=RngStates(
+                torch_state=torch.random.get_rng_state(),
+                cuda_state=torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            ),
+            lr_scheduler_state_dict=self._lr_scheduler.state_dict() if self._lr_scheduler is not None else None,
+            optimizer_state_dict=optimizer_state,
+            wandb_run_id=self._wandb_run.id if self._wandb_run is not None else None,
+        )
+
+        state_path = save_dir / f"training_state_step_{self._global_step:05d}.pt"
+        tmp_path = state_path.with_suffix(".pt.tmp")
+        try:
+            torch.save(state.to_save_dict(), tmp_path)
+        except Exception:
+            if tmp_path.exists():
+                tmp_path.unlink()
+            raise
+        tmp_path.rename(state_path)
+
+        file_size_gb = state_path.stat().st_size / (1024**3)
+        if file_size_gb > 1.0 and not self._training_state_size_warned:
+            self._training_state_size_warned = True
+            logger.warning(
+                f"⚠️ Training state file is {file_size_gb:.1f} GB (full mode includes optimizer state). "
+                f'Set checkpoints.save_training_state="minimal" to save only scheduler/RNG/step (~few KB), '
+                f'or "off" to disable entirely.'
+            )
+
+        if not self._training_state_paths or self._training_state_paths[-1] != state_path:
+            self._training_state_paths.append(state_path)
+        self._cleanup_training_states()
+
+        rel_path = state_path.relative_to(self._config.output_dir)
+        logger.debug(f"Training state saved to {rel_path}")
+
+    def _cleanup_training_states(self) -> None:
+        """Clean up old training state files, using the same keep_last_n as checkpoints."""
+        keep_n = self._config.checkpoints.keep_last_n
+        if 0 < keep_n < len(self._training_state_paths):
+            to_remove = self._training_state_paths[:-keep_n]
+            for old_state in to_remove:
+                if old_state.exists():
+                    old_state.unlink()
+                    logger.debug(f"Removed old training state: {old_state}")
+            self._training_state_paths = self._training_state_paths[-keep_n:]
 
     def _build_checkpoint_metadata(self) -> dict[str, str]:
         """Build metadata dictionary for safetensors checkpoint.
@@ -1253,20 +1269,24 @@ class LtxvTrainer:
 
         logger.info(f"💾 Training configuration saved to: {config_path.relative_to(self._config.output_dir)}")
 
-    def _init_wandb(self) -> None:
+    def _init_wandb(self, resume_run_id: str | None = None) -> None:
         """Initialize Weights & Biases run."""
         if not self._config.wandb.enabled or not IS_MAIN_PROCESS:
             self._wandb_run = None
             return
 
         wandb_config = self._config.wandb
-        run = wandb.init(
-            project=wandb_config.project,
-            entity=wandb_config.entity,
-            name=Path(self._config.output_dir).name,
-            tags=wandb_config.tags,
-            config=self._config.model_dump(),
-        )
+        init_kwargs: dict[str, Any] = {
+            "project": wandb_config.project,
+            "entity": wandb_config.entity,
+            "name": Path(self._config.output_dir).name,
+            "tags": wandb_config.tags,
+            "config": self._config.model_dump(),
+        }
+        if resume_run_id is not None:
+            init_kwargs["id"] = resume_run_id
+            init_kwargs["resume"] = "allow"
+        run = wandb.init(**init_kwargs)
         self._wandb_run = run
 
     def _log_metrics(self, metrics: dict[str, float]) -> None:
@@ -1281,7 +1301,14 @@ class LtxvTrainer:
 
         # Determine if outputs are images or videos based on file extension
         is_image = sample_paths and sample_paths[0].suffix.lower() in (".png", ".jpg", ".jpeg", ".heic", ".webp")
-        media_cls = wandb.Image if is_image else wandb.Video
 
-        samples = [media_cls(str(path), caption=prompt) for path, prompt in zip(sample_paths, prompts, strict=True)]
+        if is_image:
+            samples = [
+                wandb.Image(str(path), caption=prompt) for path, prompt in zip(sample_paths, prompts, strict=True)
+            ]
+        else:
+            samples = [
+                wandb.Video(str(path), caption=prompt, format=path.suffix.lower().lstrip("."))
+                for path, prompt in zip(sample_paths, prompts, strict=True)
+            ]
         self._wandb_run.log({"validation_samples": samples}, step=self._global_step)

@@ -1,9 +1,14 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Protocol
 
 import torch
 
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
-from ltx_core.components.protocols import DiffusionStepProtocol
+from ltx_core.conditioning import ConditioningItem
+from ltx_core.model.transformer import X0Model
 from ltx_core.types import LatentState
 from ltx_pipelines.utils.constants import VIDEO_LATENT_CHANNELS, VIDEO_SCALE_FACTORS
 
@@ -35,39 +40,89 @@ class PipelineComponents:
         self.audio_patchifier = AudioPatchifier(patch_size=1)
 
 
-class DenoisingFunc(Protocol):
+@dataclass(frozen=True)
+class DenoisedLatentResult:
+    """Output of one denoiser call for a single modality.
+    ``denoised`` is the final blended prediction for this modality.
+    The remaining fields carry the per-pass raw outputs from ``_guided_denoise``
+    (all ``None`` for ``SimpleDenoiser``).  Denoisers return a
+    ``(video_result, audio_result)`` tuple; either element may be ``None``
+    for absent modalities.
     """
-    Protocol for a denoising function used in the LTX pipeline.
+
+    denoised: torch.Tensor
+    uncond: torch.Tensor | None = None
+    cond: torch.Tensor | None = None
+    ptb: torch.Tensor | None = None
+    mod: torch.Tensor | None = None
+
+    @classmethod
+    def result_or_none(
+        cls,
+        denoised: torch.Tensor | None,
+        uncond: torch.Tensor | None = None,
+        cond: torch.Tensor | None = None,
+        ptb: torch.Tensor | None = None,
+        mod: torch.Tensor | None = None,
+    ) -> DenoisedLatentResult | None:
+        if denoised is None:
+            return None
+        return cls(denoised=denoised, uncond=uncond, cond=cond, ptb=ptb, mod=mod)
+
+
+class Denoiser(Protocol):
+    """Protocol for a denoiser that receives the transformer at call time.
+    The transformer is not stored — it is passed as the first argument so the
+    caller (a denoising loop or a pipeline block) controls its lifecycle.
     Args:
-        video_state (LatentState): The current latent state for video.
-        audio_state (LatentState): The current latent state for audio.
-        sigmas (torch.Tensor): A 1D tensor of sigma values for each diffusion step.
-        step_index (int): Index of the current denoising step.
+        transformer: The diffusion model.
+        video_state: Current video latent state, or ``None`` if absent.
+        audio_state: Current audio latent state, or ``None`` if absent.
+        sigmas: 1-D tensor of sigma values for each diffusion step.
+        step_index: Index of the current denoising step.
     Returns:
-        tuple[torch.Tensor, torch.Tensor]: The denoised video and audio tensors.
-    """
-
-    def __call__(
-        self, video_state: LatentState, audio_state: LatentState, sigmas: torch.Tensor, step_index: int
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
-
-
-class DenoisingLoopFunc(Protocol):
-    """
-    Protocol for a denoising loop function used in the LTX pipeline.
-    Args:
-        sigmas (torch.Tensor): A 1D tensor of sigma values for each diffusion step.
-        video_state (LatentState): The current latent state for video.
-        audio_state (LatentState): The current latent state for audio.
-        stepper (DiffusionStepProtocol): The diffusion step protocol to use.
-    Returns:
-        tuple[LatentState, LatentState]: The denoised video and audio latent states.
+        A ``(video_result, audio_result)`` tuple of :class:`DenoisedLatentResult`,
+        either may be ``None`` for absent modalities.
     """
 
     def __call__(
         self,
+        transformer: X0Model,
+        video_state: LatentState | None,
+        audio_state: LatentState | None,
         sigmas: torch.Tensor,
-        video_state: LatentState,
-        audio_state: LatentState,
-        stepper: DiffusionStepProtocol,
-    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+        step_index: int,
+    ) -> tuple[DenoisedLatentResult | None, DenoisedLatentResult | None]: ...
+
+
+@dataclass(frozen=True)
+class ModalitySpec:
+    """Specification for one modality passed to a diffusion stage.
+    Carries everything needed to build the initial noised latent state
+    and run the denoising loop for a single modality (video or audio).
+    Tools are created by ``DiffusionStage`` from pixel-space dimensions.
+    """
+
+    context: torch.Tensor
+    conditionings: list[ConditioningItem] = field(default_factory=list)
+    noise_scale: float = 1.0
+    frozen: bool = False
+    initial_latent: torch.Tensor | None = None
+
+
+class OffloadMode(Enum):
+    """Weight offloading strategy.
+    Controls where model weights reside during inference:
+    - ``NONE``: All weights on GPU (no streaming). Fastest inference,
+      requires enough VRAM for the full model (~28 GB for LTX-2).
+    - ``CPU``: Weights pinned in CPU RAM, streamed layer-by-layer to a
+      small GPU buffer. First pass reads from disk; subsequent passes
+      reuse the CPU cache. Requires ~36 GB RAM + ~5 GB VRAM.
+    - ``DISK``: Weights read from disk on demand through a small CPU
+      buffer, then streamed to GPU. Every pass re-reads from disk.
+      Lowest memory: ~5 GB RAM + ~5 GB VRAM.
+    """
+
+    NONE = "none"
+    CPU = "cpu"
+    DISK = "disk"

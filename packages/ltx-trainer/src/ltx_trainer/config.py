@@ -102,11 +102,6 @@ class OptimizationConfig(ConfigBaseModel):
         description="Learning rate for optimization",
     )
 
-    audio_learning_rate: float = Field(
-        default=5e-4,
-        description="Learning rate for optimization (audio layers)",
-    )
-
     steps: int = Field(
         default=3000,
         description="Number of training steps",
@@ -138,6 +133,7 @@ class OptimizationConfig(ConfigBaseModel):
         "cosine",
         "cosine_with_restarts",
         "polynomial",
+        "step",
     ] = Field(
         default="linear",
         description="Type of scheduler to use for training",
@@ -170,6 +166,15 @@ class AccelerationConfig(ConfigBaseModel):
     load_text_encoder_in_8bit: bool = Field(
         default=False,
         description="Whether to load the text encoder in 8-bit precision to save memory",
+    )
+
+    offload_optimizer_during_validation: bool = Field(
+        default=False,
+        description="Offload optimizer state to CPU before validation video sampling and reload "
+        "it afterwards, to free VRAM for inference. Useful when optimizer state is large "
+        "(e.g. AdamW for full fine-tuning or high-rank LoRA) and validation OOMs because the "
+        "VAE decoder + transformer + optimizer state cannot coexist on the GPU. Has no effect "
+        "for FSDP (sharded state). Disabled by default.",
     )
 
 
@@ -264,12 +269,6 @@ class ValidationConfig(ConfigBaseModel):
         gt=0,
     )
 
-    videos_per_prompt: int = Field(
-        default=1,
-        description="Number of videos to generate per validation prompt",
-        gt=0,
-    )
-
     guidance_scale: float = Field(
         default=4.0,
         description="CFG guidance scale to use during validation",
@@ -313,38 +312,6 @@ class ValidationConfig(ConfigBaseModel):
         "with the generated output. The reference comes from the input video, not from the model's output.",
     )
 
-    # Two-stage generation (optional, defaults to one-stage)
-    two_stage: bool = Field(
-        default=False,
-        description="Enable two-stage generation for higher quality validation samples. "
-        "Stage 1 generates at half resolution, then spatial upsampling + refinement in Stage 2.",
-    )
-
-    spatial_upsampler_path: str | None = Field(
-        default=None,
-        description="Path to spatial upsampler checkpoint (required if two_stage=True). "
-        "The upsampler scales latents from half to full resolution.",
-    )
-
-    distilled_lora_path: str | None = Field(
-        default=None,
-        description="Path to distilled LoRA checkpoint (required if two_stage=True). "
-        "The distilled LoRA is used for fast refinement in Stage 2.",
-    )
-
-    distilled_lora_strength: float = Field(
-        default=1.0,
-        description="Strength of distilled LoRA (0.0 to 1.0)",
-        ge=0.0,
-        le=1.0,
-    )
-
-    stage1_inference_steps: int = Field(
-        default=40,
-        description="Number of inference steps for Stage 1 (low-res generation with CFG)",
-        gt=0,
-    )
-
     @field_validator("images")
     @classmethod
     def validate_images(cls, v: list[str] | None, info: ValidationInfo) -> list[str] | None:
@@ -378,23 +345,6 @@ class ValidationConfig(ConfigBaseModel):
                 raise ValueError(f"Reference video path '{video_path}' does not exist")
 
         return v
-
-    @model_validator(mode="after")
-    def validate_two_stage_requirements(self) -> "ValidationConfig":
-        """Validate that upsampler and distilled LoRA are provided when two_stage=True."""
-        if self.two_stage:
-            if not self.spatial_upsampler_path:
-                raise ValueError("spatial_upsampler_path is required when two_stage=True")
-            if not self.distilled_lora_path:
-                raise ValueError("distilled_lora_path is required when two_stage=True")
-
-            # Validate that paths exist
-            if not Path(self.spatial_upsampler_path).exists():
-                raise ValueError(f"Spatial upsampler path '{self.spatial_upsampler_path}' does not exist")
-            if not Path(self.distilled_lora_path).exists():
-                raise ValueError(f"Distilled LoRA path '{self.distilled_lora_path}' does not exist")
-
-        return self
 
     @model_validator(mode="after")
     def validate_scaled_reference_dimensions(self) -> "ValidationConfig":
@@ -450,6 +400,21 @@ class CheckpointsConfig(ConfigBaseModel):
     precision: Literal["bfloat16", "float32"] = Field(
         default="bfloat16",
         description="Precision to use when saving checkpoint weights. Options: 'bfloat16' or 'float32'.",
+    )
+
+    no_resume: bool = Field(
+        default=False,
+        description="When True, ignore any saved training state and start from step 0. "
+        "Model weights from load_checkpoint are still loaded, but optimizer/scheduler "
+        "state and step counter are reset.",
+    )
+
+    save_training_state: Literal["full", "minimal", "off"] = Field(
+        default="minimal",
+        description="Save training state alongside checkpoints for resume. "
+        "'full': optimizer + scheduler + RNG + step (~800MB for LoRA, much larger for full fine-tuning). "
+        "'minimal': scheduler + RNG + step only (~few KB, sufficient for LoRA). "
+        "'off': nothing saved, resume not possible.",
     )
 
 

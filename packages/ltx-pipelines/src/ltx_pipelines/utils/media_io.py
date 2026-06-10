@@ -1,21 +1,35 @@
+import enum
 import logging
 import math
+import threading
 from collections.abc import Generator, Iterator
 from fractions import Fraction
 from io import BytesIO
+from pathlib import Path
+from queue import Queue
 
 import av
 import numpy as np
+import OpenImageIO
 import torch
 from einops import rearrange
 from PIL import Image
 from torch._prims_common import DeviceLikeType
 from tqdm import tqdm
 
-from ltx_core.types import Audio
+from ltx_core.hdr import LogC3
+from ltx_core.types import Audio, VideoPixelShape
+from ltx_pipelines.utils.color_conversion import FrameConverter, PixelFormat, yuv420p_bt709_converter_
 from ltx_pipelines.utils.constants import DEFAULT_IMAGE_CRF
 
 logger = logging.getLogger(__name__)
+
+
+class ResizeMode(enum.Enum):
+    """How to fit a conditioning video to the target resolution."""
+
+    CENTER_CROP = "center_crop"
+    REFLECT_PAD = "reflect_pad"
 
 
 def resize_aspect_ratio_preserving(image: torch.Tensor, long_side: int) -> torch.Tensor:
@@ -75,11 +89,21 @@ def resize_and_center_crop(tensor: torch.Tensor, height: int, width: int) -> tor
     return tensor
 
 
-def normalize_latent(latent: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    return (latent / 127.5 - 1.0).to(device=device, dtype=dtype)
+def normalize_images(images: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return (images / 127.5 - 1.0).to(device=device, dtype=dtype)
 
 
-def load_image_conditioning(
+def to_vae_range(x: torch.Tensor) -> torch.Tensor:
+    """Map [0, 1] to [-1, 1] (VAE input convention)."""
+    return torch.clamp(x, 0.0, 1.0) * 2.0 - 1.0
+
+
+def from_vae_range(z: torch.Tensor) -> torch.Tensor:
+    """Map [-1, 1] (VAE output convention) to [0, 1]."""
+    return torch.clamp((z + 1.0) / 2.0, 0.0, 1.0)
+
+
+def load_image_and_preprocess(
     image_path: str,
     height: int,
     width: int,
@@ -95,24 +119,137 @@ def load_image_conditioning(
     image = preprocess(image=image, crf=crf)
     image = torch.tensor(image, dtype=torch.float32, device=device)
     image = resize_and_center_crop(image, height, width)
-    image = normalize_latent(image, device, dtype)
+    image = normalize_images(image, device, dtype)
     return image
 
 
-def load_video_conditioning(
-    video_path: str, height: int, width: int, frame_cap: int, dtype: torch.dtype, device: torch.device
+def video_preprocess(
+    frames: Generator[torch.Tensor],
+    height: int,
+    width: int,
+    dtype: torch.dtype,
+    device: torch.device,
 ) -> torch.Tensor:
+    """Preprocesses a video frame generator for conditioning.
+    Args:
+        frames: Generator of video frames as tensors of shape (1, H, W, C), dtype uint8.
+        height: Target height in pixels.
+        width: Target width in pixels.
+        dtype: Target dtype for the output tensor.
+        device: Target device for the output tensor.
+    Returns:
+        Tensor of shape (1, C, F, height, width) with values in [-1, 1].
     """
-    Loads a video from a path and preprocesses it for conditioning.
-    Note: The video is resized to the nearest multiple of 2 for compatibility with video codecs.
-    """
-    frames = decode_video_from_file(path=video_path, frame_cap=frame_cap, device=device)
-    result = None
+    result: torch.Tensor | None = None
     for f in frames:
         frame = resize_and_center_crop(f.to(torch.float32), height, width)
-        frame = normalize_latent(frame, device, dtype)
+        frame = normalize_images(frame, device, dtype)
         result = frame if result is None else torch.cat([result, frame], dim=2)
+    if result is None:
+        raise ValueError("video_preprocess received an empty frame generator; no frames were decoded from the source.")
     return result
+
+
+def align_resolution(
+    width: int,
+    height: int,
+    resize_mode: ResizeMode,
+    divisor: int = 64,
+) -> tuple[int, int, int, int]:
+    """Compute aligned generation dimensions and crop-back size.
+    Args:
+        width: Source video width (need not be aligned).
+        height: Source video height (need not be aligned).
+        resize_mode: CENTER_CROP rounds down; REFLECT_PAD rounds up.
+        divisor: Alignment divisor (default 64 for two-stage pipelines).
+    Returns:
+        ``(gen_width, gen_height, crop_width, crop_height)`` where
+        ``gen_*`` are multiples of *divisor* and ``crop_*`` are the
+        original dimensions to trim back to after decoding.  When no
+        cropping is needed ``crop_*`` equals ``gen_*``.
+    """
+    if resize_mode is ResizeMode.REFLECT_PAD:
+        gen_w = ((width + divisor - 1) // divisor) * divisor
+        gen_h = ((height + divisor - 1) // divisor) * divisor
+    else:
+        gen_w = (width // divisor) * divisor
+        gen_h = (height // divisor) * divisor
+
+    crop_w = width if gen_w != width else gen_w
+    crop_h = height if gen_h != height else gen_h
+    return gen_w, gen_h, crop_w, crop_h
+
+
+def resize_and_reflect_pad(tensor: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """Resize tensor to fit within target, then reflect-pad to exact dimensions.
+    Unlike resize_and_center_crop which stretches and crops, this preserves the
+    original aspect ratio and pads the shorter dimension with reflected pixels.
+    When the target is already >= the source in both dimensions, interpolation
+    is skipped entirely to preserve original pixels.
+    Args:
+        tensor: Input with shape (H, W, C) or (F, H, W, C)
+        height: Target height
+        width: Target width
+    Returns:
+        Tensor with shape (1, C, 1, height, width) for 3D or (1, C, F, height, width) for 4D
+    """
+    if tensor.ndim == 3:
+        tensor = rearrange(tensor, "h w c -> 1 c h w")
+    elif tensor.ndim == 4:
+        tensor = rearrange(tensor, "f h w c -> f c h w")
+    else:
+        raise ValueError(f"Expected input with 3 or 4 dimensions; got shape {tensor.shape}.")
+
+    _, _, src_h, src_w = tensor.shape
+
+    if height >= src_h and width >= src_w:
+        new_h, new_w = src_h, src_w
+    else:
+        scale = min(height / src_h, width / src_w)
+        new_h = round(src_h * scale)
+        new_w = round(src_w * scale)
+        tensor = torch.nn.functional.interpolate(tensor, size=(new_h, new_w), mode="bilinear", align_corners=False)
+
+    pad_bottom = height - new_h
+    pad_right = width - new_w
+    if pad_bottom > 0 or pad_right > 0:
+        pad_mode = "reflect" if pad_bottom < new_h and pad_right < new_w else "replicate"
+        tensor = torch.nn.functional.pad(tensor, (0, pad_right, 0, pad_bottom), mode=pad_mode)
+
+    tensor = rearrange(tensor, "f c h w -> 1 c f h w")
+    return tensor
+
+
+def load_video_conditioning_hdr(
+    video_path: str,
+    height: int,
+    width: int,
+    frame_cap: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    hdr_transform: str = "logc3",
+    resize_mode: ResizeMode = ResizeMode.CENTER_CROP,
+) -> Iterator[torch.Tensor]:
+    """Load a video and yield preprocessed frames for HDR IC-LoRA conditioning.
+    Decodes through the standard path and applies the LDR compression that
+    matches training. Callers are responsible for providing Rec.709 SDR
+    input — the HDR IC-LoRA was trained on that color space.
+    Args:
+        hdr_transform: LDR-compression name (currently only ``logc3``).
+        resize_mode: How to fit the video to the target resolution.
+    Yields:
+        Per-frame tensors of shape ``(1, C, 1, height, width)``.
+    """
+    if hdr_transform != "logc3":
+        raise ValueError(f"Unsupported HDR transform: {hdr_transform}")
+
+    resize_fn = resize_and_reflect_pad if resize_mode is ResizeMode.REFLECT_PAD else resize_and_center_crop
+
+    for f in decode_video_by_frame(path=video_path, frame_cap=frame_cap, device=device):
+        frame = resize_fn(f.to(torch.float32), height, width)
+        ldr = (frame / 255.0).clamp(0.0, 1.0)
+        compressed = LogC3().compress_ldr(ldr)
+        yield to_vae_range(compressed).to(device=device, dtype=dtype)
 
 
 def decode_image(image_path: str) -> np.ndarray:
@@ -193,45 +330,118 @@ def encode_video(
     audio: Audio | None,
     output_path: str,
     video_chunks_number: int,
+    frame_converter: FrameConverter = yuv420p_bt709_converter_,
+    crf: int = 19,
+    preset: str = "veryfast",
+    thread_count: int = 0,
 ) -> None:
     if isinstance(video, torch.Tensor):
         video = iter([video])
 
-    first_chunk = next(video)
+    def convert(chunk: torch.Tensor) -> torch.Tensor:
+        return frame_converter(chunk.movedim(-1, -3))
 
-    _, height, width, _ = first_chunk.shape
+    first_chunk = convert(next(video))
+
+    if frame_converter.pixel_format == PixelFormat.RGB24:
+        height, width = first_chunk.shape[-3], first_chunk.shape[-2]
+    else:
+        height = first_chunk.shape[-2] * 2 // 3
+        width = first_chunk.shape[-1]
 
     container = av.open(output_path, mode="w")
-    stream = container.add_stream("libx264", rate=int(fps))
-    stream.width = width
-    stream.height = height
-    stream.pix_fmt = "yuv420p"
+    success = False
+    try:
+        stream = container.add_stream("libx264", rate=int(fps), options={"crf": str(crf), "preset": preset})
+        stream.width = width
+        stream.height = height
+        stream.pix_fmt = "yuv420p"
+        stream.codec_context.thread_count = thread_count
+        stream.codec_context.thread_type = "FRAME"
+        if frame_converter.color_space is not None:
+            stream.codec_context.colorspace = frame_converter.color_space.av_colorspace
+        if frame_converter.color_range is not None:
+            stream.codec_context.color_range = frame_converter.color_range.av_color_range
 
-    if audio is not None:
-        audio_stream = _prepare_audio_stream(container, audio.sampling_rate)
+        if audio is not None:
+            audio_stream = _prepare_audio_stream(container, audio.sampling_rate)
 
-    def all_tiles(
-        first_chunk: torch.Tensor, tiles_generator: Generator[tuple[torch.Tensor, int], None, None]
-    ) -> Generator[tuple[torch.Tensor, int], None, None]:
-        yield first_chunk
-        yield from tiles_generator
+        av_format = frame_converter.pixel_format.av_format
 
-    for video_chunk in tqdm(all_tiles(first_chunk, video), total=video_chunks_number):
-        video_chunk_cpu = video_chunk.to("cpu").numpy()
-        for frame_array in video_chunk_cpu:
-            frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
-            for packet in stream.encode(frame):
-                container.mux(packet)
+        def cpu_chunks() -> Generator[np.ndarray, None, None]:
+            yield first_chunk.to("cpu").numpy()
+            for chunk in video:
+                yield convert(chunk).to("cpu").numpy()
 
-    # Flush encoder
-    for packet in stream.encode():
-        container.mux(packet)
+        _encode_chunks_threaded(
+            container=container,
+            stream=stream,
+            av_format=av_format,
+            chunks=cpu_chunks(),
+            progress_total=video_chunks_number,
+        )
 
-    if audio is not None:
-        _write_audio(container, audio_stream, audio)
-
-    container.close()
+        if audio is not None:
+            _write_audio(container, audio_stream, audio)
+        success = True
+    finally:
+        container.close()
+        if not success:
+            Path(output_path).unlink(missing_ok=True)
     logger.info(f"Video saved to {output_path}")
+
+
+def _encode_chunks_threaded(
+    container: av.container.Container,
+    stream: av.video.stream.VideoStream,
+    av_format: str,
+    chunks: Iterator[np.ndarray],
+    progress_total: int,
+) -> None:
+    """Run libx264 frame.encode + container.mux on a background thread while
+    the caller produces numpy chunks on the current thread. The 1-slot queue
+    lets the producer get one chunk ahead (so the next VAE/gather chunk
+    overlaps with libx264 encoding the previous chunk) without buffering more
+    than one chunk in CPU memory.
+    """
+    chunk_queue: Queue[np.ndarray | None] = Queue(maxsize=1)
+    encoder_error: list[BaseException] = []
+
+    def encoder_worker() -> None:
+        error: BaseException | None = None
+        while True:
+            arr = chunk_queue.get()
+            if arr is None:
+                break
+            if error is not None:
+                continue
+            try:
+                for frame_array in arr:
+                    frame = av.VideoFrame.from_ndarray(frame_array, format=av_format)
+                    for packet in stream.encode(frame):
+                        container.mux(packet)
+            except Exception as e:
+                error = e
+        if error is None:
+            try:
+                for packet in stream.encode():
+                    container.mux(packet)
+            except Exception as e:
+                error = e
+        if error is not None:
+            encoder_error.append(error)
+
+    encoder_thread = threading.Thread(target=encoder_worker, name="h264-encoder")
+    encoder_thread.start()
+    try:
+        for arr in tqdm(chunks, total=progress_total):
+            chunk_queue.put(arr)
+    finally:
+        chunk_queue.put(None)
+        encoder_thread.join()
+
+    if encoder_error:
+        raise encoder_error[0]
 
 
 _INT_FORMAT_MAX: dict[str, float] = {
@@ -257,9 +467,23 @@ def _audio_frame_to_float(frame: av.AudioFrame) -> np.ndarray:
     return arr
 
 
-def get_videostream_metadata(path: str) -> tuple[float, int, int, int]:
-    """Read video stream metadata: (fps, num_frames, width, height).
+def get_videostream_fps(path: str) -> float:
+    """Read video stream FPS."""
+    container = av.open(path)
+    try:
+        video_stream = next(s for s in container.streams if s.type == "video")
+        return float(video_stream.average_rate)
+    finally:
+        container.close()
+
+
+def get_videostream_metadata(path: str) -> VideoPixelShape:
+    """Read video stream metadata as a VideoPixelShape with batch=1.
     If frame count is missing in the container, decodes the stream to count frames.
+    Args:
+        path: Path to the video file.
+    Returns:
+        VideoPixelShape with batch=1, frames, height, width, and fps populated from the stream.
     """
     container = av.open(path)
     try:
@@ -270,7 +494,7 @@ def get_videostream_metadata(path: str) -> tuple[float, int, int, int]:
             num_frames = sum(1 for _ in container.decode(video_stream))
         width = video_stream.codec_context.width
         height = video_stream.codec_context.height
-        return fps, num_frames, width, height
+        return VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=fps)
     finally:
         container.close()
 
@@ -338,16 +562,85 @@ def decode_audio_from_file(
     return Audio(waveform=waveform, sampling_rate=sample_rate)
 
 
-def decode_video_from_file(path: str, frame_cap: int, device: DeviceLikeType) -> Generator[torch.Tensor]:
+def decode_video_by_frame(
+    path: str,
+    device: DeviceLikeType,
+    starting_frame: int = 0,
+    frame_cap: int | None = None,
+) -> Generator[torch.Tensor]:
+    """Decodes video from a file by sequential frame index, without relying on pts.
+    Args:
+        path: Path to the video file.
+        device: Device to place the resulting tensors on.
+        starting_frame: Number of leading frames to skip (default 0).
+        frame_cap: Maximum number of frames to yield. If None, no frame limit (default None).
+    Yields:
+        Frames as tensors of shape (1, H, W, C), dtype uint8.
+    """
     container = av.open(path)
     try:
         video_stream = next(s for s in container.streams if s.type == "video")
-        for frame in container.decode(video_stream):
+        for index, frame in enumerate(container.decode(video_stream)):
+            if index < starting_frame:
+                continue
             tensor = torch.tensor(frame.to_rgb().to_ndarray(), dtype=torch.uint8, device=device).unsqueeze(0)
             yield tensor
-            frame_cap = frame_cap - 1
-            if frame_cap == 0:
+            if frame_cap is not None:
+                frame_cap -= 1
+                if frame_cap == 0:
+                    break
+    finally:
+        container.close()
+
+
+def decode_video_from_file(
+    path: str,
+    device: DeviceLikeType,
+    start_time: float = 0.0,
+    max_duration: float | None = None,
+) -> Generator[torch.Tensor]:
+    """Decodes video from a file using presentation timestamps for time-based trimming.
+    If a frame with no pts is encountered, falls back to :func:`decode_video_by_frame`
+    using FPS-derived frame indices.
+    Args:
+        path: Path to the video file.
+        device: Device to place the resulting tensors on.
+        start_time: Start time in seconds (default 0.0).
+        max_duration: Maximum duration in seconds to decode. If None, reads to end of
+            stream (default None).
+    Yields:
+        Frames as tensors of shape (1, H, W, C), dtype uint8.
+    """
+    container = av.open(path)
+    try:
+        video_stream = next(s for s in container.streams if s.type == "video")
+        time_base = float(video_stream.time_base)
+
+        if start_time > 0:
+            container.seek(int(start_time / time_base), stream=video_stream)
+
+        end_time = start_time + max_duration if max_duration is not None else None
+
+        for frame in container.decode(video_stream):
+            # PyAV may leave pts unset when the demuxer does not expose per-frame
+            # timestamps (e.g. some raw/elementary streams, stripped or missing
+            # metadata, or certain remux paths). Without pts we cannot map frames to
+            # wall-clock time, so we fall back to sequential frame indices using the
+            # stream's average frame rate.
+            if frame.pts is None:
+                fps = float(video_stream.average_rate)
+                starting_frame = round(start_time * fps)
+                frame_cap = round(max_duration * fps) if max_duration is not None else None
+                yield from decode_video_by_frame(
+                    path=path, device=device, starting_frame=starting_frame, frame_cap=frame_cap
+                )
+                return
+            frame_time = frame.pts * time_base
+            if frame_time < start_time:
+                continue
+            if end_time is not None and frame_time >= end_time:
                 break
+            yield torch.tensor(frame.to_rgb().to_ndarray(), dtype=torch.uint8, device=device).unsqueeze(0)
     finally:
         container.close()
 
@@ -389,3 +682,85 @@ def preprocess(image: np.array, crf: float = DEFAULT_IMAGE_CRF) -> np.array:
     with BytesIO(video_bytes) as video_file:
         image_array = decode_single_frame(video_file)
     return image_array
+
+
+def save_exr_tensor(tensor: torch.Tensor, file_path: str | Path, half: bool = False) -> None:
+    """Save a single tensor frame as EXR with linear sRGB colorspace metadata.
+    Args:
+        tensor: ``[H, W, C]`` or ``[C, H, W]`` float tensor.
+        file_path: Output path (e.g. ``frame_0000.exr``).
+        half: Force float16 output with ZIP compression.
+    """
+    if tensor.dim() == 3 and tensor.shape[0] == 3:
+        tensor = tensor.permute(1, 2, 0)
+    use_half = half or tensor.dtype in (torch.float16, torch.half)
+    img_np = np.ascontiguousarray(tensor.cpu().numpy().astype(np.float32))
+    file_path = str(file_path)
+
+    h, w = img_np.shape[:2]
+    fmt = OpenImageIO.HALF if use_half else OpenImageIO.FLOAT
+    spec = OpenImageIO.ImageSpec(w, h, 3, fmt)
+    spec.channelnames = ("R", "G", "B")
+    spec.attribute("compression", "zip")
+    spec.attribute("chromaticities", "float[8]", (0.64, 0.33, 0.30, 0.60, 0.15, 0.06, 0.3127, 0.3290))
+    spec.attribute("colorSpace", "sRGB")
+
+    out = OpenImageIO.ImageOutput.create(file_path)
+    if out is None:
+        raise RuntimeError(
+            f"Failed to create EXR writer for '{file_path}'. Ensure OpenImageIO is built with OpenEXR support."
+        )
+    try:
+        if not out.open(file_path, spec):
+            raise RuntimeError(f"Failed to open EXR file '{file_path}': {out.geterror()}")
+        if not out.write_image(img_np):
+            raise RuntimeError(f"Failed to write EXR image '{file_path}': {out.geterror()}")
+    finally:
+        out.close()
+
+
+def _linear_to_srgb(x: np.ndarray) -> np.ndarray:
+    """Linear -> sRGB OETF per IEC 61966-2-1. Input assumed in [0, 1]."""
+    x = np.clip(x, 0.0, 1.0)
+    return np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1.0 / 2.4) - 0.055)
+
+
+def encode_exr_sequence_to_mp4(exr_dir: Path, output_mp4: Path, frame_rate: float) -> None:
+    """Convert a linear EXR frame sequence to sRGB and encode to H.264 .mp4 via PyAV.
+    Exposure is fixed at EV=0 (no gain). Each EXR frame is clamped to [0, 1],
+    passed through the sRGB OETF, quantised to 8-bit BGR, and fed to a libx264
+    stream (crf 18, yuv420p). ``frame_rate`` is the original source video's
+    frame rate so playback matches the input timing.
+    """
+    import os  # noqa: PLC0415
+
+    os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
+    import cv2  # noqa: PLC0415
+
+    exr_files = sorted(exr_dir.glob("frame_*.exr"))
+    if not exr_files:
+        raise FileNotFoundError(f"No EXR frames found in {exr_dir}")
+
+    container = av.open(str(output_mp4), mode="w")
+    stream = container.add_stream("libx264", rate=Fraction(frame_rate).limit_denominator(1000))
+    stream.pix_fmt = "yuv420p"
+    stream.options = {"crf": "18", "movflags": "+faststart"}
+
+    try:
+        for i, exr_path in enumerate(exr_files):
+            hdr = cv2.imread(str(exr_path), cv2.IMREAD_UNCHANGED).astype(np.float32)
+            sdr = _linear_to_srgb(np.maximum(hdr, 0.0))
+            bgr8 = (sdr * 255.0 + 0.5).astype(np.uint8)
+
+            if i == 0:
+                stream.height = bgr8.shape[0]
+                stream.width = bgr8.shape[1]
+
+            frame = av.VideoFrame.from_ndarray(bgr8, format="bgr24")
+            for packet in stream.encode(frame):
+                container.mux(packet)
+
+        for packet in stream.encode():
+            container.mux(packet)
+    finally:
+        container.close()
