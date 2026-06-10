@@ -516,8 +516,19 @@ class LtxvTrainer:
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
-        self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
-        logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+        # Split audio-branch parameters so the optimizer can apply a separate
+        # learning rate (optimization.audio_learning_rate) to them.
+        self._trainable_vision_params = [
+            p for (name, p) in self._transformer.named_parameters() if p.requires_grad and "audio" not in name.lower()
+        ]
+        self._trainable_audio_params = [
+            p for (name, p) in self._transformer.named_parameters() if p.requires_grad and "audio" in name.lower()
+        ]
+        self._trainable_params = self._trainable_vision_params + self._trainable_audio_params
+        logger.debug(
+            f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,} "
+            f"(audio params: {sum(p.numel() for p in self._trainable_audio_params):,})"
+        )
 
     def _init_timestep_sampler(self) -> None:
         """Initialize the timestep sampler based on the config."""
@@ -770,13 +781,18 @@ class LtxvTrainer:
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
+        audio_lr = opt_cfg.audio_learning_rate if opt_cfg.audio_learning_rate is not None else lr
+        param_groups = [
+            {"params": self._trainable_vision_params, "lr": lr},
+            {"params": self._trainable_audio_params, "lr": audio_lr},
+        ]
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW(self._trainable_params, lr=lr)
+            optimizer = AdamW(param_groups, lr=lr)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
-            optimizer = AdamW8bit(self._trainable_params, lr=lr)
+            optimizer = AdamW8bit(param_groups, lr=lr)
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 

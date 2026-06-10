@@ -102,6 +102,11 @@ class OptimizationConfig(ConfigBaseModel):
         description="Learning rate for optimization",
     )
 
+    audio_learning_rate: float | None = Field(
+        default=None,
+        description="Learning rate for the audio-branch parameters. Defaults to learning_rate.",
+    )
+
     steps: int = Field(
         default=3000,
         description="Number of training steps",
