@@ -402,6 +402,11 @@ class CheckpointsConfig(ConfigBaseModel):
         ge=-1,
     )
 
+    save_first_checkpoint: bool = Field(
+        default=False,
+        description="Also save a checkpoint after the first optimization step.",
+    )
+
     precision: Literal["bfloat16", "float32"] = Field(
         default="bfloat16",
         description="Precision to use when saving checkpoint weights. Options: 'bfloat16' or 'float32'.",

@@ -7,7 +7,7 @@ import warnings
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 import torch
 import wandb
@@ -68,6 +68,49 @@ if not IS_MAIN_PROCESS:
 
 StepCallback = Callable[[int, int, list[Path] | None], None]  # (step, total, sampled paths or None) -> None
 
+
+class TrainingCallback(Protocol):
+    """Protocol for training callbacks to enable custom integrations.
+
+    The trainer reports facts at the moment they become true; callbacks own
+    what to do with them. All hooks fire on every rank except on_save, which
+    fires on the main process only (it runs after the main-process-only
+    checkpoint write); callbacks guard ranks themselves where needed.
+    """
+
+    def on_train_begin(self, trainer: "LtxvTrainer", config: LtxTrainerConfig) -> None:
+        """Called once before the training loop starts."""
+        ...
+
+    def on_step_end(self, step: int, total_steps: int, metrics: dict[str, float], video_paths: list[Path]) -> None:
+        """Called after each optimization step with that step's metrics and any
+        validation videos produced at this step."""
+        ...
+
+    def on_save(self, step: int, checkpoint_path: Path) -> None:
+        """Called after a checkpoint file is written, with training models
+        offloaded to CPU so the callback can use the GPU."""
+        ...
+
+    def on_validation_begin(self, step: int) -> None:
+        """Called before built-in validation sampling starts."""
+        ...
+
+    def on_validation_end(self, step: int, video_paths: list[Path]) -> None:
+        """Called after built-in validation sampling completes."""
+        ...
+
+    def should_stop_training(self) -> bool:
+        """Polled once per optimization step; return True to stop training
+        after a final checkpoint save. Must return the same value on every
+        rank."""
+        ...
+
+    def on_train_end(self) -> None:
+        """Called once after the final checkpoint save."""
+        ...
+
+
 MEMORY_CHECK_INTERVAL = 200
 
 
@@ -91,8 +134,9 @@ class TrainingStepOutput:
 
 
 class LtxvTrainer:
-    def __init__(self, trainer_config: LtxTrainerConfig) -> None:
+    def __init__(self, trainer_config: LtxTrainerConfig, callbacks: list[TrainingCallback] | None = None) -> None:
         self._config = trainer_config
+        self._callbacks = callbacks or []
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
@@ -187,14 +231,26 @@ class LtxvTrainer:
 
         sampled_videos_paths = None
 
+        for callback in self._callbacks:
+            callback.on_train_begin(self, cfg)
+
         with progress:
             if cfg.validation.interval and not cfg.validation.skip_initial_validation:
+                for callback in self._callbacks:
+                    callback.on_validation_begin(self._global_step)
                 with self._offloaded_optimizer_state():
                     sampled_videos_paths = self._run_distributed_validation(progress)
+                for callback in self._callbacks:
+                    callback.on_validation_end(self._global_step, sampled_videos_paths or [])
 
             self._accelerator.wait_for_everyone()
 
             for step in range(remaining_steps * cfg.optimization.gradient_accumulation_steps):
+                # Check callbacks for stop signal (rank-consistent by contract)
+                if any(callback.should_stop_training() for callback in self._callbacks):
+                    logger.info(f"🛑 Training stopped by callback at step {self._global_step}")
+                    break
+
                 # Get next batch, reset the dataloader if needed
                 try:
                     batch = next(data_iter)
@@ -230,14 +286,21 @@ class LtxvTrainer:
                         and self._global_step % cfg.validation.interval == 0
                         and is_optimization_step
                     ):
+                        for callback in self._callbacks:
+                            callback.on_validation_begin(self._global_step)
                         with self._offloaded_optimizer_state():
                             sampled_videos_paths = self._run_distributed_validation(progress)
+                        for callback in self._callbacks:
+                            callback.on_validation_end(self._global_step, sampled_videos_paths or [])
 
                     # Save checkpoint if needed
                     if (
                         cfg.checkpoints.interval
                         and self._global_step > 0
-                        and self._global_step % cfg.checkpoints.interval == 0
+                        and (
+                            self._global_step % cfg.checkpoints.interval == 0
+                            or (cfg.checkpoints.save_first_checkpoint and self._global_step == 1)
+                        )
                         and is_optimization_step
                     ):
                         self._save_checkpoint()
@@ -254,6 +317,22 @@ class LtxvTrainer:
                     current_lr = self._optimizer.param_groups[0]["lr"]
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
                     step_loss = output.loss.detach().mean().item()
+
+                    if self._callbacks and is_optimization_step:
+                        callback_metrics = {
+                            "loss": step_loss,
+                            "learning_rate": current_lr,
+                            "step": self._global_step,
+                        }
+                        if len(self._optimizer.param_groups) > 1:
+                            callback_metrics["audio_learning_rate"] = self._optimizer.param_groups[1]["lr"]
+                        for callback in self._callbacks:
+                            callback.on_step_end(
+                                self._global_step,
+                                cfg.optimization.steps,
+                                callback_metrics,
+                                list(sampled_videos_paths or []),
+                            )
 
                     progress.update_training(
                         loss=step_loss,
@@ -316,6 +395,9 @@ class LtxvTrainer:
         )
 
         saved_path = self._save_checkpoint()
+
+        for callback in self._callbacks:
+            callback.on_train_end()
 
         if IS_MAIN_PROCESS:
             # Log the training statistics
@@ -802,6 +884,31 @@ class LtxvTrainer:
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
 
     @contextlib.contextmanager
+    def _offload_models_for_callbacks(self) -> Iterator[None]:
+        """Move the training models and optimizer state to CPU while callbacks
+        run, so they get the GPU to themselves. Restores everything on exit.
+        No-op for FSDP, where manual device moves break sharding metadata.
+        """
+        if self._accelerator.distributed_type == DistributedType.FSDP:
+            yield
+            return
+
+        device = self._accelerator.device
+        self._optimizer.zero_grad(set_to_none=True)
+        unwrapped_transformer = self._accelerator.unwrap_model(self._transformer)
+        unwrapped_transformer.to("cpu")
+        if self._embeddings_processor is not None:
+            self._embeddings_processor.to("cpu")
+        free_gpu_memory()
+        try:
+            with self._offloaded_optimizer_state():
+                yield
+        finally:
+            unwrapped_transformer.to(device)
+            if self._embeddings_processor is not None:
+                self._embeddings_processor.to(device)
+
+    @contextlib.contextmanager
     def _offloaded_optimizer_state(self) -> Iterator[None]:
         """Context manager that offloads optimizer state to CPU during validation.
         Opt-in via `acceleration.offload_optimizer_during_validation`. Frees VRAM for
@@ -1166,6 +1273,13 @@ class LtxvTrainer:
         self._cleanup_checkpoints()
 
         self._save_training_state(save_dir)
+
+        if self._callbacks:
+            # Offload the training models so callbacks get the GPU to
+            # themselves (e.g. to sample from the freshly saved weights).
+            with self._offload_models_for_callbacks():
+                for callback in self._callbacks:
+                    callback.on_save(self._global_step, saved_weights_path)
 
         return saved_weights_path
 
