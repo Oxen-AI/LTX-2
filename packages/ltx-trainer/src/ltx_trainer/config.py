@@ -102,6 +102,11 @@ class OptimizationConfig(ConfigBaseModel):
         description="Learning rate for optimization",
     )
 
+    audio_learning_rate: float | None = Field(
+        default=None,
+        description="Learning rate for the audio-branch parameters. Defaults to learning_rate.",
+    )
+
     steps: int = Field(
         default=3000,
         description="Number of training steps",
@@ -395,6 +400,11 @@ class CheckpointsConfig(ConfigBaseModel):
         default=1,
         description="Number of most recent checkpoints to keep. Set to -1 to keep all checkpoints.",
         ge=-1,
+    )
+
+    save_first_checkpoint: bool = Field(
+        default=False,
+        description="Also save a checkpoint after the first optimization step.",
     )
 
     precision: Literal["bfloat16", "float32"] = Field(
