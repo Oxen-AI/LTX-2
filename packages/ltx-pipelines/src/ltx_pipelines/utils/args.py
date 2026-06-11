@@ -1,8 +1,11 @@
 import argparse
+import json
+from collections.abc import Sequence
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.quantization import QuantizationPolicy
 from ltx_pipelines.utils.constants import (
     DEFAULT_IMAGE_CRF,
@@ -12,6 +15,8 @@ from ltx_pipelines.utils.constants import (
     LTX_2_3_PARAMS,
     PipelineParams,
 )
+from ltx_pipelines.utils.quantization_factory import QuantizationKind
+from ltx_pipelines.utils.types import OffloadMode
 
 
 class ImageConditioningInput(NamedTuple):
@@ -30,7 +35,7 @@ class VideoConditioningAction(argparse.Action):
         option_string: str | None = None,  # noqa: ARG002
     ) -> None:
         path, strength_str = values
-        resolved_path = resolve_path(path)
+        resolved_path = resolve_existing_path(path)
         strength = float(strength_str)
         current = getattr(namespace, self.dest) or []
         current.append((resolved_path, strength))
@@ -56,7 +61,7 @@ class VideoMaskConditioningAction(argparse.Action):
             msg = f"{option_string} requires exactly 2 arguments (MASK_PATH STRENGTH), got {len(values)}"
             raise argparse.ArgumentError(self, msg)
 
-        mask_path = resolve_path(values[0])
+        mask_path = resolve_existing_path(values[0])
         strength = float(values[1])
         setattr(namespace, self.dest, (mask_path, strength))
 
@@ -74,7 +79,7 @@ class ImageAction(argparse.Action):
             raise argparse.ArgumentError(self, msg)
 
         conditioning = ImageConditioningInput(
-            path=resolve_path(values[0]),
+            path=resolve_existing_path(values[0]),
             frame_idx=int(values[1]),
             strength=float(values[2]),
             crf=int(values[3]) if len(values) > 3 else DEFAULT_IMAGE_CRF,
@@ -99,7 +104,7 @@ class LoraAction(argparse.Action):
         path = values[0]
         strength_str = values[1] if len(values) > 1 else str(DEFAULT_LORA_STRENGTH)
 
-        resolved_path = resolve_path(path)
+        resolved_path = resolve_existing_path(path)
         strength = float(strength_str)
 
         current = getattr(namespace, self.dest) or []
@@ -107,49 +112,153 @@ class LoraAction(argparse.Action):
         setattr(namespace, self.dest, current)
 
 
-def resolve_path(path: str) -> str:
-    return str(Path(path).expanduser().resolve().as_posix())
+class CompileAction(argparse.Action):
+    """Parse ``--compile [KEY=VALUE ...]`` into a :class:`CompilationConfig`.
+    The flag is absent           -> ``args.compile`` stays at its default (``None``).
+    The flag is passed alone     -> ``CompilationConfig()`` (vanilla torch defaults).
+    The flag is passed with args -> ``CompilationConfig`` with the given fields overridden.
+    Errors (unknown key, malformed value, duplicate key, empty value) raise
+    :class:`argparse.ArgumentError` so argparse formats them as friendly CLI
+    messages rather than uncaught tracebacks.
+    """
 
+    _ALLOWED_KEYS = frozenset({"mode", "backend", "fullgraph", "dynamic", "inductor_config", "dynamo_config"})
 
-QUANTIZATION_POLICIES = ("fp8-cast", "fp8-scaled-mm")
-
-
-class QuantizationAction(argparse.Action):
     def __call__(
         self,
         parser: argparse.ArgumentParser,  # noqa: ARG002
         namespace: argparse.Namespace,
         values: list[str],
-        option_string: str | None = None,
+        option_string: str | None = None,  # noqa: ARG002
     ) -> None:
-        if len(values) > 2:
-            msg = (
-                f"{option_string} accepts at most 2 arguments (POLICY and optional AMAX_PATH), got {len(values)} values"
-            )
-            raise argparse.ArgumentError(self, msg)
+        overrides: dict[str, object] = {}
+        for item in values:
+            if "=" not in item:
+                raise argparse.ArgumentError(self, f"expects KEY=VALUE pairs, got: {item!r}")
+            key, _, raw = item.partition("=")
+            key = key.strip()
+            if key not in self._ALLOWED_KEYS:
+                raise argparse.ArgumentError(
+                    self,
+                    f"{key!r} is not a CompilationConfig field; valid keys: {sorted(self._ALLOWED_KEYS)}",
+                )
+            if key in overrides:
+                raise argparse.ArgumentError(self, f"{key} given more than once")
+            if key == "mode":
+                overrides[key] = self._parse_mode(raw)
+            elif key == "backend":
+                overrides[key] = self._parse_non_empty(key, raw)
+            elif key == "fullgraph":
+                overrides[key] = self._parse_bool(key, raw)
+            elif key == "dynamic":
+                overrides[key] = self._parse_dynamic(raw)
+            elif key in ("inductor_config", "dynamo_config"):
+                overrides[key] = self._parse_json_dict(key, raw)
+        setattr(namespace, self.dest, CompilationConfig(**overrides))
 
-        policy_name = values[0]
-        if policy_name not in QUANTIZATION_POLICIES:
-            msg = f"Unknown quantization policy '{policy_name}'. Choose from: {', '.join(QUANTIZATION_POLICIES)}"
-            raise argparse.ArgumentError(self, msg)
+    def _parse_mode(self, raw: str) -> str | None:
+        stripped = raw.strip()
+        if not stripped:
+            raise argparse.ArgumentError(self, "mode=... value cannot be empty (use mode=none to clear)")
+        if stripped.lower() == "none":
+            return None
+        return stripped
 
-        if policy_name == "fp8-cast":
-            if len(values) > 1:
-                msg = f"{option_string} fp8-cast does not accept additional arguments"
-                raise argparse.ArgumentError(self, msg)
-            policy = QuantizationPolicy.fp8_cast()
-        elif policy_name == "fp8-scaled-mm":
-            amax_path = resolve_path(values[1]) if len(values) > 1 else None
-            policy = QuantizationPolicy.fp8_scaled_mm(amax_path)
+    def _parse_non_empty(self, key: str, raw: str) -> str:
+        stripped = raw.strip()
+        if not stripped:
+            raise argparse.ArgumentError(self, f"{key}=... value cannot be empty")
+        return stripped
 
-        setattr(namespace, self.dest, policy)
+    def _parse_bool(self, key: str, raw: str) -> bool:
+        normalized = raw.strip().lower()
+        if normalized in ("true", "1"):
+            return True
+        if normalized in ("false", "0"):
+            return False
+        raise argparse.ArgumentError(self, f"{key}=... must be true or false; got {raw!r}")
+
+    def _parse_dynamic(self, raw: str) -> bool | None:
+        normalized = raw.strip().lower()
+        if normalized in ("auto", "none"):
+            return None
+        if normalized in ("true", "1"):
+            return True
+        if normalized in ("false", "0"):
+            return False
+        raise argparse.ArgumentError(self, f"dynamic=... must be auto/true/false; got {raw!r}")
+
+    def _parse_json_dict(self, key: str, raw: str) -> dict[str, Any]:
+        # Inline JSON object starts with '{'; otherwise treat the value as a path to a JSON file.
+        stripped = raw.strip()
+        if not stripped:
+            raise argparse.ArgumentError(self, f"{key}=... value cannot be empty")
+        if stripped.startswith("{"):
+            source = stripped
+        else:
+            path = Path(stripped).expanduser()
+            if not path.is_file():
+                raise argparse.ArgumentError(
+                    self, f"{key}=... must be a JSON object or a path to a JSON file; got {raw!r}"
+                )
+            source = path.read_text()
+        try:
+            value = json.loads(source)
+        except json.JSONDecodeError as e:
+            raise argparse.ArgumentError(self, f"{key}=... must be a JSON object; got {raw!r} ({e.msg})") from None
+        if not isinstance(value, dict):
+            raise argparse.ArgumentError(self, f"{key}=... must decode to a JSON object; got {type(value).__name__}")
+        return value
+
+
+def resolve_path(path: str) -> str:
+    return str(Path(path).expanduser().resolve().as_posix())
+
+
+def resolve_existing_path(path: str) -> str:
+    """Resolve *path* and verify it exists."""
+    resolved = resolve_path(path)
+    if not Path(resolved).exists():
+        raise argparse.ArgumentError(None, f"Path not found: {resolved}")
+    return resolved
+
+
+QUANTIZATION_POLICIES = tuple(k.value for k in QuantizationKind)
+
+
+def _resolve_quantization(namespace: argparse.Namespace) -> None:
+    # Resolution is deferred until after parse_args because fp8-scaled-mm needs the
+    # checkpoint path, which isn't on the namespace when the --quantization argument
+    # is parsed.
+    name = getattr(namespace, "quantization", None)
+    if name is None or isinstance(name, QuantizationPolicy):
+        return
+    try:
+        kind = QuantizationKind(name)
+    except ValueError:
+        return
+    ckpt = getattr(namespace, "checkpoint_path", None) or getattr(namespace, "distilled_checkpoint_path", None)
+    if ckpt is None:
+        raise SystemExit(f"--quantization {kind.value} requires --checkpoint-path (or --distilled-checkpoint-path).")
+    namespace.quantization = kind.to_policy(checkpoint_path=ckpt)
+
+
+class _PipelineArgumentParser(argparse.ArgumentParser):
+    def parse_args(  # type: ignore[override]
+        self,
+        args: Sequence[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        ns = super().parse_args(args, namespace)
+        _resolve_quantization(ns)
+        return ns
 
 
 def detect_checkpoint_path(distilled: bool = False) -> str:
     """Pre-parse argv to extract the checkpoint path before building the full parser."""
     pre = argparse.ArgumentParser(add_help=False)
     flag = "--distilled-checkpoint-path" if distilled else "--checkpoint-path"
-    pre.add_argument(flag, type=resolve_path, required=True)
+    pre.add_argument(flag, type=resolve_existing_path, required=True)
     known, _ = pre.parse_known_args()
     return known.distilled_checkpoint_path if distilled else known.checkpoint_path
 
@@ -158,24 +267,33 @@ def basic_arg_parser(
     params: PipelineParams = LTX_2_3_PARAMS,
     distilled: bool = False,
 ) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
+    parser = _PipelineArgumentParser()
     if distilled:
         parser.add_argument(
             "--distilled-checkpoint-path",
-            type=resolve_path,
+            type=resolve_existing_path,
             required=True,
             help="Path to LTX-2 distilled model checkpoint (.safetensors file).",
         )
     else:
         parser.add_argument(
             "--checkpoint-path",
-            type=resolve_path,
+            type=resolve_existing_path,
             required=True,
             help="Path to LTX-2 model checkpoint (.safetensors file).",
         )
+        parser.add_argument(
+            "--num-inference-steps",
+            type=int,
+            default=params.num_inference_steps,
+            help=(
+                f"Number of denoising steps in the diffusion sampling process. "
+                f"Higher values improve quality but increase generation time (default: {params.num_inference_steps})."
+            ),
+        )
     parser.add_argument(
         "--gemma-root",
-        type=resolve_path,
+        type=resolve_existing_path,
         required=True,
         help="Path to the root directory containing the Gemma text encoder model files.",
     )
@@ -197,6 +315,98 @@ def basic_arg_parser(
         default=params.seed,
         help=f"Random seed for reproducible generation (default: {params.seed}).",
     )
+    parser.add_argument(
+        "--lora",
+        dest="lora",
+        action=LoraAction,
+        nargs="+",  # Accept 1-2 arguments per use (path and optional strength); validation is handled in LoraAction
+        metavar=("PATH", "STRENGTH"),
+        default=[],
+        help=(
+            "LoRA (Low-Rank Adaptation) model: path to model file and optional strength "
+            f"(default strength: {DEFAULT_LORA_STRENGTH}). Can be specified multiple times. "
+            "Example: --lora path/to/lora1.safetensors 0.8 --lora path/to/lora2.safetensors"
+        ),
+    )
+
+    parser.add_argument("--enhance-prompt", action="store_true")
+
+    def _positive_int(value: str) -> int:
+        try:
+            int_value = int(value)
+            if int_value < 1:
+                raise argparse.ArgumentTypeError("must be >= 1")
+            return int_value
+        except ValueError as e:
+            raise argparse.ArgumentTypeError(f"must be an integer, got {value}") from e
+
+    # Weight offloading
+    parser.add_argument(
+        "--offload",
+        dest="offload_mode",
+        type=OffloadMode,
+        default=OffloadMode.NONE,
+        choices=list(OffloadMode),
+        help=(
+            "Weight offloading strategy. "
+            "'none' keeps all weights on GPU (default). "
+            "'cpu' pins weights in CPU RAM, streams to GPU per layer. "
+            "'disk' reads weights from disk on demand (lowest memory). "
+            "Example: --offload cpu"
+        ),
+    )
+
+    parser.add_argument(
+        "--max-batch-size",
+        type=_positive_int,
+        default=1,
+        metavar="N",
+        help=(
+            "Maximum batch size per transformer forward pass. "
+            "Guided denoisers batch up to 4 guidance passes into a single call. "
+            "Default 1 runs passes sequentially. Set to 4 to batch all passes "
+            "together, which reduces layer-streaming PCIe transfers. "
+            "Example: --max-batch-size 4"
+        ),
+    )
+
+    parser.add_argument(
+        "--quantization",
+        choices=QUANTIZATION_POLICIES,
+        default=None,
+        help=(
+            f"Quantization policy: {', '.join(QUANTIZATION_POLICIES)}. "
+            "fp8-cast uses FP8 casting with upcasting during inference. "
+            "fp8-scaled-mm uses FP8 scaled matrix multiplication; the layer set is auto-discovered "
+            "from the checkpoint's .weight_scale tensors. "
+            "Example: --quantization fp8-cast or --quantization fp8-scaled-mm"
+        ),
+    )
+    parser.add_argument(
+        "--compile",
+        nargs="*",
+        action=CompileAction,
+        default=None,
+        metavar="KEY=VALUE",
+        help=(
+            "Enable torch.compile for transformer blocks. Pass alone for defaults, "
+            "or with KEY=VALUE overrides for any CompilationConfig field. "
+            "Keys: mode, backend, fullgraph, dynamic, inductor_config, dynamo_config. "
+            "inductor_config/dynamo_config take JSON objects (inline or a path to a .json file) "
+            "that fully replace the defaults. "
+            "Examples: --compile  or  --compile mode=reduce-overhead  or  "
+            "--compile mode=reduce-overhead fullgraph=true backend=eager  or  "
+            "--compile inductor_config='{\"max_autotune\": true}'"
+        ),
+    )
+    return parser
+
+
+def new_video_gen_arg_parser(
+    params: PipelineParams = LTX_2_3_PARAMS,
+    distilled: bool = False,
+) -> argparse.ArgumentParser:
+    parser = basic_arg_parser(params=params, distilled=distilled)
     parser.add_argument(
         "--height",
         type=int,
@@ -223,15 +433,6 @@ def basic_arg_parser(
         help=f"Frame rate of the generated video (fps) (default: {params.frame_rate}).",
     )
     parser.add_argument(
-        "--num-inference-steps",
-        type=int,
-        default=params.num_inference_steps,
-        help=(
-            f"Number of denoising steps in the diffusion sampling process. "
-            f"Higher values improve quality but increase generation time (default: {params.num_inference_steps})."
-        ),
-    )
-    parser.add_argument(
         "--image",
         dest="images",
         action=ImageAction,
@@ -247,34 +448,67 @@ def basic_arg_parser(
             "--image path/to/image2.jpg 160 0.9 0"
         ),
     )
+
+    return parser
+
+
+def video_editing_arg_parser(
+    distilled: bool = True,
+) -> argparse.ArgumentParser:
+    """Base argument parser for video-editing pipelines (retake, extension, inpainting, sticker movement).
+    Uses the same actions and conventions as basic_arg_parser but only the args needed for editing
+    (no height/width/num-frames; resolution comes from input video). Default is distilled checkpoint only.
+    """
+    parser = basic_arg_parser(distilled=distilled)
+    parser.add_argument("--video-path", type=resolve_existing_path, required=True, help="Path to the source video.")
+    parser.add_argument("--start-time", type=float, required=True, help="Start time of the region to regenerate (s).")
+    parser.add_argument("--end-time", type=float, required=True, help="End time of the region to regenerate (s).")
+    return parser
+
+
+def lipdub_arg_parser(
+    params: PipelineParams = LTX_2_3_PARAMS,
+) -> argparse.ArgumentParser:
+    """Argument parser for the lip-dub pipeline.
+    Frame count and frame rate are derived from the reference video at runtime (the frame count
+    is silently snapped down to the nearest 8k+1), so this parser intentionally omits
+    --num-frames, --frame-rate, and --image. Distilled checkpoint only.
+    """
+    parser = basic_arg_parser(params=params, distilled=True)
     parser.add_argument(
-        "--lora",
-        dest="lora",
-        action=LoraAction,
-        nargs="+",  # Accept 1-2 arguments per use (path and optional strength); validation is handled in LoraAction
-        metavar=("PATH", "STRENGTH"),
-        default=[],
+        "--height",
+        type=int,
+        default=params.stage_2_height,
         help=(
-            "LoRA (Low-Rank Adaptation) model: path to model file and optional strength "
-            f"(default strength: {DEFAULT_LORA_STRENGTH}). Can be specified multiple times. "
-            "Example: --lora path/to/lora1.safetensors 0.8 --lora path/to/lora2.safetensors"
+            f"Height of the generated video in pixels, should be divisible by 64 (default: {params.stage_2_height})."
         ),
     )
-
-    parser.add_argument("--enhance-prompt", action="store_true")
     parser.add_argument(
-        "--quantization",
-        dest="quantization",
-        action=QuantizationAction,
-        nargs="+",
-        metavar=("POLICY", "AMAX_PATH"),
-        default=None,
+        "--width",
+        type=int,
+        default=params.stage_2_width,
+        help=f"Width of the generated video in pixels, should be divisible by 64 (default: {params.stage_2_width}).",
+    )
+    parser.add_argument(
+        "--spatial-upsampler-path",
+        type=resolve_path,
+        required=True,
         help=(
-            f"Quantization policy: {', '.join(QUANTIZATION_POLICIES)}. "
-            "fp8-cast uses FP8 casting with upcasting during inference. "
-            "fp8-scaled-mm uses FP8 scaled matrix multiplication (optionally provide amax calibration file path). "
-            "Example: --quantization fp8-cast or --quantization fp8-scaled-mm /path/to/amax.json"
+            "Path to the spatial upsampler model used to increase the resolution "
+            "of the generated video in the latent space."
         ),
+    )
+    parser.add_argument(
+        "--reference-video",
+        type=resolve_path,
+        required=True,
+        help="Reference video file (video + audio track used for IC-LoRA and audio identity).",
+    )
+    parser.add_argument(
+        "--reference-strength",
+        type=float,
+        default=1.0,
+        help="Strength for IC-LoRA video reference conditioning (default: 1.0).",
     )
     return parser
 
@@ -282,7 +516,7 @@ def basic_arg_parser(
 def default_1_stage_arg_parser(params: PipelineParams = LTX_2_3_PARAMS) -> argparse.ArgumentParser:
     video_guider = params.video_guider_params
     audio_guider = params.audio_guider_params
-    parser = basic_arg_parser(params=params)
+    parser = new_video_gen_arg_parser(params=params)
     parser.add_argument(
         "--negative-prompt",
         type=str,
@@ -348,7 +582,7 @@ def default_1_stage_arg_parser(params: PipelineParams = LTX_2_3_PARAMS) -> argpa
         default=video_guider.skip_step,
         help=(
             "Video skip step N controls periodic skipping during the video diffusion process: "
-            "only steps where step_index % (N + 1) == 0 are processed, all others are skipped "
+            "only steps where step_index %% (N + 1) == 0 are processed, all others are skipped "
             f"(e.g., 0 = no skipping; 1 = skip every other step; 2 = skip 2 of every 3 steps; "
             f"default: {video_guider.skip_step})."
         ),
@@ -408,7 +642,7 @@ def default_1_stage_arg_parser(params: PipelineParams = LTX_2_3_PARAMS) -> argpa
         default=audio_guider.skip_step,
         help=(
             "Audio skip step N controls periodic skipping during the audio diffusion process: "
-            "only steps where step_index % (N + 1) == 0 are processed, all others are skipped "
+            "only steps where step_index %% (N + 1) == 0 are processed, all others are skipped "
             f"(e.g., 0 = no skipping; 1 = skip every other step; 2 = skip 2 of every 3 steps; "
             f"default: {audio_guider.skip_step})."
         ),
@@ -448,7 +682,7 @@ def default_2_stage_arg_parser(params: PipelineParams = LTX_2_3_PARAMS) -> argpa
     )
     parser.add_argument(
         "--spatial-upsampler-path",
-        type=resolve_path,
+        type=resolve_existing_path,
         required=True,
         help=(
             "Path to the spatial upsampler model used to increase the resolution "
@@ -476,7 +710,7 @@ def hq_2_stage_arg_parser(params: PipelineParams = LTX_2_3_HQ_PARAMS) -> argpars
 
 
 def default_2_stage_distilled_arg_parser(params: PipelineParams = LTX_2_3_PARAMS) -> argparse.ArgumentParser:
-    parser = basic_arg_parser(params=params, distilled=True)
+    parser = new_video_gen_arg_parser(params=params, distilled=True)
     parser.set_defaults(height=params.stage_2_height, width=params.stage_2_width)
     # Update help text to reflect 2-stage defaults
     for action in parser._actions:
@@ -491,7 +725,7 @@ def default_2_stage_distilled_arg_parser(params: PipelineParams = LTX_2_3_PARAMS
             )
     parser.add_argument(
         "--spatial-upsampler-path",
-        type=resolve_path,
+        type=resolve_existing_path,
         required=True,
         help=(
             "Path to the spatial upsampler model used to increase the resolution "
