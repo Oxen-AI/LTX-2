@@ -117,6 +117,20 @@ class TrainingStrategy(ABC):
             before backward(). Returning unreduced loss enables per-sigma-bucket tracking.
         """
 
+    def compute_loss_components(
+        self,
+        video_pred: Tensor,
+        audio_pred: Tensor | None,
+        inputs: ModelInputs,
+    ) -> tuple[Tensor, Tensor] | None:
+        """Optional per-modality loss breakdown for logging, [B,] each.
+
+        Override to return ``(video_loss, audio_loss)`` when a strategy trains video
+        and audio jointly, so the trainer can log them separately. Their sum must
+        equal :meth:`compute_loss`. Returns ``None`` (default) when there is no split.
+        """
+        return None
+
     def get_checkpoint_metadata(self) -> dict[str, Any]:
         """Get strategy-specific metadata to include in checkpoint files.
         Override this method in subclasses to add custom metadata,

@@ -127,6 +127,8 @@ class TrainingStepOutput:
 
     loss: Tensor  # [B,] per-element loss (unreduced)
     sigma: Tensor  # [B,] sampled sigma, detached from computational graph
+    video_loss: Tensor | None = None  # [B,] video loss when trained jointly with audio
+    audio_loss: Tensor | None = None  # [B,] audio loss when trained jointly with video
 
 
 class LtxvTrainer:
@@ -326,10 +328,17 @@ class LtxvTrainer:
                     current_lr = self._optimizer.param_groups[0]["lr"]
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
                     step_loss = output.loss.detach().mean().item()
+                    loss_components = {}
+                    if output.video_loss is not None and output.audio_loss is not None:
+                        loss_components = {
+                            "video_loss": output.video_loss.detach().mean().item(),
+                            "audio_loss": output.audio_loss.detach().mean().item(),
+                        }
 
                     if self._callbacks and is_optimization_step:
                         callback_metrics = {
                             "loss": step_loss,
+                            **loss_components,
                             "learning_rate": current_lr,
                             "step": self._global_step,
                         }
@@ -356,6 +365,7 @@ class LtxvTrainer:
                         self._sigma_tracker.update(output.sigma.cpu().tolist(), output.loss.detach().cpu().tolist())
                         metrics = {
                             "train/loss": step_loss,
+                            **{f"train/{k}": v for k, v in loss_components.items()},
                             "train/learning_rate": current_lr,
                             "train/step_time": step_time,
                             "train/global_step": self._global_step,
@@ -467,8 +477,16 @@ class LtxvTrainer:
             perturbations=None,
         )
 
-        # Use strategy to compute loss (returns per-element [B,] for sigma-bucket tracking)
-        loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
+        # Use strategy to compute loss (returns per-element [B,] for sigma-bucket tracking).
+        # When a strategy trains video+audio jointly it exposes the per-modality split for
+        # logging; their sum is the loss used for backward, so output.loss is unchanged.
+        components = self._training_strategy.compute_loss_components(video_pred, audio_pred, model_inputs)
+        if components is not None:
+            video_loss, audio_loss = components
+            loss = video_loss + audio_loss
+        else:
+            video_loss = audio_loss = None
+            loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
 
         # Sigma comes from whichever modality is generated (video preferred, else audio).
         if model_inputs.video is not None and model_inputs.video.enabled:
@@ -476,7 +494,7 @@ class LtxvTrainer:
         else:
             sigma = model_inputs.audio.sigma.detach()
 
-        return TrainingStepOutput(loss=loss, sigma=sigma)
+        return TrainingStepOutput(loss=loss, sigma=sigma, video_loss=video_loss, audio_loss=audio_loss)
 
     def _load_models(self) -> None:
         """Load the transformer and embeddings processor for training."""

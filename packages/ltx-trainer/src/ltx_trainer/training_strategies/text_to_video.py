@@ -260,18 +260,36 @@ class TextToVideoStrategy(TrainingStrategy):
         inputs: ModelInputs,
     ) -> Tensor:
         """Compute masked MSE loss for video and optionally audio. Returns [B,]."""
+        video_loss, audio_loss = self._video_audio_losses(video_pred, audio_pred, inputs)
+        return video_loss if audio_loss is None else video_loss + audio_loss
+
+    def compute_loss_components(
+        self,
+        video_pred: Tensor,
+        audio_pred: Tensor | None,
+        inputs: ModelInputs,
+    ) -> tuple[Tensor, Tensor] | None:
+        """Per-element (video_loss, audio_loss) [B,] when training with audio, else None."""
+        video_loss, audio_loss = self._video_audio_losses(video_pred, audio_pred, inputs)
+        return None if audio_loss is None else (video_loss, audio_loss)
+
+    def _video_audio_losses(
+        self,
+        video_pred: Tensor,
+        audio_pred: Tensor | None,
+        inputs: ModelInputs,
+    ) -> tuple[Tensor, Tensor | None]:
+        """Masked MSE video loss [B,], plus audio loss [B,] when audio is trained (else None)."""
         # Video loss: per-element mean over (seq, channels), [B,]
         video_loss = (video_pred - inputs.video_targets).pow(2)
         video_loss_mask = inputs.video_loss_mask.unsqueeze(-1).float()
         masked = video_loss.mul(video_loss_mask)
         video_loss = masked.mean(dim=[-2, -1]) / video_loss_mask.mean(dim=[-2, -1]).clamp(min=1e-8)
 
-        # If no audio, return video loss only
+        # If no audio, video loss only
         if not self.config.with_audio or audio_pred is None or inputs.audio_targets is None:
-            return video_loss
+            return video_loss, None
 
         # Audio loss: per-element mean over (seq, channels), [B,]
         audio_loss = (audio_pred - inputs.audio_targets).pow(2).mean(dim=[-2, -1])
-
-        # Combined loss [B,]
-        return video_loss + audio_loss
+        return video_loss, audio_loss
