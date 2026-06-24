@@ -137,14 +137,17 @@ class LtxvTrainer:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
 
-        # ValidationRunner loads its own models (text encoder, VAE encoder/decoder, etc.),
-        # caches prompt embeddings and conditioning media, then unloads encoders.
-        self._validation_runner = ValidationRunner(
-            config=self._config.validation,
-            model_path=self._config.model.model_path,
-            text_encoder_path=self._config.model.text_encoder_path,
-            load_text_encoder_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
-        )
+        # ValidationRunner eagerly loads the text encoder and VAE decoder and caches
+        # prompt embeddings. It only runs when validation.interval is set, so skip
+        # building it (and those loads) when validation is disabled.
+        self._validation_runner = None
+        if self._config.validation.interval:
+            self._validation_runner = ValidationRunner(
+                config=self._config.validation,
+                model_path=self._config.model.model_path,
+                text_encoder_path=self._config.model.text_encoder_path,
+                load_text_encoder_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
+            )
 
         self._load_models()
         self._setup_accelerator()
