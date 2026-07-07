@@ -1,0 +1,56 @@
+reviews:
+  # more strict review profile
+  profile: "assertive"
+
+  # put high level summary in its own comment
+  # instead of editing your pr description
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+  high_level_summary_placeholder: ""
+
+  # also never auto edit titles
+  auto_title_placeholder: ""
+
+  # the pr-review channel takes care of this
+  suggested_reviewers: false
+
+  # python trainer, no docstring coverage gate
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+
+  # and disable the docstring generation checkbox
+  finishing_touches:
+    docstrings:
+      enabled: false
+
+  path_instructions:
+    - path: "**"
+      instructions: |
+        Do not comment about failing CI, it's already clear and visible.
+        Linux/CUDA only. LTX-2/LTX-2.3 auto-detected from checkpoint; LTXV (video-only) is not supported.
+    - path: "packages/ltx-trainer/**"
+      instructions: |
+        Pydantic configs use extra="forbid". New fields hard-fail at load and need matching configs/*.yaml and docs/configuration-reference.md updates.
+        FlexibleStrategy is the unified training path; text_to_video and video_to_video strategies are deprecated.
+        Frame count must satisfy frames % 8 == 1; width and height divisible by 32.
+        Tests: flat def test_* only; test public APIs, not _private methods.
+    - path: "packages/ltx-pipelines/**"
+      instructions: |
+        Update packages/ltx-pipelines/CLAUDE.md when changing __init__/__call__ signatures, sigma schedules, denoiser types, or guidance defaults.
+        Two-stage non-distilled pipelines require distilled_lora on stage 2 (HQ applies it to both stages).
+    - path: "packages/ltx-trainer/configs/**"
+      instructions: |
+        Must stay valid against config.py after any schema change.
+
+  # auto review new commits
+  # auto review draft PRs
+  # auto review against any base branch
+  # don't pause reviews on active PRs (default pauses after 5 commits)
+  auto_review:
+    enabled: true
+    drafts: true
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 0
+    base_branches:
+      - ".*"
