@@ -74,6 +74,7 @@ from ltx_core.model.video_vae import (
     is_diffusion_video_vae,
     video_decoder_sd_ops_for_checkpoint,
 )
+from ltx_core.model.video_vae.keyframes import DecodeKeyframes
 from ltx_core.model.video_vae.transformer import (
     DiffVAEMode,
     NAttentionKind,
@@ -116,6 +117,11 @@ from ltx_pipelines.utils.types import AutoDuration, Denoiser, ModalitySpec, Offl
 _ENCODE_MODEL_TYPES = frozenset({"gemma3", "gemma4", "gemma4_unified"})
 
 logger = logging.getLogger(__name__)
+
+ModelWrapper = Callable[[torch.nn.Module, "LatentTools | None"], torch.nn.Module]
+"""Wraps a built transformer for one :meth:`DiffusionStage.__call__` (see
+:meth:`DiffusionStage.with_model_wrapper`). Must keep the
+``(video, audio, perturbations) -> (video, audio)`` forward signature."""
 
 T = TypeVar("T")
 _M = TypeVar("_M", bound=torch.nn.Module)
@@ -286,6 +292,7 @@ class DiffusionStage:
         self._compilation_config = compilation_config
         self._alloc_trim_strategy = alloc_trim_strategy
         self.video_scale_factors = scale_factors
+        self._model_wrapper: ModelWrapper | None = None
 
     @classmethod
     def from_checkpoint(  # noqa: PLR0913
@@ -449,6 +456,20 @@ class DiffusionStage:
         new._transformer_builder = builder
         return new
 
+    def with_model_wrapper(self, wrapper: "ModelWrapper | None") -> "DiffusionStage":
+        """Return a new stage that passes each built transformer through ``wrapper``.
+        Functional: never mutates ``self``. The wrapper is applied inside the transformer
+        context -- after the model is built, before the denoising loop -- on both the standard
+        and block-streaming paths, and it receives the call's video tools. Wrapping *here*
+        rather than around the builder is what lets a wrapper compose with offloading: a
+        wrapping builder would hide a :class:`StreamingModelBuilder` from :attr:`_is_streaming`,
+        so the stage would take the plain ``gpu_model`` path and never tear the stream down.
+        ``wrapper=None`` clears any previously set wrapper.
+        """
+        new = copy.copy(self)
+        new._model_wrapper = wrapper
+        return new
+
     def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> "DiffusionStage":
         """Return a new ``DiffusionStage`` built with exactly ``loras`` (replacing the current set)."""
         return self.with_builder(self._transformer_builder.with_loras(loras))
@@ -512,10 +533,16 @@ class DiffusionStage:
         stepper: DiffusionStepProtocol | None = None,
         loop: Callable[..., tuple[LatentState | None, LatentState | None]] | None = None,
         max_batch_size: int = 1,
+        audio_fps: float | None = None,
     ) -> tuple[LatentState | None, LatentState | None]:
         """Build transformer -> run denoising loop -> free transformer.
         Returns ``(video_state | None, audio_state | None)`` with cleared
         conditionings and unpatchified latents for present modalities.
+        ``fps`` is the transformer's time base: it sets RoPE time (``pixel_frame / fps``)
+        and, by default, the audio latent's duration (``frames / fps``). ``audio_fps``
+        decouples the two for callers that hand the transformer a time base other than the
+        clip's real frame rate -- audio is then sized from ``frames / audio_fps``, so its
+        duration still matches playback. Omitted -> same as ``fps``.
         """
         if video is None and audio is None:
             raise ValueError("At least one of `video` or `audio` must be provided")
@@ -527,6 +554,7 @@ class DiffusionStage:
             stepper = EulerDiffusionStep()
 
         pixel_shape = VideoPixelShape(batch=1, frames=frames, height=height, width=width, fps=fps)
+        audio_pixel_shape = pixel_shape if audio_fps is None else pixel_shape._replace(fps=audio_fps)
 
         # Build video_tools up front so it can be forwarded to the transformer
         # context (required by TiledDataParallelBuilder in multi-GPU mode).
@@ -542,7 +570,8 @@ class DiffusionStage:
 
         mode = "streaming" if self._is_streaming else "standard"
         logger.info("Building transformer (%s) from %s", mode, self._transformer_builder.checkpoint)
-        with self._transformer_ctx(video_tools=video_tools) as transformer:
+        with self._transformer_ctx(video_tools=video_tools) as built:
+            transformer = built if self._model_wrapper is None else self._model_wrapper(built, video_tools)
             logger.info(
                 "Running denoising loop (%d steps, %dx%d %d frames @ %.1f fps)",
                 len(sigmas) - 1,
@@ -558,7 +587,7 @@ class DiffusionStage:
             audio_tools: LatentTools | None = None
             audio_state: LatentState | None = None
             if audio is not None:
-                a_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
+                a_shape = AudioLatentShape.from_video_pixel_shape(audio_pixel_shape)
                 audio_tools = AudioLatentTools(AudioPatchifier(patch_size=1), a_shape)
                 audio_state = _build_state(audio, audio_tools, noiser, self._dtype, self._device)
 
@@ -584,13 +613,14 @@ class DiffusionStage:
 
 class RecordingDiffusionStage:
     """Wraps a :class:`DiffusionStage` and records the states each call produced.
-    The supported way to reach a stage's non-video outputs -- currently the generated keyframe
-    latents on ``LatentState.generated_keyframes`` -- from *outside* a pipeline, without the
-    pipeline having to grow a diagnostics return value or a lifecycle callback. Pipelines hold
-    their stage in a plain attribute, so a caller substitutes this in::
+    Diagnostics wrapper for a stage's intermediate ``LatentState``s. Generated keyframes that
+    already sit at final output resolution are on ``PipelineOutput.keyframes``; this wrapper
+    remains the way to inspect per-stage states (including half-res stage-1 slots) without a
+    lifecycle callback. Pipelines hold their stage in a plain attribute, so a caller
+    substitutes this in::
         pipeline.stage = RecordingDiffusionStage(pipeline.stage)
-        video, audio = pipeline(...)
-        keyframes = pipeline.stage.video_states[0].generated_keyframes
+        result = pipeline(...)
+        keyframes = pipeline.stage.generated_keyframes
     Delegates every other attribute to the wrapped stage, so a substituted stage stays usable
     wherever the original was. Recording holds references to the returned states, which keeps
     their latents alive -- fine for diagnostics on one run, not something to leave enabled in a
@@ -1066,6 +1096,7 @@ class VideoDecoder:
         self._device = device
         self._diffvae_optimization = diffvae_optimization
         diffusion_vae = is_diffusion_video_vae(self._checkpoint_path)
+        self._diffusion_vae = diffusion_vae
         cfg = diffvae_optimization.resolve() if diffusion_vae else None
         use_dsl = cfg is not None and cfg.attention is NAttentionKind.BLACKWELL_DSL
         if decoder_builder is not None:
@@ -1100,17 +1131,6 @@ class VideoDecoder:
                 registry=registry or ModelRegistry(cache_models=True, cache_weights=False),
                 module_ops=module_ops,
             )
-        # DiffVAE ModuleOps from ``diffvae_optimization`` policy (default ChunkedEager).
-        # MGPU wraps this builder in ``DistributedDecoderBuilder`` — keep the op on the
-        # inner builder so it still runs before the distributed wrapper is constructed.
-        if diffusion_vae:
-            op = build_diffvae_mode_op(
-                diffvae_optimization,
-                CompilationConfig() if diffvae_optimization.resolve().compile_blocks else None,
-            )
-            self._decoder_builder = self._decoder_builder.with_module_ops(
-                (*self._decoder_builder.module_ops, op),
-            )
         self._alloc_trim_strategy = alloc_trim_strategy
 
     @property
@@ -1121,6 +1141,31 @@ class VideoDecoder:
     def diffvae_optimization(self) -> DiffVAEMode:
         return self._diffvae_optimization
 
+    def with_builder(self, builder: BuilderProtocol) -> "VideoDecoder":
+        """Return a new ``VideoDecoder`` that builds from ``builder``.
+        Functional: never mutates ``self``; shares checkpoint, dtype, device, and
+        trim strategy. Mirrors :meth:`DiffusionStage.with_builder`.
+        """
+        new = copy.copy(self)
+        new._decoder_builder = builder
+        return new
+
+    def _prepared_builder(self) -> BuilderProtocol:
+        """Return the builder with DiffVAE mode ops applied at build time.
+        DiffVAE ``module_ops`` live on the decoder (not on the caller-held builder),
+        matching :meth:`DiffusionStage._prepared_builder`. That keeps
+        ``with_builder`` / Dist ``with_tiling`` swaps on the raw builder, while
+        every build still installs the configured DiffVAE policy.
+        """
+        builder = self._decoder_builder
+        if not self._diffusion_vae:
+            return builder
+        op = build_diffvae_mode_op(
+            self._diffvae_optimization,
+            CompilationConfig() if self._diffvae_optimization.resolve().compile_blocks else None,
+        )
+        return builder.with_module_ops((*builder.module_ops, op))
+
     def __call__(
         self,
         latent: torch.Tensor,
@@ -1128,17 +1173,50 @@ class VideoDecoder:
         generator: torch.Generator | None = None,
         *,
         dtype: torch.dtype | None = None,
+        keyframes: DecodeKeyframes | None = None,
     ) -> Iterator[torch.Tensor]:
         """Decode *latent* to pixel-space video chunks. Decoder freed after exhaustion.
         ``dtype`` overrides the constructor dtype for this call only (e.g. float32 for
         HDR raw-in/raw-out). Omitted → same dtype as on construction (SDR default).
+        ``keyframes`` anchors the decode on already-encoded planes. Every decoder in this repo
+        takes it, so this never branches on which VAE was built: a diffusion VAE uses the planes,
+        a conv VAE logs that it is dropping them, and a distributed decoder splits them across
+        its ranks. The keyword is only passed when there is something to pass, so a decoder
+        written against the older signature still serves plain decodes.
         """
         build_dtype = self._dtype if dtype is None else dtype
         latent = latent.to(dtype=build_dtype)
         logger.info("Building video decoder from %s", self._checkpoint_path)
-        decoder = self._decoder_builder.build(device=self._device, dtype=build_dtype).eval()
+        decoder = self._prepared_builder().build(device=self._device, dtype=build_dtype).eval()
+        extra = {} if keyframes is None else {"keyframes": keyframes}
+        chunks = decoder.decode_video(latent, tiling_config, generator, **extra)
         return _cleanup_iter(
-            decoder.decode_video(latent, tiling_config, generator),
+            chunks,
+            decoder,
+            alloc_trim_strategy=self._alloc_trim_strategy,
+        )
+
+    def decode_single_frames(
+        self,
+        latents: Sequence[torch.Tensor],
+        generator: torch.Generator | Sequence[torch.Generator | None] | None = None,
+        *,
+        dtype: torch.dtype | None = None,
+    ) -> Iterator[torch.Tensor]:
+        """Decode each latent as its own one-frame clip on one VAE build, then free it.
+        A causal VAE cannot decode stacked independent planes without bleeding neighbours.
+        Dist builds still decode locally on every rank; this does not go through the
+        split/gather ``decode_video`` path whose workers yield nothing.
+        """
+        if not latents:
+            return iter(())
+        build_dtype = self._dtype if dtype is None else dtype
+        moved = [latent.to(dtype=build_dtype) for latent in latents]
+        logger.info("Building video decoder from %s", self._checkpoint_path)
+        decoder = self._prepared_builder().build(device=self._device, dtype=build_dtype).eval()
+        chunks = decoder.decode_single_frames(moved, generator)
+        return _cleanup_iter(
+            chunks,
             decoder,
             alloc_trim_strategy=self._alloc_trim_strategy,
         )

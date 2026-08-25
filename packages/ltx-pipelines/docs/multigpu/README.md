@@ -52,10 +52,12 @@ user-defined **runner** (a subclass of `MGPURunner`) in SPMD lockstep. A runner'
 builder (SP / TDP / distributed decoder / distributed Gemma). All builders share one
 `ModelRegistry` so the checkpoint loads from disk once per process.
 
-Two runners are provided, each with a CLI:
+Four runners are provided, each with a CLI:
 
 - [`ltx_pipelines.ti2vid_two_stages_mgpu`](../../src/ltx_pipelines/ti2vid_two_stages_mgpu.py) — SP stage 1 + TDP stage 2 + Accelerate Gemma + distributed VAE.
+- [`ltx_pipelines.ti2vid_two_stages_hq_mgpu`](../../src/ltx_pipelines/ti2vid_two_stages_hq_mgpu.py) — SP stage 1 + TDP stage 2 (HQ sampler) + Accelerate Gemma + distributed VAE.
 - [`ltx_pipelines.distilled_mgpu`](../../src/ltx_pipelines/distilled_mgpu.py) — SP (shared stage) + Accelerate Gemma + distributed VAE.
+- [`ltx_pipelines.dfr_mgpu`](../../src/ltx_pipelines/dfr_mgpu.py) — SP on both DFR stages (base + detailing) + Accelerate Gemma + distributed VAE.
 
 Checkpoint paths follow the same monolith **XOR** split contract as single-GPU CLIs:
 the parser builds a `ModelPaths` object and runners read only that (see
@@ -72,7 +74,16 @@ python -m ltx_pipelines.ti2vid_two_stages_mgpu \
     --prompt "A beautiful sunset over the ocean" \
     --output-path output.mp4
 
-# Same entrypoint with a Comfy-aligned split pack (subset of flags as needed)
+# DFR on all visible GPUs (distilled checkpoint)
+python -m ltx_pipelines.dfr_mgpu \
+    --distilled-checkpoint-path path/to/distilled_checkpoint.safetensors \
+    --detailing-lora path/to/detailing_lora.safetensors \
+    --spatial-upsampler-path path/to/upsampler.safetensors \
+    --gemma-root path/to/gemma \
+    --prompt "A beautiful sunset over the ocean" \
+    --output-path output.mp4
+
+# Same entrypoint with a Comfy-aligned split pack (subset of flags as needed; TI2Vid shown)
 python -m ltx_pipelines.ti2vid_two_stages_mgpu \
     --transformer-path path/to/diffusion_models/ltx-….safetensors \
     --text-encoder-path path/to/text_encoders/gemma-….safetensors \

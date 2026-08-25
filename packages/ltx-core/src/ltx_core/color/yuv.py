@@ -79,17 +79,78 @@ _COLOR_SPACE_MATRICES = {
 }
 
 
+# cuBLAS GEMM dims are int32. PyTorch folds ``(F, H*W, 3) @ (3, 3)`` into one
+# ``mm`` of size ``F*H*W``, reported as ``n`` in column-major. ``n`` must be
+# strictly less than this value (see ``at::cuda::blas::gemm``).
+_CUBLAS_INT32_MAX = 2**31 - 1
+
+
 def _require_rgb_chw(image: torch.Tensor) -> None:
     if image.ndim < 3 or image.shape[-3] != 3:
         raise ValueError(f"Input size must have a shape of (*, 3, H, W). Got {image.shape}")
 
 
+def _max_frames_per_gemm(height: int, width: int) -> int:
+    """Largest ``F`` with ``F * H * W < 2**31 - 1``.
+    ``int_max // H // W`` is that exclusive upper bound: a GEMM may use strictly
+    fewer frames than this so the flattened ``n`` stays below the cuBLAS limit.
+    """
+    if height <= 0 or width <= 0:
+        return _CUBLAS_INT32_MAX
+    return _CUBLAS_INT32_MAX // height // width
+
+
+def frames_per_yuv_gemm(height: int, width: int) -> int:
+    """Frames :func:`rgb_to_yuv` converts per GEMM at ``height x width``.
+    Above this many frames it converts in chunks and writes YUV back over the RGB
+    storage, so only a chunk-sized temporary is newly allocated. Memory planners
+    (see ``diffusion_tiling.emit_convert_bytes``) need that split to size a reserve.
+    """
+    limit = _max_frames_per_gemm(height, width)
+    return 1 if limit <= 1 else limit - 1
+
+
 def rgb_to_yuv(image: torch.Tensor, color_space: ColorSpace) -> torch.Tensor:
-    """RGB ``[0, 1]`` ``(*, 3, H, W)`` → YUV ``(*, 3, H, W)``."""
+    """RGB ``[0, 1]`` ``(*, 3, H, W)`` → YUV ``(*, 3, H, W)``.
+    Long clips are converted in frame chunks of size ``< (2**31 - 1) // H // W``
+    so each 3x3 GEMM stays inside cuBLAS int32. When chunking, YUV is written
+    back over the RGB storage; otherwise chunks are concatenated.
+    """
     _require_rgb_chw(image)
     mat = _COLOR_SPACE_MATRICES[color_space].to(device=image.device, dtype=image.dtype)
-    pixels = image.movedim(-3, -1)
-    return (pixels @ mat.T).movedim(-1, -3)
+    orig_shape = image.shape
+    height, width = orig_shape[-2], orig_shape[-1]
+    frames = image.reshape(-1, 3, height, width)
+    n_frames = frames.shape[0]
+    limit = _max_frames_per_gemm(height, width)
+    if limit < 1:
+        raise ValueError(
+            f"Frame {height}x{width} exceeds the cuBLAS int32 GEMM limit "
+            f"({_CUBLAS_INT32_MAX}); cannot convert even one frame."
+        )
+    # Strictly fewer than ``int_max // H // W`` so ``F*H*W < 2**31 - 1``.
+    chunk_f = 1 if limit == 1 else limit - 1
+
+    def _gemm(rgb: torch.Tensor) -> torch.Tensor:
+        pixels = rgb.movedim(-3, -1)
+        yuv = pixels.flatten(-3, -2) @ mat.T
+        return yuv.unflatten(-2, (height, width)).movedim(-1, -3)
+
+    if n_frames <= chunk_f:
+        return _gemm(frames).reshape(orig_shape)
+
+    # Overwrite RGB in place when ``reshape`` is a view; otherwise collect.
+    writeback = frames.untyped_storage().data_ptr() == image.untyped_storage().data_ptr()
+    chunks: list[torch.Tensor] = []
+    for start in range(0, n_frames, chunk_f):
+        yuv = _gemm(frames[start : start + chunk_f])
+        if writeback:
+            frames[start : start + chunk_f].copy_(yuv)
+        else:
+            chunks.append(yuv)
+    if writeback:
+        return frames.reshape(orig_shape)
+    return torch.cat(chunks, dim=0).reshape(orig_shape)
 
 
 def apply_color_range_(

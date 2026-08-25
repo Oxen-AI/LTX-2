@@ -1,5 +1,4 @@
 import logging
-from collections.abc import Iterator
 
 import torch
 
@@ -17,7 +16,7 @@ from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.types import Audio, VideoPixelShape
+from ltx_core.types import VideoPixelShape
 from ltx_pipelines.utils.args import (
     ImageConditioningInput,
     default_2_stage_arg_parser,
@@ -49,7 +48,7 @@ from ltx_pipelines.utils.media_io import (
     vae_dtype_for_hdr,
 )
 from ltx_pipelines.utils.model_paths import ModelPaths
-from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, PipelineOutput
 
 
 class KeyframeInterpolationPipeline:
@@ -165,7 +164,7 @@ class KeyframeInterpolationPipeline:
         stage_1_sigmas: torch.Tensor | None = None,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
         color_space: HDRColorSpace | None = None,
-    ) -> tuple[Iterator[torch.Tensor], Audio, TilingConfig | None]:
+    ) -> PipelineOutput:
         images = self.image_conditioner.resolve_crf(images)
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -180,7 +179,6 @@ class KeyframeInterpolationPipeline:
             enhance_first_prompt=enhance_prompt,
             enhance_static_cache=enhance_static_cache,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
-            enhance_prompt_seed=seed,
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -291,7 +289,7 @@ class KeyframeInterpolationPipeline:
 
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
         decoded_audio = self.audio_decoder(audio_state.latent)
-        return decoded_video, decoded_audio, tiling_config
+        return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config, None, video_state.latent)
 
 
 @torch.inference_mode()
@@ -313,7 +311,7 @@ def main() -> None:
     )
     hdr = resolve_hdr_color_space(images=args.images, hdr=args.hdr)
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
-    video, audio, tiling_config = pipeline(
+    result = pipeline(
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
         seed=args.seed,
@@ -346,14 +344,12 @@ def main() -> None:
         tiling_config=AUTO_TILING,
         max_batch_size=args.max_batch_size,
     )
-    video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
-
     encode_video(
-        video=video,
+        video=result.video,
         fps=args.frame_rate,
-        audio=audio,
+        audio=result.audio,
         output_path=args.output_path,
-        video_chunks_number=video_chunks_number,
+        video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
         color_space=hdr,
     )
 

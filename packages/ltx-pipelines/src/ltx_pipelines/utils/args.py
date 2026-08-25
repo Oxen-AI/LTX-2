@@ -194,6 +194,8 @@ class CompileAction(argparse.Action):
             "seq_dim_dynamic",
             "recompile_perturbed_block",
             "capture",
+            "max_video_tokens",
+            "max_audio_tokens",
         }
     )
 
@@ -227,6 +229,8 @@ class CompileAction(argparse.Action):
                 overrides[key] = self._parse_dynamic(raw)
             elif key in ("inductor_config", "dynamo_config"):
                 overrides[key] = self._parse_json_dict(key, raw)
+            elif key in ("max_video_tokens", "max_audio_tokens"):
+                overrides[key] = self._parse_positive_int(key, raw)
         setattr(namespace, self.dest, CompilationConfig(**overrides))
 
     def _parse_mode(self, raw: str) -> str | None:
@@ -250,6 +254,12 @@ class CompileAction(argparse.Action):
         if normalized in ("false", "0"):
             return False
         raise argparse.ArgumentError(self, f"{key}=... must be true or false; got {raw!r}")
+
+    def _parse_positive_int(self, key: str, raw: str) -> int:
+        stripped = raw.strip()
+        if not stripped.isdigit() or int(stripped) == 0:
+            raise argparse.ArgumentError(self, f"{key}=... must be a positive integer; got {raw!r}")
+        return int(stripped)
 
     def _parse_dynamic(self, raw: str) -> bool | None:
         normalized = raw.strip().lower()

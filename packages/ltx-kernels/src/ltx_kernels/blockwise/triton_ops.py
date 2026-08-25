@@ -8,7 +8,20 @@ from torch.library import triton_op, wrap_triton
 
 def get_tma_aligned_size(n, element_size):
     num_elems_tma = 16 // element_size
-    return ((n + num_elems_tma - 1) // num_elems_tma) * num_elems_tma 
+    return ((n + num_elems_tma - 1) // num_elems_tma) * num_elems_tma
+
+def empty_tma_aligned_scales(num_rows: int, num_blocks: int, device: torch.device) -> tuple[torch.Tensor, int]:
+    """Allocate MN-major fp32 scales with TMA-padded row storage.
+    TMA descriptors treat the padded M (16-byte aligned) as the tensor dimension, so
+    the allocation must include those extra rows. ``empty_strided((num_rows, n),
+    (1, aligned_m))`` only pads the stride and under-allocates when ``num_rows`` is
+    not already aligned -- the GEMM then reads past the buffer.
+    """
+    tma_aligned_mn = get_tma_aligned_size(num_rows, 4)
+    # (num_blocks, aligned_m).t()[:num_rows] keeps the full padded storage under a
+    # (num_rows, num_blocks) view with stride (1, aligned_m).
+    scales = torch.empty((num_blocks, tma_aligned_mn), dtype=torch.float, device=device).t()[:num_rows]
+    return scales, tma_aligned_mn
 
 @jit
 def _quantize(x, scale_max: tl.constexpr, NUM_BLOCKS: tl.constexpr, BLOCK_SIZE: tl.constexpr):
@@ -68,7 +81,7 @@ def _block_quant_norm_kernel(
     TMA_ALIGNED_MN: tl.constexpr,
     SCALE_MAX: tl.constexpr,
 ):
-    token_idx = tl.program_id(0)
+    token_idx = tl.program_id(0).to(tl.int64)
     batch_id =  token_idx // seqlen
 
     x_ptr = X + token_idx*H + tl.arange(0, H)
@@ -104,7 +117,6 @@ def _block_quant_kernel(
     X,
     Out_scales,
     X_out,
-    seqlen: int,
     H: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -112,8 +124,8 @@ def _block_quant_kernel(
     USE_GELU: tl.constexpr,
     SCALE_MAX: tl.constexpr,
 ):
-    batch_id, seq_id = tl.program_id(0), tl.program_id(1)
-    token_idx = batch_id*seqlen + seq_id
+    # 1D grid over tokens: a (batch, seq) grid overflows CUDA gridDim.y at seq > 65535.
+    token_idx = tl.program_id(0).to(tl.int64)
     x_ptr = X + token_idx*H + BLOCK_SIZE*tl.arange(0, NUM_BLOCKS)[:, None] + tl.arange(0, BLOCK_SIZE)[None, :]
     x = tl.load(x_ptr).to(tl.float32)
     if USE_GELU:
@@ -132,15 +144,13 @@ def _quant_blockwise_tma_aligned_func(x: torch.Tensor, use_gelu: bool) -> Tuple[
     block_size = 128
     num_blocks = h // block_size
     out = torch.empty((num_rows, h), device=x.device, dtype=torch.float8_e4m3fn)
-    tma_aligned_mn = get_tma_aligned_size(num_rows, 4)
-    scales = torch.empty_strided((num_rows, num_blocks), (1, tma_aligned_mn), dtype=torch.float, device=x.device)
+    scales, tma_aligned_mn = empty_tma_aligned_scales(num_rows, num_blocks, x.device)
     scale_max: float = 448.0
-    wrap_triton(_block_quant_kernel)[(b, s)](
+    wrap_triton(_block_quant_kernel)[(num_rows,)](
         x,
         scales,
         out,
         H=h,
-        seqlen=s,
         BLOCK_SIZE=128,
         NUM_BLOCKS=num_blocks,
         TMA_ALIGNED_MN=tma_aligned_mn,
@@ -164,8 +174,7 @@ def run_quant_blockwise_norm_tma_aligned(x: torch.Tensor, w: Optional[torch.Tens
     block_size = 128
     num_blocks = h // block_size
     out = torch.empty((num_rows, h), device=x.device, dtype=torch.float8_e4m3fn)
-    tma_aligned_mn = get_tma_aligned_size(num_rows, 4)
-    scales = torch.empty_strided((num_rows, num_blocks), (1, tma_aligned_mn), dtype=torch.float, device=x.device)
+    scales, tma_aligned_mn = empty_tma_aligned_scales(num_rows, num_blocks, x.device)
     norm_scale_batch_stride = norm_scale.stride(0)
     norm_shift_batch_stride = norm_shift.stride(0)
 
@@ -209,7 +218,7 @@ def _quant_rms_sum_mult_kernel(
     QUANTIZE: tl.constexpr,
     SCALE_MAX: tl.constexpr,
 ):
-    token_idx = tl.program_id(0)
+    token_idx = tl.program_id(0).to(tl.int64)
     batch_id =  token_idx // seqlen
 
     x_ptr = X + token_idx*H + tl.arange(0, H)
@@ -250,8 +259,7 @@ def run_quant_blockwise_rms_fma(x: torch.Tensor, y: torch.Tensor, z: torch.Tenso
     block_size = 128
     num_blocks = h // block_size
     out = torch.empty((num_rows, h), device=x.device, dtype=torch.float8_e4m3fn)
-    tma_aligned_mn = get_tma_aligned_size(num_rows, 4)
-    scales = torch.empty_strided((num_rows, num_blocks), (1, tma_aligned_mn), dtype=torch.float, device=x.device)
+    scales, tma_aligned_mn = empty_tma_aligned_scales(num_rows, num_blocks, x.device)
     z_batch_stride = z.stride(0)
 
     wrap_triton(_quant_rms_sum_mult_kernel)[(num_rows, 1, 1)](
@@ -321,7 +329,7 @@ def _gated_attention_kernel(
     QUANTIZE: tl.constexpr,
     SCALE_MAX: tl.constexpr,
 ):
-    token_idx = tl.program_id(0)
+    token_idx = tl.program_id(0).to(tl.int64)
 
     # Load gate logits for all heads: shape [NUM_HEADS]
     gate_logits = tl.load(Gate_Logits + token_idx * NUM_HEADS + tl.arange(0, NUM_HEADS)).to(tl.float32)
@@ -359,8 +367,7 @@ def run_gated_attention(x: torch.Tensor, gate_logits: torch.Tensor, quantize: bo
 
     if quantize:
         out = torch.empty((num_rows, h), device=x.device, dtype=torch.float8_e4m3fn)
-        tma_aligned_mn = get_tma_aligned_size(num_rows, 4)
-        scales = torch.empty_strided((num_rows, num_blocks), (1, tma_aligned_mn), dtype=torch.float, device=x.device)
+        scales, tma_aligned_mn = empty_tma_aligned_scales(num_rows, num_blocks, x.device)
     else:
         out = torch.empty((num_rows, h), device=x.device, dtype=torch.bfloat16)
         tma_aligned_mn = 0
@@ -395,7 +402,7 @@ def _blockwise_dequantize_kernel(
     NUM_BLOCKS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    token_idx = tl.program_id(0)
+    token_idx = tl.program_id(0).to(tl.int64)
 
     # Load per-block scales [NUM_BLOCKS] respecting the actual tensor strides
     scales = tl.load(

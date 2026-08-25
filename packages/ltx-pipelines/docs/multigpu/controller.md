@@ -48,7 +48,7 @@ class MyRunner(MGPURunner):
 
     @torch.inference_mode()
     def __call__(self, *, prompt: str, ...) -> Iterator[...]:
-        video, audio = self._pipeline(...)
+        result = self._pipeline(...)
         yield output_path   # __call__ MUST be a generator (use `yield`, even once)
 ```
 

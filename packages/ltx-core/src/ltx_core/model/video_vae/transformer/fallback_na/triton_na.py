@@ -27,6 +27,7 @@ def _na3d_kernel(
     h_size,
     w_size,
     num_heads,
+    bn_count,
     s_b,
     s_t,
     s_h,
@@ -46,19 +47,26 @@ def _na3d_kernel(
     is_fp32: tl.constexpr,
 ):
     pid_w = tl.program_id(0)
-    pid_th = tl.program_id(1)
-    pid_bn = tl.program_id(2)
+    h_q = tl.program_id(1)
+    pid_tbn = tl.program_id(2)
 
-    t_q = pid_th // h_size
-    h_q = pid_th % h_size
-    base = (pid_bn // num_heads) * s_b + (pid_bn % num_heads) * s_n
+    # (frame, batch, head) share axis 2 and H owns axis 1, rather than folding T*H into axis 1:
+    # gridDim.y/z are capped at 65535 and T*H passes that at production tile sizes (392*272 =
+    # 106624), which fails the launch outright with "Triton Error [CUDA]: invalid argument".
+    # Same layout as joint_triton, for the same reason.
+    t_q = pid_tbn // bn_count
+    pid_bn = pid_tbn % bn_count
+    # int64 throughout: every individual stride fits in int32, so Triton specializes them there,
+    # but t_q * s_t reaches ~1.3e10 on a 392-frame tile and would wrap -- an illegal memory access
+    # rather than a wrong answer.
+    base = (pid_bn // num_heads).to(tl.int64) * s_b + (pid_bn % num_heads).to(tl.int64) * s_n
 
     w_off = pid_w * block_q + tl.arange(0, block_q)
     w_valid = w_off < w_size
     d_off = tl.arange(0, hd_pad)
     d_mask = d_off < hd
 
-    q_ptrs = q_ptr + base + t_q * s_t + h_q * s_h + w_off[:, None] * s_w + d_off[None, :]
+    q_ptrs = q_ptr + base + t_q.to(tl.int64) * s_t + h_q.to(tl.int64) * s_h + w_off[:, None] * s_w + d_off[None, :]
     q_blk = tl.load(q_ptrs, mask=w_valid[:, None] & d_mask[None, :], other=0.0)
 
     if causal_t:
@@ -96,7 +104,7 @@ def _na3d_kernel(
 
     for tk in range(t_lo, t_hi):
         for hk in range(h_lo, h_hi):
-            plane = base + tk * s_t + hk * s_h
+            plane = base + tk.to(tl.int64) * s_t + hk.to(tl.int64) * s_h
             for wk0 in range(w_lo, w_hi, block_k):
                 wk = wk0 + tl.arange(0, block_k)
                 kmask = wk < w_hi
@@ -121,7 +129,7 @@ def _na3d_kernel(
                 m_i = m_new
 
     out = acc / tl.maximum(l_i, 1e-30)[:, None]
-    out_ptrs = out_ptr + base + t_q * s_t + h_q * s_h + w_off[:, None] * s_w + d_off[None, :]
+    out_ptrs = out_ptr + base + t_q.to(tl.int64) * s_t + h_q.to(tl.int64) * s_h + w_off[:, None] * s_w + d_off[None, :]
     tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty), mask=w_valid[:, None] & d_mask[None, :])
 
 
@@ -149,7 +157,7 @@ def na3d(
     block_q = 16
     block_k = max(16, min(32, triton.next_power_of_2(min(w, block_q + kw))))
 
-    grid = (triton.cdiv(w, block_q), t * h, batch * nh)
+    grid = (triton.cdiv(w, block_q), h, t * batch * nh)
     _na3d_kernel[grid](
         q,
         k,
@@ -159,6 +167,7 @@ def na3d(
         h,
         w,
         nh,
+        batch * nh,
         q.stride(0),
         q.stride(1),
         q.stride(2),

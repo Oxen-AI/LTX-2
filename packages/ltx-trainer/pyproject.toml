@@ -1,6 +1,6 @@
 [project]
 name = "ltx-trainer"
-version = "1.2.0"
+version = "1.3.0"
 description = "LTX-2 training, democratized."
 readme = "README.md"
 authors = [
@@ -42,8 +42,9 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-torchcodec = { index = "torch" }
-torchaudio = { index = "torch-test" }
+# macOS: the cu132 indexes ship no darwin wheels, so fall back to PyPI there.
+torchcodec = [{ index = "torch", marker = "sys_platform != 'darwin'" }]
+torchaudio = [{ index = "torch-test", marker = "sys_platform != 'darwin'" }]
 
 [[tool.uv.index]]
 name = "torch"

@@ -86,3 +86,43 @@ def deferred(
         x[:, :, :, lo:hi, :].add_(ctx[:, :, :, : hi - lo, :])
         lo = hi
     return x
+
+
+def deferred_keyframes(
+    x: torch.Tensor,
+    stage4_feat: torch.Tensor,
+    upsample_proj: nn.Linear,
+    context_proj: nn.Linear,
+    stride: tuple[int, int, int],
+    *,
+    w_chunks: int,
+) -> torch.Tensor:
+    """Keyframe counterpart of :func:`deferred`. ``x``/``stage4_feat`` are ``(B, P, H, W, C)``.
+    Each plane is its own ``T=1`` clip, so folding the plane axis into the batch turns this
+    into exactly the video case and the whole W-chunk / halo policy is inherited rather than
+    re-derived -- which is what keeps the two streams' W phases comparable downstream.
+    ``drop_leading_frame`` is pinned ``True``: a temporal stride of 2 expands ``T=1`` to 2 and
+    the drop takes it back to 1, keeping phase 1. Passing ``False`` (as tiled video does for
+    non-origin tiles) would invent a second temporal plane per keyframe.
+    The reshape is a view of a contiguous tensor, so :func:`deferred`'s in-place ``add_``
+    writes through to ``x``. Returns ``x`` (mutated).
+    """
+    if x.shape[:2] != stage4_feat.shape[:2]:
+        raise ValueError(
+            f"keyframe x and stage-4 feat must share (B, P), got {tuple(x.shape[:2])} vs {tuple(stage4_feat.shape[:2])}"
+        )
+    if not x.is_contiguous():
+        # A non-contiguous x makes the fold a copy instead of a view, and the inject would be
+        # silently dropped rather than failing. Refuse instead of quietly decoding without it.
+        raise ValueError("keyframe x must be contiguous channels-last so the plane fold stays a view")
+    folded = x.shape[0] * x.shape[1]
+    deferred(
+        x.reshape(folded, 1, *x.shape[2:]),
+        stage4_feat.reshape(folded, 1, *stage4_feat.shape[2:]),
+        upsample_proj,
+        context_proj,
+        stride,
+        w_chunks=w_chunks,
+        drop_leading_frame=True,
+    )
+    return x

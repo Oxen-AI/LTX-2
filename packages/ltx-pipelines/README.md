@@ -9,7 +9,7 @@ Pipelines are built using building blocks from [`ltx-core`](../ltx-core/) (sched
 - 🎬 **Multiple Pipeline Types**: Text-to-video, image-to-video, video-to-video, audio-to-video, keyframe interpolation, detail-fidelity rendering, and retake
 - 🎥 **HDR / EXR**: Native `--hdr` EXR conditioning with EXR + BT.2020/HLG output, plus dedicated HDR IC-LoRA
 - ⚡ **Optimized Performance**: Support for FP8 transformers, gradient estimation, and memory optimization
-- 🎯 **Production Ready**: Two-stage pipelines for best quality output
+- 🎯 **Production quality**: [`DFRPipeline`](docs/pipelines.md#12-dfrpipeline) for best output; DistilledPipeline for speed
 - 🔧 **LoRA Support**: Easy integration with trained LoRA adapters
 - 📦 **Self-Contained**: Handles model loading, encoding, decoding, and file I/O
 - 🚀 **CLI Support**: All pipelines can be run as command-line scripts
@@ -30,6 +30,8 @@ python -m ltx_pipelines.ti2vid_two_stages \
     --output-path output.mp4
 ```
 
+DFR uses the **same distilled transformer** as DistilledPipeline, plus `--detailing-lora` (no `--distilled-lora`). Copy-paste commands, 4K sizes, fps, and memory: [Running DFR](docs/pipelines.md#running-dfr).
+
 See [Installation & Usage](docs/installation.md) for full setup, CLI modules, and shared flags.
 
 ## 📚 Documentation
@@ -38,7 +40,7 @@ See [Installation & Usage](docs/installation.md) for full setup, CLI modules, an
 | ----- | ----------- |
 | [Installation & Usage](docs/installation.md) | Install, requirements, running pipelines from the CLI, common flags |
 | [Pipeline Selection Guide](docs/pipeline-selection.md) | Decision tree + feature comparison to pick the right pipeline |
-| [Available Pipelines](docs/pipelines.md) | Full reference for all 11 pipelines |
+| [Available Pipelines](docs/pipelines.md) | Full reference for all 12 pipelines, including [Running DFR](docs/pipelines.md#running-dfr) |
 | [Conditioning Types](docs/conditioning.md) | Image and video conditioning methods |
 | [HDR Support](docs/hdr.md) | Native EXR/`--hdr` colour spaces, I/O, and examples |
 | [Multimodal Guidance](docs/multimodal-guidance.md) | CFG / STG / modality guidance parameters and tuning |

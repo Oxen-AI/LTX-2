@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from functools import partial
 from typing import Any
 
@@ -14,7 +14,7 @@ from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.types import Audio, VideoPixelShape
+from ltx_core.types import VideoPixelShape
 from ltx_pipelines.utils.args import (
     ImageConditioningInput,
     add_generated_keyframes_arg,
@@ -55,7 +55,7 @@ from ltx_pipelines.utils.media_io import (
 )
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.samplers import euler_ancestral_denoising_loop
-from ltx_pipelines.utils.types import DEFAULT_AUTO_DURATION, AutoDuration, ModalitySpec, OffloadMode
+from ltx_pipelines.utils.types import DEFAULT_AUTO_DURATION, AutoDuration, ModalitySpec, OffloadMode, PipelineOutput
 
 # Generation from which stage 1 is sampled with the ancestral (SDE) Euler sampler instead of the
 # deterministic one.
@@ -201,7 +201,7 @@ class DistilledPipeline:
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
         color_space: HDRColorSpace | None = None,
         generated_keyframes: int | Sequence[int] = 0,
-    ) -> tuple[Iterator[torch.Tensor], Audio, int, TilingConfig | None]:
+    ) -> PipelineOutput:
         """Generate a video.
         Stage 1 samples with the ancestral (SDE) Euler sampler or the deterministic one according
         to ``self.use_ancestral_sampler``, detected from the checkpoint generation. Stage 2 is
@@ -314,7 +314,7 @@ class DistilledPipeline:
 
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
         decoded_audio = self.audio_decoder(audio_state.latent)
-        return decoded_video, decoded_audio, num_frames, tiling_config
+        return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config, None, video_state.latent)
 
 
 @torch.inference_mode()
@@ -337,7 +337,7 @@ def main() -> None:
     )
     hdr = resolve_hdr_color_space(images=args.images, hdr=args.hdr)
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
-    video, audio, num_frames, tiling_config = pipeline(
+    result = pipeline(
         prompt=args.prompt,
         seed=args.seed,
         height=args.height,
@@ -354,11 +354,11 @@ def main() -> None:
     )
 
     encode_video(
-        video=video,
+        video=result.video,
         fps=args.frame_rate,
-        audio=audio,
+        audio=result.audio,
         output_path=args.output_path,
-        video_chunks_number=get_video_chunks_number(num_frames, tiling_config),
+        video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
         color_space=hdr,
     )
 

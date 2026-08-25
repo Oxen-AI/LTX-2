@@ -59,6 +59,28 @@ def _naive_weight_or_bias_downcast(key: str, value: torch.Tensor) -> list[KeyVal
     return [KeyValueOperationResult(key, value.to(dtype=torch.float8_e4m3fn))]
 
 
+# Triton's fp8e4nv (torch.float8_e4m3fn) is only a legal kernel dtype on
+# sm_89+ (Ada). Below that, tl.load of an e4m3fn tensor fails at compile with
+# "type fp8e4nv not supported in this architecture". PyTorch eager conversion
+# still works -- that is the software path used when Triton is missing.
+_TRITON_FP8E4NV_MIN_CAPABILITY = (8, 9)
+
+
+def _triton_supports_fp8e4nv(device: torch.device) -> bool:
+    """Return whether Triton's fused fp8 kernel can compile for *device*.
+    ``device`` is the tensor's device, not the process's current CUDA device,
+    so mixed-GPU hosts pick the capability that will actually run the kernel.
+    """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability(device) >= _TRITON_FP8E4NV_MIN_CAPABILITY
+
+
+def _use_triton_fp8_kernel(device: torch.device) -> bool:
+    """True when ``fused_add_round_launch`` can compile on *device*."""
+    return TRITON_AVAILABLE and _triton_supports_fp8e4nv(device)
+
+
 def _upcast_and_round(
     weight: torch.Tensor, dtype: torch.dtype, with_stochastic_rounding: bool = False, seed: int = 0
 ) -> torch.Tensor:
@@ -66,10 +88,10 @@ def _upcast_and_round(
     Upcast the weight to the given dtype and optionally apply stochastic rounding.
     Input weight needs to have float8_e4m3fn or float8_e5m2 dtype.
     Stochastic rounding is implemented via a Triton kernel. When Triton is not
-    available (e.g., on Windows), this falls back to deterministic (nearest)
-    rounding via ``weight.to(dtype)``.
+    available (e.g., on Windows) or cannot compile ``fp8e4nv`` (pre-Ada GPUs),
+    this falls back to deterministic (nearest) rounding via ``weight.to(dtype)``.
     """
-    if not with_stochastic_rounding or not TRITON_AVAILABLE or weight.device.type != "cuda":
+    if not with_stochastic_rounding or not _use_triton_fp8_kernel(weight.device):
         return weight.to(dtype)
     return fused_add_round_launch(torch.zeros_like(weight, dtype=dtype), weight, seed)
 
@@ -206,13 +228,14 @@ def fuse_cast_fp8_weight(
     weight_fp8: torch.Tensor,
 ) -> torch.Tensor:
     """Return ``(delta_bf16 + dequantize(weight_fp8)).to(weight_fp8.dtype)``.
-    CUDA with Triton uses stochastic rounding via the fused kernel; otherwise
-    falls back to a deterministic bf16 add. ``delta_bf16`` is the bf16
+    CUDA with Triton on sm_89+ uses stochastic rounding via the fused kernel;
+    otherwise falls back to a deterministic bf16 add (no Triton, or a GPU
+    whose Triton cannot compile ``fp8e4nv``). ``delta_bf16`` is the bf16
     accumulator and is mutated in place.
     """
     if delta_bf16.dtype != torch.bfloat16:
         raise ValueError(f"delta_bf16 must be bfloat16, got {delta_bf16.dtype}")
-    if str(weight_fp8.device).startswith("cuda") and TRITON_AVAILABLE:
+    if _use_triton_fp8_kernel(weight_fp8.device):
         fused_add_round_launch(delta_bf16, weight_fp8, seed=0)
     else:
         delta_bf16.add_(weight_fp8.to(dtype=torch.bfloat16))
@@ -226,7 +249,8 @@ def _fp8_cast_fuse(
     model_sd: StateDict,
 ) -> dict[str, torch.Tensor]:
     """Cast the dequantized FP8 weight + BF16 deltas back to ``weight.dtype``
-    (FP8) via the fused-add-round kernel on CUDA.
+    (FP8) via the fused-add-round kernel on CUDA when Triton can compile
+    ``fp8e4nv``, otherwise via a deterministic software add.
     Only a subset of linears are FP8-downcast (see ``TRANSFORMER_LINEAR_DOWNCAST_MAP``);
     LoRAs may also target layers left in BF16 (e.g. audio ``add_q/k/v_proj``, cross-modal
     projections). For those, fall back to a plain BF16 fuse.

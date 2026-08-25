@@ -1,12 +1,15 @@
 [project]
 name = "ltx-core"
-version = "1.2.0"
+version = "1.3.0"
 description = "Core implementation of Lightricks' LTX-2 model"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "torch~=2.7",
     "torchaudio",
+    # Gemma 4's processor imports torchvision; without this, `uv sync --package
+    # ltx-pipelines` (no trainer) fails with Could not import Gemma4UnifiedProcessor.
+    "torchvision",
     "einops",
     "numpy",
     "av",
@@ -37,8 +40,10 @@ natten = [
 ]
 
 [tool.uv.sources]
-torch = { index = "torch" }
-torchaudio = { index = "torch-test" }
+# macOS: the cu132 indexes ship no darwin wheels, so fall back to PyPI there.
+torch = [{ index = "torch", marker = "sys_platform != 'darwin'" }]
+torchaudio = [{ index = "torch-test", marker = "sys_platform != 'darwin'" }]
+torchvision = [{ index = "torch", marker = "sys_platform != 'darwin'" }]
 natten = { index = "natten" }
 
 [[tool.uv.index]]

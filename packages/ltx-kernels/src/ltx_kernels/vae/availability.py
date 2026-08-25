@@ -17,14 +17,15 @@ import torch
 # Consumer Blackwell (sm_120/sm_121, e.g. RTX 5090) has tcgen05 MMA but no TMEM, so a
 # tcgen05 test alone would pass there and then fail inside the JIT. Hopper and Ada have
 # neither: they are not a slower fallback, the instructions are not in the ISA.
-_TCGEN05_CAPS = frozenset({(10, 0), (10, 1), (10, 3), (12, 0), (12, 1)})
-_TMEM_CAPS = frozenset({(10, 0), (10, 1), (10, 3)})
+# Jetson Thor (sm_110) has both tcgen05 MMA and TMEM, same as datacenter Blackwell.
+_TCGEN05_CAPS = frozenset({(10, 0), (10, 1), (10, 3), (11, 0), (12, 0), (12, 1)})
+_TMEM_CAPS = frozenset({(10, 0), (10, 1), (10, 3), (11, 0)})
 
 UNSUPPORTED_MESSAGE = (
     "the CuTe DSL VAE kernels need a GPU with both tcgen05 MMA and Tensor Memory "
-    "(sm_100/sm_101/sm_103, e.g. B200 or GB200) and nvidia-cutlass-dsl installed; "
-    "consumer Blackwell has tcgen05 but no TMEM, and these kernels hold all 512 "
-    "TMEM columns"
+    "(sm_100/sm_101/sm_103, e.g. B200 or GB200, or sm_110 Jetson Thor) and "
+    "nvidia-cutlass-dsl installed; consumer Blackwell has tcgen05 but no TMEM, "
+    "and these kernels hold all 512 TMEM columns"
 )
 
 

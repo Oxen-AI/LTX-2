@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
 
 import torch
 
@@ -47,7 +46,7 @@ from ltx_pipelines.utils.media_io import (
     vae_dtype_for_hdr,
 )
 from ltx_pipelines.utils.model_paths import ModelPaths
-from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, PipelineOutput
 
 
 class RetakePipeline:
@@ -170,7 +169,7 @@ class RetakePipeline:
         max_batch_size: int = 1,
         sigmas: torch.Tensor | None = None,
         color_space: HDRColorSpace | None = None,
-    ) -> tuple[Iterator[torch.Tensor], torch.Tensor, TilingConfig | None]:
+    ) -> PipelineOutput:
         """Regenerate ``[start_time, end_time]`` of the source video (retake).
         Parameters
         ----------
@@ -205,8 +204,9 @@ class RetakePipeline:
             Whether to enhance the prompt via the text encoder.
         Returns
         -------
-        tuple[Iterator[torch.Tensor], torch.Tensor, TilingConfig]
-            ``(video_frames_iterator, audio_waveform, tiling_config)``
+        PipelineOutput
+            Decoded video, audio, frame count, tiling, ``keyframes=None``, and the
+            video latent used for decode when retained (may be ``None``).
         """
         if start_time >= end_time:
             raise ValueError(f"start_time ({start_time}) must be less than end_time ({end_time})")
@@ -261,7 +261,6 @@ class RetakePipeline:
             prompts_to_encode,
             enhance_first_prompt=enhance_prompt,
             enhance_static_cache=enhance_static_cache,
-            enhance_prompt_seed=seed,
         )
 
         v_context_p, a_context_p = contexts[0].video_encoding, contexts[0].audio_encoding
@@ -326,7 +325,9 @@ class RetakePipeline:
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
         decoded_audio = self.audio_decoder(audio_state.latent)
 
-        return decoded_video, decoded_audio, tiling_config
+        return PipelineOutput(
+            decoded_video, decoded_audio, output_shape.frames, tiling_config, None, video_state.latent
+        )
 
 
 @torch.inference_mode()
@@ -365,7 +366,7 @@ def main() -> None:
     params = detect_params(args.model_paths.transformer())
     hdr = resolve_hdr_color_space(video_paths=[args.video_path], hdr=args.hdr)
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
-    video_iter, audio, tiling_config = pipeline(
+    result = pipeline(
         video_path=args.video_path,
         prompt=args.prompt,
         start_time=args.start_time,
@@ -382,13 +383,12 @@ def main() -> None:
         max_batch_size=args.max_batch_size,
     )
 
-    video_chunks_number = get_video_chunks_number(src.frames, tiling_config)
     encode_video(
-        video=video_iter,
+        video=result.video,
         fps=int(src.fps),
-        audio=audio,
+        audio=result.audio,
         output_path=args.output_path,
-        video_chunks_number=video_chunks_number,
+        video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
         color_space=hdr,
     )
 

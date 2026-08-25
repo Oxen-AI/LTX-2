@@ -58,8 +58,12 @@ class DiffVAEMode(Enum):
     - **BLACKWELL_DSL:** datacenter Blackwell CuTe DSL NA + fused stage-5
       (deferred stage-4 inputs; upsample+context_proj inside the fused kernel).
     CHUNKED_* always use deferred stage-4 + w_chunks=4. COMBINED_COMPILE is
-    combined context + w_chunks=1 (best runtime, highest memory) and **requires
-    natten**. Chunked modes fall back to Triton/eager when natten is missing.
+    combined context + w_chunks=1 (best runtime, highest memory). Every mode falls
+    back to Triton/eager when natten is missing; only the chunked ones also drop
+    compilation there (see ``apply.resolve_attention_for_host``).
+    A keyframe decode is never compiled -- the compiled entry points are the
+    keyframe-free ones -- so its memory budget follows the block shape rather than
+    the mode's name. ``diffusion_tiling`` owns that table.
     """
 
     CHUNKED_EAGER = "chunked_eager"

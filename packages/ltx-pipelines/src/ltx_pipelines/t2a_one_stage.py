@@ -129,7 +129,6 @@ class T2AOneStagePipeline:
             enhance_first_prompt=enhance_prompt,
             enhance_static_cache=enhance_static_cache,
             enhance_prompt_image=None,
-            enhance_prompt_seed=seed,
         )
         a_context_p = ctx_p.audio_encoding
         a_context_n = ctx_n.audio_encoding

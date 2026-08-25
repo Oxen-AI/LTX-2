@@ -181,8 +181,14 @@ def _blockwise_gencode() -> tuple[list[str], bool]:
 
 
 # Arch codes the NVFP4 kernels support. The E2M1 pack/convert intrinsics and the cuBLASLt
-# block-scaled FP4 kernels are Blackwell-only (sm_100a datacenter, sm_120a consumer).
-_NVFP4_ARCHES = ["100a", "120a"]
+# block-scaled FP4 kernels are Blackwell-only (sm_100a datacenter, sm_110a Jetson Thor,
+# sm_120a consumer).
+# All three are the arch-specific ("a") targets on purpose. cvt.rn.satfinite.e2m1x2.f32
+# -- the hardware BF16/FP32 -> E2M1 pair conversion behind __nv_cvt_float2_to_fp4x2 -- is
+# only emitted for those; on a plain family target (sm_110) the CUDA headers fall back to
+# a software emulation and the quantize kernel balloons from 360 to 1312 SASS instructions,
+# which drops it from memory-bound (~250 GB/s) to ALU-bound (~62 GB/s) on Thor.
+_NVFP4_ARCHES = ["100a", "110a", "120a"]
 
 
 def _nvfp4_gencode() -> list[str]:
@@ -196,6 +202,8 @@ def _nvfp4_gencode() -> list[str]:
     for tok in env:
         if tok.startswith("10.0"):
             sel.append("100a")
+        elif tok.startswith("11.0"):
+            sel.append("110a")
         elif tok.startswith("12.0"):
             sel.append("120a")
     return [a for a in dict.fromkeys(sel) if a in base]

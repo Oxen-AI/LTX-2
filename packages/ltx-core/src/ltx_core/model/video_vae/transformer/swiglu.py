@@ -67,6 +67,28 @@ def triton_swiglu_available() -> bool:
     return _TRITON_AVAILABLE and torch.cuda.is_available()
 
 
+def _cuda_tensors_for_triton(*tensors: torch.Tensor) -> bool:
+    """True when every tensor is CUDA and all share one device (Triton launch context)."""
+    if not tensors or not tensors[0].is_cuda:
+        return False
+    device = tensors[0].device
+    return all(t.is_cuda and t.device == device for t in tensors)
+
+
+def _resolve_use_triton(use_triton: bool, *tensors: torch.Tensor) -> bool:
+    """Enable Triton only when every tensor is on the same CUDA device; reject mixed devices."""
+    if not use_triton:
+        return False
+    if _cuda_tensors_for_triton(*tensors):
+        return True
+    devices = {t.device for t in tensors}
+    if len(devices) > 1:
+        raise ValueError(
+            f"SwiGLU requires all tensors on one device for Triton or torch.mm; got {sorted(str(d) for d in devices)}"
+        )
+    return False
+
+
 def token_intervals(n_tok: int, tile: SwiGLUTileSpec) -> list[DimensionInterval]:
     """Split ``n_tok`` tokens per ``tile`` (count or size). Overlap is always 0."""
     if n_tok < 0:
@@ -216,10 +238,10 @@ def dual_gate_up_triton_eligible(
     w_up: torch.Tensor,
 ) -> bool:
     """True when the fused gate+up SwiGLU Triton kernel can run.
-    Requires BF16 activations/weights, ``hidden == 4 * dim``, and ``dim`` in
-    ``[256, 2048]`` (DiffVAE MLP shapes).
+    Requires BF16 activations/weights on the same CUDA device, ``hidden == 4 * dim``,
+    and ``dim`` in ``[256, 2048]`` (DiffVAE MLP shapes).
     """
-    if not triton_swiglu_available() or not x.is_cuda:
+    if not triton_swiglu_available() or not _cuda_tensors_for_triton(x, w_gate, w_up):
         return False
     if x.dtype != torch.bfloat16 or w_gate.dtype != torch.bfloat16 or w_up.dtype != torch.bfloat16:
         return False
@@ -241,57 +263,69 @@ def _fused_gate_up_swiglu_triton(
     """``out = silu(x @ W_gateᵀ) * (x @ W_upᵀ)`` with one x-tile load (BF16)."""
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is not available")
+    if not _cuda_tensors_for_triton(x, w_gate, w_up, out):
+        raise ValueError(
+            "fused gate+up SwiGLU Triton requires CUDA tensors on one device; "
+            f"got x={x.device}, w_gate={w_gate.device}, w_up={w_up.device}, out={out.device}"
+        )
     m, k = x.shape
     n = w_gate.shape[0]
     block_m, block_n, block_k = 64, 64, 32
     grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
-    _fused_gate_up_swiglu_kernel[grid](
-        x,
-        w_gate,
-        w_up,
-        out,
-        m,
-        k,
-        n,
-        x.stride(0),
-        x.stride(1),
-        w_gate.stride(0),
-        w_gate.stride(1),
-        w_up.stride(0),
-        w_up.stride(1),
-        out.stride(0),
-        out.stride(1),
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-    )
+    with torch.cuda.device(x.device):
+        _fused_gate_up_swiglu_kernel[grid](
+            x,
+            w_gate,
+            w_up,
+            out,
+            m,
+            k,
+            n,
+            x.stride(0),
+            x.stride(1),
+            w_gate.stride(0),
+            w_gate.stride(1),
+            w_up.stride(0),
+            w_up.stride(1),
+            out.stride(0),
+            out.stride(1),
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+        )
 
 
 def _fused_up_mul_triton(x: torch.Tensor, w_up: torch.Tensor, silu_gate: torch.Tensor) -> None:
     """Inplace: ``silu_gate *= (x @ w_up.T)``."""
     if not _TRITON_AVAILABLE:
         raise RuntimeError("Triton is not available")
+    if not _cuda_tensors_for_triton(x, w_up, silu_gate):
+        raise ValueError(
+            "fused up-mul SwiGLU Triton requires CUDA tensors on one device; "
+            f"got x={x.device}, w_up={w_up.device}, silu_gate={silu_gate.device}"
+        )
     m, k = x.shape
     n = w_up.shape[0]
     block_m, block_n, block_k = 64, 64, 32
     grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
-    _fused_up_mul_kernel[grid](
-        x,
-        w_up,
-        silu_gate,
-        m,
-        k,
-        n,
-        x.stride(0),
-        x.stride(1),
-        w_up.stride(0),
-        w_up.stride(1),
-        silu_gate.stride(0),
-        silu_gate.stride(1),
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-    )
+    with torch.cuda.device(x.device):
+        _fused_up_mul_kernel[grid](
+            x,
+            w_up,
+            silu_gate,
+            m,
+            k,
+            n,
+            x.stride(0),
+            x.stride(1),
+            w_up.stride(0),
+            w_up.stride(1),
+            silu_gate.stride(0),
+            silu_gate.stride(1),
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+        )
 
 
 def _fused_up_mul_torch(x: torch.Tensor, w_up: torch.Tensor, silu_gate: torch.Tensor) -> None:
@@ -351,10 +385,13 @@ def _swiglu_chunked_impl(
     if n_tok == 0:
         return x
 
+    # Triton needs every pointer on the launch device; all-CPU falls back to torch.mm.
+    use_triton = _resolve_use_triton(bool(use_triton), x_flat, w_gate, w_up, w_down)
+
     out_flat = torch.empty((n_tok, dim), device=x.device, dtype=x.dtype)
     max_chunk = max((iv.end - iv.start for iv in intervals), default=0)
     workspace = torch.empty((max_chunk, hidden), device=x.device, dtype=x.dtype)
-    use_dual = bool(use_triton) and dual_gate_up_triton_eligible(x_flat, w_gate, w_up)
+    use_dual = use_triton and dual_gate_up_triton_eligible(x_flat, w_gate, w_up)
     w_gate_c = w_gate.contiguous() if use_dual else w_gate
     w_up_c = w_up.contiguous() if use_triton else w_up
 

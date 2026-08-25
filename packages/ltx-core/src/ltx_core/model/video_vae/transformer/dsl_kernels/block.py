@@ -87,6 +87,63 @@ class DSLDiffusionNABlock(DiffusionNABlock):
         return self.forward_x_ctx(x, stage4_feat, modulation, drop_leading_frame=drop_leading_frame, out=out)
 
     @torch.compiler.disable
+    def forward_x_ctx_with_keyframes(
+        self,
+        x: torch.Tensor,
+        stage4_feat: torch.Tensor,
+        keyframe_x: torch.Tensor,
+        keyframe_stage4_feat: torch.Tensor,
+        modulation: tuple[torch.Tensor, ...],
+        keyframe_times: torch.Tensor,
+        keyframe_valid: torch.Tensor,
+        *,
+        drop_leading_frame: bool = True,
+        out: torch.Tensor | None = None,
+        out_keyframes: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Both streams in one fused launch, joint softmax included.
+        Signature-compatible with ``chunked.block``'s method of the same name, so the
+        decoder's deferred keyframe loop drives either without knowing which it has.
+        ``drop_leading_frame`` is the video stream's alone: each plane is a ``T=1`` clip whose
+        temporal stride collapses, so the kernel always takes the subpixel a one-frame input
+        shuffles out to. That is a tiling property and must not leak into the anchor arm.
+        ``keyframe_valid`` is applied by dropping the invalid planes before the launch and
+        restoring their rows as zeros -- the kernel has no notion of validity, and dropping is
+        order-preserving, so the surviving planes rank identically under the ``(|dt|, index)``
+        tie-break. Zero rows are the contract: an invalid plane's every key is masked.
+        """
+        keep = keyframe_valid.nonzero().flatten()
+        if int(keep.numel()) == int(keyframe_x.shape[1]):
+            return self._fused_forward_x_ctx(
+                x,
+                stage4_feat,
+                modulation,
+                drop_leading_frame=drop_leading_frame,
+                out=out,
+                keyframes=(keyframe_x, keyframe_stage4_feat, keyframe_times),
+                out_keyframes=out_keyframes,
+            )
+        # Dropping planes shortens the anchor stream, so a buffer sized for the full plane
+        # count no longer fits it -- and the result is scattered into a fresh tensor anyway.
+        # The anchor stream forgoes recycling for this launch; the video stream does not.
+        video_out, live = self._fused_forward_x_ctx(
+            x,
+            stage4_feat,
+            modulation,
+            drop_leading_frame=drop_leading_frame,
+            out=out,
+            keyframes=(
+                keyframe_x.index_select(1, keep),
+                keyframe_stage4_feat.index_select(1, keep),
+                keyframe_times.index_select(0, keep),
+            ),
+        )
+        restored = keyframe_x.new_zeros(keyframe_x.shape)
+        if int(keep.numel()):
+            restored.index_copy_(1, keep, live.to(dtype=restored.dtype))
+        return video_out, restored
+
+    @torch.compiler.disable
     def _fused_forward_x_ctx(
         self,
         x: torch.Tensor,
@@ -95,8 +152,16 @@ class DSLDiffusionNABlock(DiffusionNABlock):
         *,
         drop_leading_frame: bool,
         out: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Marshal weights into :func:`ltx_kernels.vae.run_block_fna_dsl`."""
+        keyframes: "tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None" = None,
+        out_keyframes: torch.Tensor | None = None,
+    ) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor]":
+        """Marshal weights into :func:`ltx_kernels.vae.run_block_fna_dsl`.
+        ``keyframes`` is ``(x, stage4_feat, times)`` for the anchor stream, and passing it
+        makes the launch dual-stream and the return a pair. ``out_keyframes`` is that
+        stream's recycled output buffer, the anchor-side counterpart of ``out``. Its stage-4 feature is the
+        *pre*-upsample one, like the video's: the kernel runs the deferred hop over each
+        plane in isolation, taking the temporal subpixel a one-frame input shuffles out to.
+        """
         from ltx_kernels.vae import run_block_fna_dsl  # noqa: PLC0415
 
         upsample = self.stage4_upsample
@@ -113,7 +178,7 @@ class DSLDiffusionNABlock(DiffusionNABlock):
             modulation[i] + self.scale_shift_table[i].view(1, 1, 1, 1, -1) for i in range(AdaLNZero.NUM_CHUNKS)
         ]
         attn = self.attn
-        return run_block_fna_dsl(
+        result = run_block_fna_dsl(
             x,
             stage4_feat,
             w_ctx=w_fused,
@@ -145,7 +210,21 @@ class DSLDiffusionNABlock(DiffusionNABlock):
             inv_w=attn.rope_inv_w.to(device=x.device),
             num_heads=attn.num_heads,
             attn_scale=attn.scale,
+            **(
+                {}
+                if keyframes is None
+                else {
+                    "x_keyframes": keyframes[0],
+                    "stage4_keyframes": keyframes[1],
+                    "keyframe_times": keyframes[2],
+                    "out_keyframes": out_keyframes,
+                }
+            ),
             rope_dim_split=tuple(attn.rope_dim_split),
             kernel_size=tuple(attn.kernel_size),
             out=out,
-        ).to(dtype=x.dtype)
+        )
+        if keyframes is None:
+            return result.to(dtype=x.dtype)
+        video_out, keyframe_out = result
+        return video_out.to(dtype=x.dtype), keyframe_out.to(dtype=keyframes[0].dtype)

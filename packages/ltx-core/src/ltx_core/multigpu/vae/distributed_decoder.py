@@ -14,7 +14,7 @@ management — they are independent concerns.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -23,8 +23,10 @@ from einops import rearrange
 from torch.multiprocessing import Queue
 
 from ltx_core.model.disposable import Disposable
+from ltx_core.model.video_vae.keyframes import DecodeKeyframes
 from ltx_core.model.video_vae.video_vae import (
     VideoDecoder,
+    iter_decoded_single_frames,
     map_spatial_slice,
     map_temporal_slice,
     to_mapping_operation,
@@ -38,7 +40,7 @@ from ltx_core.tiling import (
     masks_are_complementary,
     scale_by_masks_1d,
 )
-from ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape
+from ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape, VideoPixelShape
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,68 @@ logger = logging.getLogger(__name__)
 def _sgpu_has_temporal_tiling(tiling_config: TilingConfig | None, num_frames: int) -> bool:
     """True when SGPU tiling would produce more than one temporal chunk for ``num_frames``."""
     return tiling_config is not None and tiling_config.video_chunks_number(num_frames) > 1
+
+
+def create_distributed_tiles(
+    vae_tiling: TileCountConfig,
+    latent_shape: VideoLatentShape,
+    scale: SpatioTemporalScaleFactors,
+) -> list[Tile]:
+    """Latent tiles Dist decode uses: ``vae_tiling`` splitters + latent→pixel mappers."""
+    t_split, h_split, w_split = vae_tiling.to_splitters(scale, causal_temporal=True)
+    return create_tiles(
+        torch.Size([latent_shape.frames, latent_shape.height, latent_shape.width]),
+        splitters=[t_split, h_split, w_split],
+        mappers=[
+            to_mapping_operation(map_temporal_slice, scale.time),
+            to_mapping_operation(map_spatial_slice, scale.height),
+            to_mapping_operation(map_spatial_slice, scale.width),
+        ],
+    )
+
+
+def dist_rank_tiles(
+    vae_tiling: TileCountConfig,
+    latent_shape: VideoLatentShape,
+    scale: SpatioTemporalScaleFactors,
+    rank: int,
+    world_size: int,
+) -> list[Tile]:
+    """Round-robin Dist tiles for ``rank`` (same assignment as :meth:`DistributedVideoDecoder._decode_tiles`)."""
+    if world_size < 1:
+        raise ValueError(f"world_size must be >= 1, got {world_size}")
+    if not 0 <= rank < world_size:
+        raise ValueError(f"rank must be in [0, {world_size}), got {rank}")
+    all_tiles = create_distributed_tiles(vae_tiling, latent_shape, scale)
+    return [t for i, t in enumerate(all_tiles) if i % world_size == rank]
+
+
+def dist_rank_tile_pixel_shape(
+    vae_tiling: TileCountConfig,
+    latent_shape: VideoLatentShape,
+    scale: SpatioTemporalScaleFactors,
+    rank: int,
+    world_size: int,
+    *,
+    fps: float,
+    batch: int = 1,
+) -> VideoPixelShape:
+    """Pixel extent of this rank's Dist decode volume (largest tile if the rank owns several).
+    Matches ``decode_video`` of each ``latent[:, :, in_coords]`` slice: spatial axes scale
+    by ``scale.height`` / ``scale.width``; temporal is ``(F_lat - 1) * scale.time + 1``.
+    """
+    my_tiles = dist_rank_tiles(vae_tiling, latent_shape, scale, rank, world_size)
+    if not my_tiles:
+        raise ValueError(f"rank {rank}/{world_size} has no Dist tiles")
+
+    def pixel_thw(tile: Tile) -> tuple[int, int, int]:
+        f_lat = tile.in_coords[0].stop - tile.in_coords[0].start
+        h_lat = tile.in_coords[1].stop - tile.in_coords[1].start
+        w_lat = tile.in_coords[2].stop - tile.in_coords[2].start
+        return (f_lat - 1) * scale.time + 1, h_lat * scale.height, w_lat * scale.width
+
+    frames, height, width = max(map(pixel_thw, my_tiles), key=lambda thw: thw[0] * thw[1] * thw[2])
+    return VideoPixelShape(batch=batch, frames=frames, height=height, width=width, fps=fps)
 
 
 # ------------------------------------------------------------------
@@ -165,6 +229,10 @@ class DistributedVideoDecoder(torch.nn.Module, Disposable):
     driver_rank:
         Group-local rank of the driver process (the rank that collects
         and assembles tiles).
+    num_temporal_batches:
+        Number of temporal batches the driver assembles the canvas in
+        (:func:`gather_frames`); each is a ``frames/n x H x W x 3`` buffer, so a
+        higher count lowers peak driver VRAM. Defaults to one batch per rank.
     """
 
     def __init__(
@@ -174,6 +242,7 @@ class DistributedVideoDecoder(torch.nn.Module, Disposable):
         vae_group: dist.ProcessGroup,
         vae_tiling: TileCountConfig,
         driver_rank: int = 0,
+        num_temporal_batches: int | None = None,
     ) -> None:
         super().__init__()
         self.decoder = decoder
@@ -183,6 +252,9 @@ class DistributedVideoDecoder(torch.nn.Module, Disposable):
         self.world_size = dist.get_world_size(vae_group)
         self.vae_tiling = vae_tiling
         self.driver_rank = driver_rank
+        if num_temporal_batches is not None and num_temporal_batches < 1:
+            raise ValueError(f"num_temporal_batches must be >= 1, got {num_temporal_batches}")
+        self.num_temporal_batches = self.world_size if num_temporal_batches is None else num_temporal_batches
 
     @property
     def video_downscale_factors(self) -> SpatioTemporalScaleFactors:
@@ -207,6 +279,8 @@ class DistributedVideoDecoder(torch.nn.Module, Disposable):
         tiling_config: TilingConfig | None = None,
         generator: torch.Generator | None = None,
         device_fn: Callable[[int], str | torch.device] | None = None,
+        *,
+        keyframes: DecodeKeyframes | None = None,
     ) -> Iterator[torch.Tensor]:
         """Distributed decode — all ranks decode, driver assembles.
         Not a generator so that worker side-effects (decode + queue.put)
@@ -221,7 +295,7 @@ class DistributedVideoDecoder(torch.nn.Module, Disposable):
         full_shape = latent_shape.upscale(scale)
 
         # Phase 1: each rank decodes its assigned tiles.
-        my_tiles = self._decode_tiles(latent, latent_shape, scale, generator, tiling_config)
+        my_tiles = self._decode_tiles(latent, latent_shape, scale, generator, tiling_config, keyframes)
 
         # Phase 2: workers send tiles to driver.
         if self.rank != self.driver_rank:
@@ -249,12 +323,24 @@ class DistributedVideoDecoder(torch.nn.Module, Disposable):
             full_shape.frames,
             full_shape.height,
             full_shape.width,
-            self.world_size,
+            self.num_temporal_batches,
             self.world_size,
             weights,
             device_fn=device_fn,
         )
         return batches
+
+    def decode_single_frames(
+        self,
+        latents: Sequence[torch.Tensor],
+        generator: torch.Generator | Sequence[torch.Generator | None] | None = None,
+    ) -> Iterator[torch.Tensor]:
+        """Local SGPU decode of each T=1 clip on every rank. Does not Dist-split or gather.
+        ``decode_video`` on Dist is the wrong tool here: workers send their tile and yield
+        nothing. Carry-keyframe planes are independent one-frame clips, so every rank
+        decodes them on the inner decoder and keeps the pixels.
+        """
+        yield from iter_decoded_single_frames(self.decoder, latents, generator)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -267,19 +353,18 @@ class DistributedVideoDecoder(torch.nn.Module, Disposable):
         scale: SpatioTemporalScaleFactors,
         generator: torch.Generator | None,
         tiling_config: TilingConfig | None = None,
+        keyframes: DecodeKeyframes | None = None,
     ) -> list[DecodedTile]:
-        """Decode this rank's assigned latent tiles and convert to :class:`DecodedTile` list."""
-        t_split, h_split, w_split = self.vae_tiling.to_splitters(scale, causal_temporal=True)
-        all_tiles = create_tiles(
-            torch.Size([latent_shape.frames, latent_shape.height, latent_shape.width]),
-            splitters=[t_split, h_split, w_split],
-            mappers=[
-                to_mapping_operation(map_temporal_slice, scale.time),
-                to_mapping_operation(map_spatial_slice, scale.height),
-                to_mapping_operation(map_spatial_slice, scale.width),
-            ],
-        )
-        my_tiles = [t for i, t in enumerate(all_tiles) if i % self.world_size == self.rank]
+        """Decode this rank's assigned latent tiles and convert to :class:`DecodedTile` list.
+        Each tile gets its keyframe planes narrowed to its own window:
+        * spatially, with the same slices as its video latent -- planes are full-frame, so
+          handing them over uncropped offsets every one of them by the tile origin;
+        * temporally, via :meth:`DecodeKeyframes.for_frame_span`, which keeps the planes inside
+          the tile **and the nearest one on each side of it**, leaves ``pixel_frame_indices``
+          **global**, and sets ``clip_start_frame`` to the tile's first pixel. DiffVAE then
+          uses ``t_s(48) - t_s(56)`` for the 8-frame gap instead of rewriting 48 to -8.
+        """
+        my_tiles = dist_rank_tiles(self.vae_tiling, latent_shape, scale, self.rank, self.world_size)
         if self.vae_tiling.frames.num_tiles > 1 and tiling_config is not None:
             for tile in my_tiles:
                 latent_f = tile.in_coords[0].stop - tile.in_coords[0].start
@@ -296,7 +381,17 @@ class DistributedVideoDecoder(torch.nn.Module, Disposable):
             # One MGPU tile only — cat stitches SGPU temporal yields of this tile,
             # not the full video (full assembly is gather_frames on the driver).
             latent_slice = latent[:, :, tile.in_coords[0], tile.in_coords[1], tile.in_coords[2]]
-            chunks = list(self.decoder.decode_video(latent_slice, tiling_config, generator=generator))
+            tile_keyframes = (
+                None
+                if keyframes is None
+                else keyframes.for_frame_span(tile.out_coords[0].start, tile.out_coords[0].stop - 1).crop_spatial(
+                    tile.in_coords[1], tile.in_coords[2]
+                )
+            )
+            # Only pass the keyword when there is something to pass: the wrapped decoder may be
+            # any VideoDecoder, including one written against the pre-keyframes signature.
+            extra = {} if tile_keyframes is None else {"keyframes": tile_keyframes}
+            chunks = list(self.decoder.decode_video(latent_slice, tiling_config, generator=generator, **extra))
             pixels = torch.cat(chunks, dim=0)  # [F, H, W, C] in [0, 1]
             decoded.append(_to_decoded_tile(pixels, tile))
         return decoded

@@ -20,6 +20,11 @@ from ltx_core.model.video_vae.transformer.dsl_kernels.chain import (
     alloc_block_volume,
     linear_into_block_volume,
 )
+from ltx_core.model.video_vae.transformer.dsl_kernels.joint_attn import (
+    DSLJointAttention,
+    dsl_joint_supported,
+    na_attention_joint_dsl,
+)
 
 __all__ = [
     "FUSED_CTX_BIAS_BUFFER",
@@ -29,11 +34,14 @@ __all__ = [
     "DSLChannelLinear",
     "DSLDiffusionBlockChain",
     "DSLDiffusionNABlock",
+    "DSLJointAttention",
     "alloc_block_volume",
+    "dsl_joint_supported",
     "enable_blackwell_dsl",
     "fused_na_block_supported",
     "linear_into_block_volume",
     "na_attention_dsl",
+    "na_attention_joint_dsl",
     "na_dsl_available",
     "require_softmax_bound",
 ]

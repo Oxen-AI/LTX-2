@@ -48,6 +48,30 @@ def _read_a_chunk(sA, row, vals, c0, n):
             vals[k * _KRUN + ki] = ACC(frag[ki])
 
 
+@cute.jit
+def select_tensor(cond, when_true, when_false):
+    """One tensor addressing ``when_true`` where ``cond`` holds and ``when_false`` elsewhere.
+    This is what lets the video and keyframe streams share traced code instead of one
+    instantiation each. A *device-value* ``if`` cannot select a tensor -- ``a if cond else b``
+    reaches the NVVM backend as a select on a pointer type it rejects -- but it can select an
+    *address*, which is one ``selp.b64``. So the pair becomes a single operand and everything
+    downstream of it is traced once.
+    The two must be interchangeable through that one layout: same element type, and the same
+    row stride, since the layout comes from ``when_true``. Both hold by construction for every
+    pair this is used on -- each is a contiguous row-major ``(rows, channels)`` buffer over the
+    same ``channels`` -- and :func:`ltx_kernels.vae.block_fna_dsl._check_out` re-checks shape
+    and contiguity for the one buffer a caller supplies, the output.
+    Alignment is the element's. Every vectorised read of these buffers goes through
+    :func:`_vec_ptr` or :func:`_row_vec_ptr`, which re-assert 16B on the offset pointer, so
+    claiming more here would only move the same assertion earlier.
+    """
+    addr = when_true.iterator.toint() if cond else when_false.iterator.toint()
+    return cute.make_tensor(
+        cute.make_ptr(when_true.element_type, addr, cute.AddressSpace.gmem),
+        when_true.layout,
+    )
+
+
 def _vec_ptr(t, coord):
     """A ``VEC``-wide, 16B-aligned pointer at ``(row, col)`` of a row-major 2D tensor.
     Adding a dynamic offset to a pointer drops its alignment to one element, and

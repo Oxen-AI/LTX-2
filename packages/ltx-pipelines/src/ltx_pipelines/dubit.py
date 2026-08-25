@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
 
 import torch
 
@@ -25,7 +24,7 @@ from ltx_core.model.video_vae import (
 )
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
+from ltx_core.types import AudioLatentShape, VideoPixelShape
 from ltx_pipelines.iclora_utils import (
     append_ic_lora_reference_video_conditionings,
     read_lora_reference_downscale_factor,
@@ -61,7 +60,7 @@ from ltx_pipelines.utils.media_io import (
     get_videostream_metadata,
 )
 from ltx_pipelines.utils.model_paths import ModelPaths
-from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, PipelineOutput
 
 
 class DubItPipeline:
@@ -207,7 +206,7 @@ class DubItPipeline:
         stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
         color_space: HDRColorSpace | None = None,
-    ) -> tuple[Iterator[torch.Tensor], Audio, TilingConfig | None]:
+    ) -> PipelineOutput:
         images = self.image_conditioner.resolve_crf(images)
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -225,7 +224,6 @@ class DubItPipeline:
             enhance_first_prompt=enhance_prompt,
             enhance_static_cache=enhance_static_cache,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
-            enhance_prompt_seed=seed,
         )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
 
@@ -329,7 +327,7 @@ class DubItPipeline:
 
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
         decoded_audio = self.audio_decoder(s1_audio_latent)
-        return decoded_video, decoded_audio, tiling_config
+        return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config, None, video_state.latent)
 
 
 def patchify_dubit_audio_reference_latent(
@@ -376,7 +374,7 @@ def main() -> None:
     )
     src = get_videostream_metadata(args.reference_video)
     # Dub-It is SDR-only (no ``--hdr``); EXR references are rejected in arg validation.
-    video, audio, tiling_config = pipeline(
+    result = pipeline(
         prompt=args.prompt,
         seed=args.seed,
         height=args.height,
@@ -389,11 +387,11 @@ def main() -> None:
         enhance_static_cache=args.enhance_static_cache,
     )
     encode_video(
-        video=video,
+        video=result.video,
         fps=int(src.fps),
-        audio=audio,
+        audio=result.audio,
         output_path=args.output_path,
-        video_chunks_number=get_video_chunks_number(snap_frames_to_grid(src.frames), tiling_config),
+        video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
     )
 
 

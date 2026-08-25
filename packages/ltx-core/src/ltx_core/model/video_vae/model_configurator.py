@@ -300,6 +300,8 @@ _BARE_DIFFUSION_DECODER_PREFIX = "decoder."
 _K_NORM_SUFFIX = ".attn.k_norm.weight"
 _CONTEXT_PROJ_WEIGHT_SUFFIX = ".context_proj.weight"
 _CONTEXT_PROJ_BIAS_SUFFIX = ".context_proj.bias"
+_TYPE_EMB_KEY = "type_emb"
+_CONV_IN_WEIGHT_KEY = "conv_in.weight"
 _UPSAMPLE3_WEIGHT_KEY = "upsamples.3.proj.weight"
 _UPSAMPLE3_BIAS_KEY = "upsamples.3.proj.bias"
 _GATE_PARAM_SUFFIXES = (".gate_msa", ".gate_mlp", ".gate_ctx")
@@ -441,6 +443,29 @@ def _build_diffusion_vae_decoder_sd_ops(
 DIFFUSION_VAE_DECODER_COMFY_KEYS_FILTER = _build_diffusion_vae_decoder_sd_ops({})
 
 
+def _checkpoint_has_type_emb(checkpoint_path: str | Path) -> bool:
+    """Whether the checkpoint carries the keyframe ``type_emb`` tag."""
+    with safetensors.safe_open(str(checkpoint_path), framework="pt", device="cpu") as handle:
+        return any(_strip_diffusion_decoder_prefix(key) == _TYPE_EMB_KEY for key in handle.keys())  # noqa: SIM118
+
+
+def _emit_zero_type_emb(param_key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
+    """Pass ``conv_in.weight`` through and synthesize a zero ``type_emb`` beside it.
+    ``type_emb`` is registered unconditionally on the decoder but only exists in
+    keyframe-trained checkpoints. The loader does a non-strict ``assign=True`` load onto a
+    meta model, so a missing parameter would stay on the meta device -- and
+    ``_check_uninitialized`` then returns the whole decoder still on meta, breaking every
+    pre-keyframe checkpoint. Synthesizing zeros here keeps those checkpoints loadable and
+    is exactly the no-op the tag has when untrained (it is added to the keyframe latents,
+    and zero means "no tag"). Attached to ``conv_in.weight`` because it always exists and
+    its ``(out, in)`` shape carries the latent width.
+    """
+    return [
+        KeyValueOperationResult(param_key, value),
+        KeyValueOperationResult(_TYPE_EMB_KEY, torch.zeros(value.shape[1], dtype=value.dtype)),
+    ]
+
+
 def _emit_na_softmax_bound(param_key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
     """Pass ``attn.k_norm.weight`` through and emit the DSL kernel's softmax bound beside it.
     The CuTe DSL neighborhood-attention kernel replaces the online row max with a fixed
@@ -496,9 +521,9 @@ class _Stage4Hop:
         context_biases: dict[str, torch.Tensor] = {}
         with safetensors.safe_open(str(checkpoint_path), framework="pt", device="cpu") as handle:
             for key in handle.keys():  # noqa: SIM118
-                if not key.startswith(_RAW_DIFFUSION_DECODER_PREFIX):
+                short = _strip_diffusion_decoder_prefix(key)
+                if short is None:
                     continue
-                short = key.removeprefix(_RAW_DIFFUSION_DECODER_PREFIX)
                 if short == _UPSAMPLE3_WEIGHT_KEY:
                     upsample_weight = handle.get_tensor(key)
                 elif short == _UPSAMPLE3_BIAS_KEY:
@@ -558,8 +583,12 @@ def video_decoder_sd_ops_for_checkpoint(
     if not diffusion_vae:
         return VAE_DECODER_COMFY_KEYS_FILTER
     gates = _read_diff_vae_gates(checkpoint_path)
-    if not na_dsl_kernel:
-        return _build_diffusion_vae_decoder_sd_ops(gates)
-    return _build_diffusion_vae_decoder_sd_ops(gates, stage4_hop=_Stage4Hop.read(checkpoint_path)).with_kv_operation(
-        operation=_emit_na_softmax_bound, key_suffix=_K_NORM_SUFFIX
-    )
+    if na_dsl_kernel:
+        ops = _build_diffusion_vae_decoder_sd_ops(gates, stage4_hop=_Stage4Hop.read(checkpoint_path)).with_kv_operation(
+            operation=_emit_na_softmax_bound, key_suffix=_K_NORM_SUFFIX
+        )
+    else:
+        ops = _build_diffusion_vae_decoder_sd_ops(gates)
+    if not _checkpoint_has_type_emb(checkpoint_path):
+        ops = ops.with_kv_operation(operation=_emit_zero_type_emb, key_suffix=_CONV_IN_WEIGHT_KEY)
+    return ops

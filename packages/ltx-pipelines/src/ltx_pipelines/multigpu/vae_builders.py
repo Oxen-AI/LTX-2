@@ -37,12 +37,14 @@ class DistributedDecoderBuilder(BuilderProtocol):
         vae_tiling: TileCountConfig,
         driver_rank: int,
         registry: Registry,
+        num_temporal_batches: int | None = None,
     ) -> None:
         self._inner = inner.with_registry(registry)
         self._queue = queue
         self._vae_group = vae_group
         self._vae_tiling = vae_tiling
         self._driver_rank = driver_rank
+        self._num_temporal_batches = num_temporal_batches
 
     @property
     def registry(self) -> Registry:
@@ -71,6 +73,16 @@ class DistributedDecoderBuilder(BuilderProtocol):
         clone._inner = self._inner.with_module_ops(module_ops)
         return clone
 
+    def with_tiling(self, vae_tiling: TileCountConfig) -> Self:
+        """Return a new builder that splits decode with ``vae_tiling``.
+        Functional: never mutates ``self``; shares the inner builder, queue, and
+        process group. Mirrors stage ``with_*`` helpers so pipelines can swap
+        count-based Dist tiling per request without holding one decoder per config.
+        """
+        clone = copy.copy(self)
+        clone._vae_tiling = vae_tiling
+        return clone
+
     def build(
         self,
         device: torch.device | None = None,
@@ -84,4 +96,5 @@ class DistributedDecoderBuilder(BuilderProtocol):
             vae_group=self._vae_group,
             vae_tiling=self._vae_tiling,
             driver_rank=dist.get_group_rank(self._vae_group, self._driver_rank),
+            num_temporal_batches=self._num_temporal_batches,
         )

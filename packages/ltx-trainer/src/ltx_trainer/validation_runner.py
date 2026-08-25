@@ -27,7 +27,7 @@ from ltx_core.conditioning.mask_utils import extend_keyframes_mask
 from ltx_core.conditioning.types.latent_cond import VideoConditionByLatentIndex
 from ltx_core.conditioning.types.mask_cond import VideoConditionByMask
 from ltx_core.conditioning.types.reference_video_cond import VideoConditionByReferenceLatent
-from ltx_core.devices import cuda_activation_budget_bytes
+from ltx_core.devices import activation_budget_bytes
 from ltx_core.guidance.perturbations import (
     BatchedPerturbationConfig,
     Perturbation,
@@ -1029,7 +1029,7 @@ class ValidationRunner:
             num_frames=(latent_frames - 1) * scale.time + 1,
             # Matches the ModuleOps that load_video_vae_decoder applies to the diffusion decoder.
             mode=DiffVAEMode.CHUNKED_EAGER,
-            free_bytes=cuda_activation_budget_bytes(device) if device.type == "cuda" else 0,
+            free_bytes=activation_budget_bytes(device),
         )
 
     def _decode_audio(self, audio_state: LatentState, device: torch.device) -> Tensor:

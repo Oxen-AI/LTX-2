@@ -100,6 +100,44 @@ def cuda_activation_budget_bytes(device: DeviceSpec = None) -> int:
     return min(int(free_raw), under_fraction)
 
 
+def mps_activation_budget_bytes(device: DeviceSpec = None) -> int:
+    """Bytes still available for new MPS allocations in this process.
+    ``recommended_max_memory`` is Metal's recommended working-set size, which is
+    below physical RAM (unified memory is shared with the rest of the system), so it
+    is the conservative ceiling to plan against. ``driver_allocated_memory`` -- not
+    ``current_allocated_memory`` -- is subtracted because it counts blocks the
+    allocator is holding in its cache, mirroring the CUDA path's use of
+    ``memory_reserved``.
+    Unlike the CUDA ceiling this one is advisory: exceeding Metal's recommendation
+    degrades to swapping rather than raising, so callers get a budget that errs
+    small instead of a hard limit.
+    """
+    if not is_mps_available():
+        return 0
+    if resolve_device(device).type != "mps":
+        return 0
+    recommended = int(torch.mps.recommended_max_memory())
+    allocated = int(torch.mps.driver_allocated_memory())
+    return max(0, recommended - allocated)
+
+
+def activation_budget_bytes(device: DeviceSpec = None) -> int:
+    """Bytes available for new activations on *device*, across backends.
+    Use this rather than the per-backend helpers when sizing work to fit in memory
+    (e.g. DiffVAE decode tiling): a CUDA-only probe silently yields a zero budget
+    elsewhere, which reads as "nothing fits" instead of "unknown".
+    Returns 0 on CPU. Host RAM is not probed, so callers that support CPU execution
+    must treat 0 as "no budget information" and pick their own fallback rather than
+    concluding that no work fits.
+    """
+    resolved = resolve_device(device)
+    if resolved.type == "cuda":
+        return cuda_activation_budget_bytes(resolved)
+    if resolved.type == "mps":
+        return mps_activation_budget_bytes(resolved)
+    return 0
+
+
 def cleanup_accelerator_memory(device: DeviceSpec = None) -> None:
     """Run Python GC and release CUDA/MPS allocator caches."""
     gc.collect()

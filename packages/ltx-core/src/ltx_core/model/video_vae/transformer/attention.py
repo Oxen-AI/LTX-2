@@ -7,18 +7,22 @@ det stages use ``det_attn_rope`` from :meth:`NeighborhoodAttention3D.forward`.
 
 from __future__ import annotations
 
-from typing import Protocol
+import dataclasses
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 from torch import nn
 
-from ltx_core.model.video_vae.transformer.det_attn_rope import det_qkv_rope
+from ltx_core.model.video_vae.transformer.det_attn_rope import det_qkv_rope, det_qkv_rope_at_times
 from ltx_core.model.video_vae.transformer.qkv import QKVProjections
 from ltx_core.model.video_vae.transformer.rope_math import (
     DEFAULT_ABS_ROPE_NUM_TILES,
     default_rope_dim_split,
     rope_inv_freqs,
 )
+
+if TYPE_CHECKING:
+    from ltx_core.model.video_vae.keyframes import KeyframeStream
 
 try:
     import natten
@@ -48,6 +52,32 @@ class NAAttentionCallable(Protocol):
         k: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor: ...
+
+
+class JointNAAttentionCallable(Protocol):
+    """A windowed 3D NA backend that also carries a keyframe plane stack.
+    Same conventions as :class:`NAAttentionCallable` -- Q/K/V already normed, scaled and
+    absolutely RoPE'd -- with a second stream shaped ``(B, P, H, W, NH, HD)`` whose plane
+    axis sits in video's temporal slot. Both streams' RoPE must share one origin, so
+    ``keyframe_times`` are tile-local. Returns one output per stream.
+    NATTEN and the CuTe DSL kernel cannot express a joint window, so this is a separate
+    slot from ``attention_function`` rather than a widening of it: it keeps the shipping
+    keyframe-less hot path untouched, and it is immune to the install-order hazard that
+    ``configure_natten_backend`` creates by overwriting ``attention_function`` wholesale.
+    """
+
+    def __call__(
+        self,
+        attn: NeighborhoodAttention3D,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        keyframe_q: torch.Tensor,
+        keyframe_k: torch.Tensor,
+        keyframe_v: torch.Tensor,
+        keyframe_times: torch.Tensor,
+        keyframe_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 class NattenAttention(NAAttentionCallable):
@@ -119,6 +149,9 @@ class NeighborhoodAttention3D(nn.Module):
         # Kept for the chunked opaque residual (string arg); callable is the swap surface.
         self.natten_backend: str | None = None
         self.attention_function: NAAttentionCallable = NattenAttention()
+        # Separate slot, installed for every mode; never NATTEN/DSL. Only the keyframe
+        # decode path reads it, so keyframe-less decode keeps NATTEN when it is installed.
+        self.joint_attention_function: JointNAAttentionCallable | None = None
 
         self.register_buffer("rope_inv_t", rope_inv_freqs(rope_dim_split[0], rope_base), persistent=False)
         self.register_buffer("rope_inv_h", rope_inv_freqs(rope_dim_split[1], rope_base), persistent=False)
@@ -159,6 +192,45 @@ class NeighborhoodAttention3D(nn.Module):
         out = self.attention_function(self, q, k, v)
         out = out.reshape(batch, t, h, w, self.dim)
         return self.proj(out)
+
+    def forward_with_keyframes(
+        self,
+        x: torch.Tensor,
+        keyframes: KeyframeStream,
+    ) -> tuple[torch.Tensor, KeyframeStream]:
+        """Dual-stream det NA: one joint softmax over video and keyframe planes.
+        Unlike :meth:`forward` there is no ``dims >= kernel_size`` floor: the joint window
+        is clamp-and-mask, so an undersized axis simply masks its out-of-range offsets.
+        """
+        if self.joint_attention_function is None:
+            raise RuntimeError(
+                "keyframe decode needs joint_attention_function installed; build the decoder "
+                "through apply_diffvae_config / apply_diffvae_mode"
+            )
+        batch, t, h, w, _ = x.shape
+        planes = keyframes.x.shape[1]
+
+        q, k, v = det_qkv_rope(self, x)
+        keyframe_q, keyframe_k, keyframe_v = det_qkv_rope_at_times(self, keyframes.x, keyframes.times)
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        keyframe_q = keyframe_q.contiguous()
+        keyframe_k = keyframe_k.contiguous()
+        keyframe_v = keyframe_v.contiguous()
+
+        out, keyframe_out = self.joint_attention_function(
+            self,
+            q,
+            k,
+            v,
+            keyframe_q,
+            keyframe_k,
+            keyframe_v,
+            keyframes.times,
+            keyframes.valid,
+        )
+        out = self.proj(out.reshape(batch, t, h, w, self.dim))
+        keyframe_out = self.proj(keyframe_out.reshape(batch, planes, h, w, self.dim))
+        return out, dataclasses.replace(keyframes, x=keyframe_out)
 
 
 def configure_w_chunks(module_root: nn.Module, w_chunks: int = 1) -> None:

@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+import dataclasses
+import logging
+from collections.abc import Sequence
 from typing import Iterator, List, Literal, Tuple
 
 import torch
 from torch import nn
 
-from ltx_core.devices import cuda_activation_budget_bytes
 from ltx_core.model.disposable import Disposable
 from ltx_core.model.transformer.timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
 from ltx_core.model.video_vae import diffusion_tiling
+from ltx_core.model.video_vae.keyframes import (
+    DecodeKeyframes,
+    KeyframeStream,
+    keyframe_clip_times,
+    planes_for_tile,
+    remaining_time_strides,
+    upsample_keyframe_planes,
+)
 from ltx_core.model.video_vae.ops import PerChannelStatistics, patchify, unpatchify
 from ltx_core.model.video_vae.transformer import (
     AdaLNZero,
@@ -19,11 +29,9 @@ from ltx_core.model.video_vae.transformer import (
     LinearPixelShuffleUpsample,
     NABlock,
 )
-from ltx_core.model.video_vae.transformer.config import DiffVAEMode
-from ltx_core.model.video_vae.video_vae import VideoDecoder
+from ltx_core.model.video_vae.video_vae import VideoDecoder, iter_decoded_single_frames
 from ltx_core.tiling import (
     Tile,
-    TileSizeConfig,
     TilingConfig,
     group_tiles_by_temporal_slice,
     masks_are_complementary,
@@ -31,6 +39,8 @@ from ltx_core.tiling import (
 )
 from ltx_core.types import SpatioTemporalScaleFactors, VideoLatentShape
 from ltx_core.utils import to_velocity
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 # Production CausalVideoAutoencoderL decoder layout: channel width per stage.
 # Mirrors the (non-diffusion) NA decoder's stage spec.
@@ -123,6 +133,12 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
         self.per_channel_statistics = PerChannelStatistics(latent_channels=in_channels)
 
         self.conv_in = ChannelLinear(in_channels, stage_channels[0], bias=True)
+        # Keyframe-stream tag, added to un-normalized keyframe latents before the shared
+        # ``conv_in`` and nowhere else. It is the only keyframe-specific weight in the
+        # whole feature. Checkpoints predating the keyframe training have no such key, so
+        # ``video_decoder_sd_ops_for_checkpoint`` synthesizes zeros -- a missing key would
+        # otherwise leave the parameter on the meta device under ``strict=False`` load.
+        self.type_emb = nn.Parameter(torch.zeros(in_channels))
 
         self.det_stages = nn.ModuleList()
         self.upsamples = nn.ModuleList()
@@ -198,6 +214,9 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
         # Default False = combined pathway (``CombinedDiffusionNABlock``). Chunked DiffVAE
         # modes flip this via ``apply_diffvae_config``.
         self.deferred_stage4_upsample = False
+        # Remaining temporal upsampling per stage input, plus 1 for stage 5: the divisor in
+        # ``keyframe_stage_times``. (8, 8, 4, 2, 1) for the production ladder.
+        self._keyframe_time_strides: Tuple[int, ...] = remaining_time_strides(self.upsamples)
 
     def _run_det_stage(self, x: torch.Tensor, stage_i: int, drop_leading_frame: bool) -> torch.Tensor:
         """One deterministic stage: NA blocks + upsample."""
@@ -224,6 +243,214 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
         for stage_i in range(3):
             x = self._run_det_stage(x, stage_i, drop_leading_frame)
         return x
+
+    def _keyframe_stream_from_latents(
+        self,
+        keyframes: DecodeKeyframes,
+        *,
+        valid: torch.Tensor | None = None,
+    ) -> KeyframeStream:
+        """Keyframe latents to a stage-1-input stream: un-normalize, tag, ``conv_in``, mask.
+        Stages 1-3 always run on the whole volume, so times stay in the global stage-1
+        origin. Tile-local rebasing happens later, at stage 4.
+        Unlike upstream we un-normalize first, because our ``conv_in`` consumes
+        un-normalized latents (``forward_stages_1_to_3`` does the same for video) while
+        upstream un-normalizes above the decoder. ``type_emb`` still lands in exactly the
+        same place: on the latents, immediately before the shared ``conv_in``.
+        """
+        latents = self.per_channel_statistics.un_normalize(keyframes.latents)
+        x = latents.permute(0, 2, 3, 4, 1)
+        x = x + self.type_emb.view(1, 1, 1, 1, -1)
+        x = self.conv_in(x)
+        planes = x.shape[1]
+        if valid is None:
+            valid = torch.ones(planes, dtype=torch.bool, device=x.device)
+        times = keyframe_clip_times(
+            keyframes.pixel_frame_indices,
+            self._keyframe_time_strides[0],
+            keyframes.clip_start_frame,
+        )
+        return KeyframeStream(x=x, times=times.to(device=x.device), valid=valid.to(device=x.device)).masked()
+
+    def _run_det_stage_with_keyframes(
+        self,
+        x: torch.Tensor,
+        keyframes: KeyframeStream,
+        stage_i: int,
+        drop_leading_frame: bool,
+        pixel_frame_indices: torch.Tensor,
+        next_time_origin: float,
+        clip_start_frame: int = 0,
+    ) -> tuple[torch.Tensor, KeyframeStream]:
+        """One deterministic stage over both streams: joint NA blocks + upsample.
+        The keyframe upsample is spatial-only and always drops its leading frame; the video
+        stream's ``drop_leading_frame`` is a tiling property and must not leak into it.
+        Times are rebuilt from the *next* stage's remaining stride after upsampling.
+        ``next_time_origin`` is in the **next** stage's temporal units, because that is the
+        scale the times it rebases are expressed in. Zero everywhere except the stage-4 hop of
+        a tiled decode, whose next stage is 5 and whose origin is therefore a pixel frame.
+        ``clip_start_frame`` is the first global pixel of *this* video latent (0 for a full
+        clip; Dist's tile origin for a slice).
+        """
+        if self.mark_dynamic_shapes:
+            for dim in (1, 2, 3):
+                torch._dynamo.mark_dynamic(x, dim)
+        for block in self.det_stages[stage_i]:
+            x, keyframes = block.forward_with_keyframes(x, keyframes)
+        x = self.upsamples[stage_i](x, drop_leading_frame=drop_leading_frame)
+        keyframe_x = upsample_keyframe_planes(self.upsamples[stage_i], keyframes.x)
+        next_times = keyframe_clip_times(
+            pixel_frame_indices,
+            self._keyframe_time_strides[stage_i + 1],
+            clip_start_frame,
+            extra_origin=next_time_origin,
+        )
+        return x, KeyframeStream(
+            x=keyframe_x,
+            times=next_times.to(device=keyframe_x.device),
+            valid=keyframes.valid,
+        ).masked()
+
+    def forward_stages_1_to_3_with_keyframes(
+        self,
+        z_noisy: torch.Tensor,
+        keyframes: DecodeKeyframes,
+        drop_leading_frame: bool = True,
+        *,
+        keyframe_valid: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, KeyframeStream]:
+        """Dual-stream stages 1-3: video latent + keyframe planes to stage-4 inputs.
+        Keyframe counterpart of :meth:`forward_stages_1_to_3`. ``z_noisy`` and
+        ``keyframes.latents`` must already carry identical spatial padding -- the pad is
+        applied symmetrically, so padding only one stream would offset every keyframe plane
+        from the video by half the pad and read as ghosting rather than a failure.
+        Times are relative to :attr:`DecodeKeyframes.clip_start_frame`. For a full-clip decode
+        that is 0, so they match global ``t_s``. For a Dist slice they are ``t_s(index) -
+        t_s(clip_start)`` from stage 1, because this path's "whole volume" *is* the slice.
+        Additional in-volume tile origins are applied in :meth:`forward_stage_4_with_keyframes`.
+        """
+        keyframes.validate()
+        if z_noisy.shape[-2:] != keyframes.latents.shape[-2:]:
+            raise ValueError(
+                f"keyframe latents must share the video latent's H/W (identical padding), got "
+                f"{tuple(keyframes.latents.shape[-2:])} vs {tuple(z_noisy.shape[-2:])}"
+            )
+        stream = self._keyframe_stream_from_latents(keyframes, valid=keyframe_valid)
+        x = self.per_channel_statistics.un_normalize(z_noisy).permute(0, 2, 3, 4, 1)
+        x = self.conv_in(x)
+        for stage_i in range(3):
+            x, stream = self._run_det_stage_with_keyframes(
+                x,
+                stream,
+                stage_i,
+                drop_leading_frame,
+                keyframes.pixel_frame_indices,
+                0.0,
+                clip_start_frame=keyframes.clip_start_frame,
+            )
+        return x, stream
+
+    def forward_stage_4_with_keyframes(
+        self,
+        x: torch.Tensor,
+        keyframes: KeyframeStream,
+        pixel_frame_indices: torch.Tensor,
+        drop_leading_frame: bool = True,
+        pad_trailing: bool = True,
+        *,
+        stage4_time_origin: float = 0.0,
+        pixel_time_origin: float = 0.0,
+        clip_start_frame: int = 0,
+    ) -> tuple[torch.Tensor, KeyframeStream]:
+        """Dual-stream stage 4 to stage-5 context. Keyframe counterpart of
+        :meth:`forward_stage_4`.
+        The ghost-pad crop applies to the video stream only: the trailing replicate is a
+        temporal-border workaround and the keyframe planes have no temporal extent to pad.
+        On the deferred (chunked) pathway neither stream is upsampled here: each stage-5
+        block folds ``upsamples[3]`` into its own context inject. The returned stream's
+        ``times`` are nonetheless the *stage-5* times, because that is where they are
+        consumed -- the same asymmetry the video stream already has, whose returned
+        ``x`` is a pre-upsample feature rather than stage-5 context.
+        **Two origins, at two scales.** The video stream's RoPE is tile-local 0-based at every
+        stage, so keyframe times must be rebased to whatever the tile's frame 0 is -- and this
+        method spans two different temporal resolutions. ``stage4_time_origin`` is the tile's
+        start in stage-4 input units (for the blocks); ``pixel_time_origin`` is its first
+        global pixel frame (for stage 5). They are taken separately from the tile rather than
+        derived from one another: ``drop_leading_frame`` and the causal first frame make
+        ``pixel_origin == stride_t * stage4_origin`` an off-by-one trap, not an identity. Both
+        are 0.0 for an untiled full-clip decode. ``clip_start_frame`` is subtracted in stage
+        units as well, so a Dist slice whose first pixel is 56 still sees ``t_s(48) - t_s(56)``.
+        """
+        # Rebuild from global indices rather than trusting the caller's stream: stages 1-3 of a
+        # full-clip decode are global, and Dist has already folded clip_start into clip times.
+        keyframes = dataclasses.replace(
+            keyframes,
+            times=keyframe_clip_times(
+                pixel_frame_indices,
+                self._keyframe_time_strides[3],
+                clip_start_frame,
+                extra_origin=stage4_time_origin,
+            ).to(device=keyframes.x.device),
+        )
+        if self.deferred_stage4_upsample:
+            return self._forward_stage_4_deferred_with_keyframes(
+                x, keyframes, pixel_frame_indices, pad_trailing, pixel_time_origin, clip_start_frame
+            )
+        x, keyframes = self._run_det_stage_with_keyframes(
+            x,
+            keyframes,
+            3,
+            drop_leading_frame,
+            pixel_frame_indices,
+            pixel_time_origin,
+            clip_start_frame=clip_start_frame,
+        )
+        if pad_trailing:
+            x = diffusion_tiling.crop_trailing_context_natten_pad(
+                x,
+                n_latent_frames=self._natten_trailing_pad_latent_frames,
+                time_scale=self.video_downscale_factors.time,
+                stage5_kernel_t=self.stage5_kernel[0],
+            )
+        return x, keyframes
+
+    def _forward_stage_4_deferred_with_keyframes(
+        self,
+        x: torch.Tensor,
+        keyframes: KeyframeStream,
+        pixel_frame_indices: torch.Tensor,
+        pad_trailing: bool,
+        pixel_time_origin: float,
+        clip_start_frame: int = 0,
+    ) -> tuple[torch.Tensor, KeyframeStream]:
+        """Stage-4 blocks only, both streams, for the deferred (chunked) pathway.
+        Mirrors :meth:`forward_stage_4`'s deferred branch: no ``upsamples[3]`` on either
+        stream, ghost cropped at pre-upsample temporal resolution (video only).
+        """
+        if self.mark_dynamic_shapes:
+            for dim in (1, 2, 3):
+                torch._dynamo.mark_dynamic(x, dim)
+        for block in self.det_stages[3]:
+            x, keyframes = block.forward_with_keyframes(x, keyframes)
+        if pad_trailing:
+            up_t = int(self.upsamples[3].stride[0])
+            x = diffusion_tiling.crop_trailing_context_natten_pad(
+                x,
+                n_latent_frames=self._natten_trailing_pad_latent_frames,
+                time_scale=self.video_downscale_factors.time // up_t,
+                stage5_kernel_t=max(1, -(-self.stage5_kernel[0] // up_t)),
+            )
+        stage5_times = keyframe_clip_times(
+            pixel_frame_indices,
+            self._keyframe_time_strides[4],
+            clip_start_frame,
+            extra_origin=pixel_time_origin,
+        )
+        return x, KeyframeStream(
+            x=keyframes.x,
+            times=stage5_times.to(device=keyframes.x.device),
+            valid=keyframes.valid,
+        ).masked()
 
     def forward_stage_4(
         self,
@@ -269,10 +496,33 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
         x = self.conv_in_x_t(noised_pixels_patched.permute(0, 2, 3, 4, 1))
         return torch.cat([context, x], dim=-1)
 
+    def _keyframe_context_and_x_for_diff_step(
+        self,
+        keyframe_context: torch.Tensor,
+        keyframe_x_t: torch.Tensor,
+        keyframe_valid: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keyframe ``[context | conv_in_x_t(patched x)]``, mask-zeroed.
+        ``keyframe_x_t`` is ``(B, C_pix, P, H_pix, W_pix)`` -- the keyframe planes' own noised
+        pixels, one pixel frame per plane, through the *shared* ``conv_in_x_t``.
+        """
+        patched = patchify(keyframe_x_t, patch_size_hw=self.patch_size, patch_size_t=1)
+        x = self.conv_in_x_t(patched.permute(0, 2, 3, 4, 1))
+        x = x * keyframe_valid[None, :, None, None, None]
+        return torch.cat([keyframe_context, x], dim=-1)
+
     def _x_for_diff_step(self, x_t: torch.Tensor) -> torch.Tensor:
         """Conv-processed noised pixels only (deferred-context path)."""
         noised_pixels_patched = patchify(x_t, patch_size_hw=self.patch_size, patch_size_t=1)
         return self.conv_in_x_t(noised_pixels_patched.permute(0, 2, 3, 4, 1))
+
+    def _keyframe_x_for_diff_step(self, keyframe_x_t: torch.Tensor, keyframe_valid: torch.Tensor) -> torch.Tensor:
+        """Mask-zeroed keyframe noised pixels only (deferred-context path).
+        Contiguous by construction: the chunked pathway mutates this buffer in place.
+        """
+        patched = patchify(keyframe_x_t, patch_size_hw=self.patch_size, patch_size_t=1)
+        x = self.conv_in_x_t(patched.permute(0, 2, 3, 4, 1))
+        return (x * keyframe_valid[None, :, None, None, None]).contiguous()
 
     def forward_diff_step(
         self,
@@ -296,8 +546,55 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
 
         for block in self.diff_blocks:
             x_half.copy_(block.forward_combined(context_and_x, modulation))
-        x = x_half
+        return self._pixels_from_stage5(x_half)
 
+    def forward_diff_step_with_keyframes(
+        self,
+        context_and_x: torch.Tensor,
+        keyframe_context_and_x: torch.Tensor,
+        t: torch.Tensor,
+        keyframe_times: torch.Tensor,
+        keyframe_valid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One dual-stream stage-5 step. Returns ``(video_pred, keyframe_pred)`` in pixel space.
+        The keyframe stream at stage 5 is a genuine second *pixel* diffusion stream -- its own
+        noised pixels through the shared ``conv_in_x_t``, its own per-block
+        ``context_proj(keyframe_context)``, the same AdaLN modulation -- not a zero tensor and
+        not the context. It is evolved through the same Euler loop as video so the hidden
+        state the joint attention reads sits at the noise level it was trained to see, then
+        discarded: callers use the video prediction only.
+        Both buffers follow ``forward_diff_step``'s ``[context | x]`` layout and the same
+        ``copy_``-into-a-view discipline. Video T/H/W stay dynamic; the keyframe plane axis is
+        specialized, since ``keyframe_times`` / ``keyframe_valid`` pin it.
+        """
+        x_half = context_and_x[..., self.context_channels :]
+        keyframe_half = keyframe_context_and_x[..., self.context_channels :]
+        t_emb = self.t_embedder(self.timestep_scale_multiplier * t, hidden_dtype=x_half.dtype)
+        modulation = self.shared_adaln(t_emb)
+
+        if self.mark_dynamic_shapes:
+            for dim in (1, 2, 3):
+                torch._dynamo.mark_dynamic(context_and_x, dim)
+            # Keyframe dim 1 is the plane count, not T, and keyframe_times / keyframe_valid pin it.
+            # Marking it dynamic and then specializing to P raises ConstraintViolationError.
+            for dim in (2, 3):
+                torch._dynamo.mark_dynamic(keyframe_context_and_x, dim)
+
+        for block in self.diff_blocks:
+            x_out, keyframe_out = block.forward_combined_with_keyframes(
+                context_and_x,
+                keyframe_context_and_x,
+                modulation,
+                keyframe_times,
+                keyframe_valid,
+            )
+            x_half.copy_(x_out)
+            keyframe_half.copy_(keyframe_out)
+
+        return self._pixels_from_stage5(x_half), self._pixels_from_stage5(keyframe_half)
+
+    def _pixels_from_stage5(self, x: torch.Tensor) -> torch.Tensor:
+        """Shared stage-5 tail: ``norm_out`` -> ``conv_out`` -> channels-first -> unpatchify."""
         x = self.norm_out(x)
         x = self.conv_out(x)
         x = x.permute(0, 4, 1, 2, 3).contiguous()
@@ -339,6 +636,68 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
         x = self.conv_out(x)
         x = x.permute(0, 4, 1, 2, 3).contiguous()
         return unpatchify(x, patch_size_hw=self.patch_size, patch_size_t=1)
+
+    def forward_diff_step_deferred_with_keyframes(
+        self,
+        x: torch.Tensor,
+        stage4_feat: torch.Tensor,
+        keyframe_x: torch.Tensor,
+        keyframe_stage4_feat: torch.Tensor,
+        t: torch.Tensor,
+        keyframe_times: torch.Tensor,
+        keyframe_valid: torch.Tensor,
+        *,
+        drop_leading_frame: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dual-stream stage-5 step with deferred context. Keyframe counterpart of
+        :meth:`forward_diff_step_deferred`.
+        Each stream carries its own pre-upsample stage-4 feature and injects it per block,
+        so full-resolution context is never materialised for either. ``drop_leading_frame``
+        is the video stream's tiling property; the keyframe inject always collapses its
+        temporal stride.
+        """
+        t_emb = self.t_embedder(self.timestep_scale_multiplier * t, hidden_dtype=x.dtype)
+        modulation = self.shared_adaln(t_emb)
+
+        if self.mark_dynamic_shapes:
+            for dim in (1, 2, 3):
+                torch._dynamo.mark_dynamic(x, dim)
+                torch._dynamo.mark_dynamic(stage4_feat, dim)
+            # Plane count, not T -- see the note in the combined path above.
+            for dim in (2, 3):
+                torch._dynamo.mark_dynamic(keyframe_x, dim)
+                torch._dynamo.mark_dynamic(keyframe_stage4_feat, dim)
+
+        # The DSL chain drives itself, so both streams recycle output buffers instead of
+        # allocating a volume per block per stream; the chunked blocks expose the same
+        # ``forward_x_ctx_with_keyframes``, so the fallback loop drives those.
+        from ltx_core.model.video_vae.transformer.dsl_kernels import DSLDiffusionBlockChain  # noqa: PLC0415
+
+        if isinstance(self.diff_blocks, DSLDiffusionBlockChain):
+            x, keyframe_x = self.diff_blocks.forward_x_ctx_with_keyframes(
+                x,
+                stage4_feat,
+                keyframe_x,
+                keyframe_stage4_feat,
+                modulation,
+                keyframe_times,
+                keyframe_valid,
+                drop_leading_frame=drop_leading_frame,
+            )
+        else:
+            for block in self.diff_blocks:
+                x, keyframe_x = block.forward_x_ctx_with_keyframes(
+                    x,
+                    stage4_feat,
+                    keyframe_x,
+                    keyframe_stage4_feat,
+                    modulation,
+                    keyframe_times,
+                    keyframe_valid,
+                    drop_leading_frame=drop_leading_frame,
+                )
+
+        return self._pixels_from_stage5(x), self._pixels_from_stage5(keyframe_x)
 
     def _euler_step(
         self, x_t: torch.Tensor, model_out: torch.Tensor, t_now: torch.Tensor, t_next: torch.Tensor
@@ -393,6 +752,508 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
         if self.model_output_type == "x0":
             return model_out
         return self._euler_step(x_t, model_out.to(torch.float32), t_now, torch.zeros_like(t_now))
+
+    def _stage5_canvas_from_context(
+        self,
+        context_tile: torch.Tensor,
+        *,
+        drop_leading_frame: bool,
+    ) -> tuple[int, int, int]:
+        """``(T, H_pix, W_pix)`` of the stage-5 pixel canvas a context tile implies.
+        On the combined pathway the context is already at stage-5 resolution and
+        ``_context_and_x_for_diff_step`` patchifies ``x_t`` by ``patch_size``, so the canvas
+        is just ``(T, H * patch_size, W * patch_size)``. On the deferred pathway the tile is
+        still pre-upsample: each stage-5 block folds ``upsamples[3]`` into its inject, so
+        apply that stride here -- including the leading-frame drop the fold performs when the
+        temporal stride is 2.
+        """
+        t, h, w = context_tile.shape[1], context_tile.shape[2], context_tile.shape[3]
+        if self.deferred_stage4_upsample:
+            # Context is still pre-upsample, so this is the same geometry as a stage-4
+            # input. Ghost crop already ran, so do not re-apply the kernel-T floor.
+            return diffusion_tiling.stage5_pixel_shape_from_stage4(
+                t,
+                h,
+                w,
+                upsample_stride=tuple(self.upsamples[3].stride),  # type: ignore[arg-type]
+                patch_size=self.patch_size,
+                stage5_kernel_t=self.stage5_kernel[0],
+                drop_leading_frame=drop_leading_frame,
+                pad_trailing=False,
+            )
+        return t, h * self.patch_size, w * self.patch_size
+
+    def _decode_one_tile_with_keyframes(  # noqa: PLR0913
+        self,
+        feat_tile: torch.Tensor,
+        keyframes: KeyframeStream,
+        pixel_frame_indices: torch.Tensor,
+        *,
+        is_origin: bool,
+        timestep: torch.Tensor,
+        pad_trailing: bool,
+        generator: torch.Generator | None,
+        compute_dtype: torch.dtype,
+        x_t_tile_init: torch.Tensor | None = None,
+        stage4_time_origin: float = 0.0,
+        pixel_time_origin: float = 0.0,
+        clip_start_frame: int = 0,
+    ) -> torch.Tensor:
+        """Stage 4 + dual-stream diffusion on one stage-4 feature tile.
+        Both streams are Euler-stepped together; only the video pixels are returned. The
+        keyframe pixel stream exists so the hidden state the joint attention reads stays at
+        the noise level it was trained on, and is discarded here (upstream exposes it only
+        through its explicit per-step entry points, which the trainer uses).
+        Noise is sized from the stage-5 context rather than from a re-derived tile geometry;
+        see :meth:`_stage5_canvas_from_context` for the deferred-pathway correction. The
+        keyframe canvas differs only in its frame count -- one pixel frame per plane, since
+        keyframe upsampling collapses its temporal stride.
+        ``x_t_tile_init`` lets a tiled decode share one global noise field across tiles (edge
+        policy applied by the caller, as the plain path does); ``None`` draws fresh noise. The
+        keyframe stream always draws its own -- its planes are not part of the video canvas.
+        """
+        context_tile, keyframes = self.forward_stage_4_with_keyframes(
+            feat_tile,
+            keyframes,
+            pixel_frame_indices,
+            drop_leading_frame=is_origin,
+            pad_trailing=pad_trailing,
+            stage4_time_origin=stage4_time_origin,
+            pixel_time_origin=pixel_time_origin,
+            clip_start_frame=clip_start_frame,
+        )
+
+        batch = context_tile.shape[0]
+        canvas_t, canvas_h, canvas_w = self._stage5_canvas_from_context(context_tile, drop_leading_frame=is_origin)
+        randn_device = generator.device if generator is not None else feat_tile.device
+
+        def _noise(frames: int) -> torch.Tensor:
+            return torch.randn(
+                (batch, self.out_channels, frames, canvas_h, canvas_w),
+                dtype=compute_dtype,
+                generator=generator,
+                device=randn_device,
+            ).to(feat_tile.device)
+
+        x_t = _noise(canvas_t) if x_t_tile_init is None else x_t_tile_init
+        keyframe_x_t = _noise(keyframes.num_planes)
+
+        def _step(t_now: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            if self.deferred_stage4_upsample:
+                return self.forward_diff_step_deferred_with_keyframes(
+                    self._x_for_diff_step(x_t),
+                    context_tile,
+                    self._keyframe_x_for_diff_step(keyframe_x_t, keyframes.valid),
+                    keyframes.x,
+                    t_now,
+                    keyframes.times,
+                    keyframes.valid,
+                    drop_leading_frame=is_origin,
+                )
+            context_and_x = self._context_and_x_for_diff_step(context_tile, x_t)
+            keyframe_context_and_x = self._keyframe_context_and_x_for_diff_step(
+                keyframes.x, keyframe_x_t, keyframes.valid
+            )
+            return self.forward_diff_step_with_keyframes(
+                context_and_x, keyframe_context_and_x, t_now, keyframes.times, keyframes.valid
+            )
+
+        _, num_steps = timestep.shape
+        for i in range(num_steps - 1):
+            t_now = timestep[:, i]
+            t_next = timestep[:, i + 1]
+            video_out, keyframe_out = _step(t_now)
+            x_t = self._euler_step(x_t, video_out.to(torch.float32), t_now, t_next)
+            keyframe_x_t = self._euler_step(keyframe_x_t, keyframe_out.to(torch.float32), t_now, t_next)
+
+        t_now = timestep[:, -1]
+        video_out, _ = _step(t_now)
+        if self.model_output_type == "x0":
+            return video_out
+        return self._euler_step(x_t, video_out.to(torch.float32), t_now, torch.zeros_like(t_now))
+
+    def _decode_temporal_group_isolated_with_keyframes(  # noqa: PLR0913
+        self,
+        tiles: List[Tile],
+        feat_s4: torch.Tensor,
+        stream: KeyframeStream,
+        pixel_frame_indices: torch.Tensor,
+        content_s4_frames: int,
+        x_t_init: torch.Tensor | None,
+        timestep: torch.Tensor,
+        full_video_shape: VideoLatentShape,
+        curr_temporal_slice: slice,
+        generator: torch.Generator | None,
+        *,
+        complementary: bool,
+        clip_start_frame: int = 0,
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """Decode one temporal group's tiles with keyframes and blend into a group buffer.
+        Keyframe counterpart of :meth:`_decode_temporal_group_isolated`. Each tile carries
+        only the planes near it -- those inside its pixel-frame span plus the nearest plane on
+        each *side* of it (:func:`planes_for_tile`) -- and the two origins that plane set has
+        to be rebased against come from the tile, never from each other.
+        Tile ``out_coords`` are local to this latent. Dist slices keep global
+        ``pixel_frame_indices`` and pass ``clip_start_frame`` so selection lines up.
+        """
+        group_temporal_len = curr_temporal_slice.stop - curr_temporal_slice.start
+        group_shape = full_video_shape._replace(frames=group_temporal_len)
+        full_torch_shape = full_video_shape.to_torch_shape()
+        accum_dtype = torch.float16 if feat_s4.dtype == torch.bfloat16 else feat_s4.dtype
+        buffer = torch.zeros(group_shape.to_torch_shape(), device=feat_s4.device, dtype=accum_dtype)
+        weights: torch.Tensor | None = None if complementary else torch.zeros_like(buffer)
+        local_temporal_slice = slice(0, group_temporal_len)
+
+        compute_dtype = feat_s4.dtype
+        up3_stride = tuple(self.upsamples[3].stride)
+
+        for tile_index, tile in enumerate(tiles):
+            feat_tile, is_origin, pad_trailing, content_thw = diffusion_tiling.slice_stage4_tile(
+                feat_s4, tile, content_frames=content_s4_frames
+            )
+            # Two origins at two scales -- see forward_stage_4_with_keyframes.
+            stage4_origin = tile.in_coords[1].indices(content_s4_frames)[0]
+            pixel_lo, pixel_hi, _ = tile.out_coords[2].indices(full_torch_shape[2])
+
+            # ``out_coords`` are local to this latent. Dist slices keep global indices and
+            # ``clip_start_frame`` as the origin, so a local ``[0, 72)`` still has to select
+            # global ``[56, 127]``.
+            keep = planes_for_tile(pixel_frame_indices, pixel_lo, pixel_hi - 1, clip_start_frame=clip_start_frame)
+            if not bool(keep.any()):
+                raise RuntimeError(
+                    f"tile covering pixel frames [{pixel_lo + clip_start_frame}, "
+                    f"{pixel_hi - 1 + clip_start_frame}] selected no keyframe planes "
+                    f"out of {int(pixel_frame_indices.shape[0])}; planes_for_tile always keeps at least one"
+                )
+            tile_stream = stream.select_planes(keep.to(stream.valid.device)).crop_spatial(
+                tile.in_coords[2], tile.in_coords[3]
+            )
+            # Not debug-only: the decode below needs this tile's plane positions.
+            tile_indices = pixel_frame_indices[keep.to(pixel_frame_indices.device)]
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(
+                    "keyframe decode: tile %d/%d frames [%d, %d), stage-4 extent %dx%dx%d, %d of %d planes at %s",
+                    tile_index + 1,
+                    len(tiles),
+                    pixel_lo,
+                    pixel_hi,
+                    feat_tile.shape[1],
+                    feat_tile.shape[2],
+                    feat_tile.shape[3],
+                    tile_stream.num_planes,
+                    int(pixel_frame_indices.shape[0]),
+                    tile_indices.tolist(),
+                )
+
+            x_t_tile_init: torch.Tensor | None = None
+            if x_t_init is not None:
+                stage5_f, stage5_h, stage5_w = diffusion_tiling.stage5_pixel_shape_from_stage4(
+                    content_thw[0],
+                    content_thw[1],
+                    content_thw[2],
+                    upsample_stride=up3_stride,  # type: ignore[arg-type]
+                    patch_size=self.patch_size,
+                    stage5_kernel_t=self.stage5_kernel[0],
+                    drop_leading_frame=is_origin,
+                    pad_trailing=pad_trailing,
+                )
+                # Same edge policy as the plain path: expand/crop the shared noise field
+                # rather than drawing fresh noise, since NA mixes padded values inward.
+                x_t_tile_init = x_t_init[tile.out_coords]
+                x_t_tile_init, _ = diffusion_tiling.resize_axis(x_t_tile_init, 2, stage5_f, mode="repeat_last")
+                x_t_tile_init, _ = diffusion_tiling.resize_axis(x_t_tile_init, 3, stage5_h, mode="symmetric")
+                x_t_tile_init, _ = diffusion_tiling.resize_axis(x_t_tile_init, 4, stage5_w, mode="symmetric")
+
+            pixel_tile = self._decode_one_tile_with_keyframes(
+                feat_tile,
+                tile_stream,
+                tile_indices,
+                is_origin=is_origin,
+                timestep=timestep,
+                pad_trailing=pad_trailing,
+                generator=generator,
+                compute_dtype=compute_dtype,
+                x_t_tile_init=x_t_tile_init,
+                stage4_time_origin=float(stage4_origin),
+                pixel_time_origin=float(pixel_lo),
+                clip_start_frame=clip_start_frame,
+            )
+            content_pixel_shape = diffusion_tiling.pixel_tile_shape(full_torch_shape, tile.out_coords)
+            pixel_tile = diffusion_tiling.crop_pixels_to_content(
+                pixel_tile,
+                content_pixel_shape[2],
+                content_pixel_shape[3],
+                content_pixel_shape[4],
+            ).to(buffer.dtype)
+
+            masks = tuple(m.to(device=buffer.device, dtype=torch.float32) for m in tile.masks_1d)
+            local_coords = (
+                tile.out_coords[0],
+                tile.out_coords[1],
+                local_temporal_slice,
+                tile.out_coords[3],
+                tile.out_coords[4],
+            )
+            buffer[local_coords] += scale_by_masks_1d(pixel_tile, masks)
+            if weights is not None:
+                strength = torch.ones(pixel_tile.shape, device=buffer.device, dtype=buffer.dtype)
+                weights[local_coords] += scale_by_masks_1d(strength, masks)
+
+        return buffer, weights
+
+    def _decode_groups_with_keyframes(  # noqa: PLR0913, PLR0915
+        self,
+        feat_s4: torch.Tensor,
+        stream: KeyframeStream,
+        pixel_frame_indices: torch.Tensor,
+        latent: torch.Tensor,
+        tiling_config: TilingConfig,
+        timestep: torch.Tensor,
+        generator: torch.Generator | None,
+        *,
+        content_pixel: VideoLatentShape,
+        h_pad: diffusion_tiling.AxisPad | None,
+        w_pad: diffusion_tiling.AxisPad | None,
+        as_fhwc: bool,
+        clip_start_frame: int = 0,
+    ) -> Iterator[torch.Tensor]:
+        """Tiled keyframe decode, streaming one temporal group at a time.
+        Same shape as :meth:`_decode_pixels`: only the trailing overlap of the previous group
+        is retained between iterations, and a group's exclusive frames are yielded before the
+        next group decodes. That keeps residency at roughly two tile extents rather than a
+        whole video, which matters more here than on the plain path -- a keyframe decode also
+        carries a second pixel stream through stage 5.
+        """
+        full_video_shape = (
+            VideoLatentShape.from_torch_shape(latent.shape)
+            .upscale(self.video_downscale_factors)
+            ._replace(channels=self.out_channels)
+        )
+        target_shape = full_video_shape.to_torch_shape()
+        strides = [tuple(u.stride) for u in self.upsamples]
+        s4_t, s4_h, s4_w = diffusion_tiling.stage4_thw_from_latent(
+            strides, latent.shape[2], latent.shape[3], latent.shape[4], drop_leading_frame=True
+        )
+        tiles = diffusion_tiling.prepare_tile_schedule(
+            torch.Size([latent.shape[0], latent.shape[1], s4_t, s4_h, s4_w]),
+            tiling_config,
+            upsample3_stride=tuple(self.upsamples[3].stride),  # type: ignore[arg-type]
+            patch_size=self.patch_size,
+            min_tile_size=self.tile_min_sizes,
+            tile_halos=self.tile_halos,
+        )
+        complementary = masks_are_complementary(tiles, target_shape)
+        groups = group_tiles_by_temporal_slice(tiles)
+        group_slices = [slice(*group[0].out_coords[2].indices(target_shape[2])[:2]) for group in groups]
+
+        single_step_x0 = timestep.shape[1] == 1 and self.model_output_type == "x0"
+        x_t_init: torch.Tensor | None = None
+        if not single_step_x0:
+            randn_device = generator.device if generator is not None else latent.device
+            x_t_init = torch.randn(
+                tuple(target_shape), dtype=latent.dtype, generator=generator, device=randn_device
+            ).to(latent.device)
+
+        logger.info(
+            "keyframe decode: %d tile(s) in %d temporal group(s), %d frames at %dx%d, %d planes",
+            len(tiles),
+            len(groups),
+            content_pixel.frames,
+            content_pixel.height,
+            content_pixel.width,
+            int(pixel_frame_indices.shape[0]),
+        )
+
+        scaled_h_pad = diffusion_tiling.scale_axis_pad(h_pad, self.video_downscale_factors.height)
+        scaled_w_pad = diffusion_tiling.scale_axis_pad(w_pad, self.video_downscale_factors.width)
+        overlap_stub: torch.Tensor | None = None
+        overlap_stub_weights: torch.Tensor | None = None
+
+        def _emit(buf: torch.Tensor, wts: torch.Tensor | None, global_start: int) -> torch.Tensor | None:
+            """Finalize, crop to content, and lay out one emitted run of frames."""
+            if global_start >= content_pixel.frames or buf.shape[2] < 1:
+                return None
+            frames_keep = min(buf.shape[2], content_pixel.frames - global_start)
+            if frames_keep < 1:
+                return None
+            chunk = buf[:, :, :frames_keep]
+            if wts is not None:
+                floor = diffusion_tiling._weight_floor(wts.dtype)
+                chunk = chunk / wts[:, :, :frames_keep].clamp(min=floor)
+            chunk = diffusion_tiling.crop_pixels_to_content(
+                chunk.to(latent.dtype),
+                frames_keep,
+                content_pixel.height,
+                content_pixel.width,
+                h_pad=scaled_h_pad,
+                w_pad=scaled_w_pad,
+            )
+            return chunk[0].permute(1, 2, 3, 0).contiguous() if as_fhwc else chunk
+
+        for group_index, group in enumerate(groups):
+            curr_temporal_slice = group_slices[group_index]
+            logger.info(
+                "keyframe decode: group %d/%d, frames [%d, %d)",
+                group_index + 1,
+                len(groups),
+                curr_temporal_slice.start,
+                curr_temporal_slice.stop,
+            )
+            buffer, weights = self._decode_temporal_group_isolated_with_keyframes(
+                group,
+                feat_s4,
+                stream,
+                pixel_frame_indices,
+                s4_t,
+                x_t_init,
+                timestep,
+                full_video_shape,
+                curr_temporal_slice,
+                generator,
+                complementary=complementary,
+                clip_start_frame=clip_start_frame,
+            )
+
+            if overlap_stub is not None:
+                overlap_len = int(overlap_stub.shape[2])
+                if overlap_len > 0:
+                    overlap_stub += buffer[:, :, :overlap_len]
+                    buffer[:, :, :overlap_len] = overlap_stub
+                    if not complementary:
+                        assert overlap_stub_weights is not None
+                        assert weights is not None
+                        overlap_stub_weights += weights[:, :, :overlap_len]
+                        weights[:, :, :overlap_len] = overlap_stub_weights
+                overlap_stub = None
+                overlap_stub_weights = None
+
+            if group_index + 1 < len(groups):
+                next_start = group_slices[group_index + 1].start
+                exclusive_len = min(max(0, next_start - curr_temporal_slice.start), buffer.shape[2])
+                emitted = _emit(
+                    buffer[:, :, :exclusive_len],
+                    None if weights is None else weights[:, :, :exclusive_len],
+                    curr_temporal_slice.start,
+                )
+                if emitted is not None:
+                    yield emitted
+                # Retain only the trailing overlap for the next group's handoff.
+                overlap_stub = buffer[:, :, exclusive_len:].clone()
+                if not complementary:
+                    assert weights is not None
+                    overlap_stub_weights = weights[:, :, exclusive_len:].clone()
+                del buffer, weights
+            else:
+                emitted = _emit(buffer, weights, curr_temporal_slice.start)
+                if emitted is not None:
+                    yield emitted
+
+    def _decode_pixels_with_keyframes(
+        self,
+        latent: torch.Tensor,
+        keyframes: DecodeKeyframes,
+        tiling_config: TilingConfig | None = None,
+        generator: torch.Generator | None = None,
+        *,
+        as_fhwc: bool = False,
+    ) -> Iterator[torch.Tensor]:
+        """Keyframe-aware decode, yielding one chunk of ``(B, C, F, H, W)`` in ``[-1, 1]``.
+        Stages 1-3 run once on the whole volume for both streams -- so the keyframe stream
+        reaches stage 4 with *global* times -- then stages 4-5 run per tile with pixel blend.
+        With ``tiling_config=None`` that is a single tile and the whole thing is one pass.
+        """
+        content_shape = VideoLatentShape.from_torch_shape(latent.shape)
+        content_pixel = content_shape.upscale(self.video_downscale_factors)._replace(channels=self.out_channels)
+        keyframes.validate(num_frames=content_pixel.frames)
+
+        latent, (_t_pad, h_pad, w_pad) = diffusion_tiling.ensure_min_latent_shape(latent, self.stage_min_tile_sizes)
+        # Same spatial floor for the keyframe planes, with the plane axis pinned by a
+        # temporal minimum of 1. The pad is symmetric, so padding only one stream would
+        # offset every plane from the video by half of it.
+        _min_t, min_h, min_w = self.stage_min_tile_sizes
+        keyframe_latents, (_, keyframe_h_pad, keyframe_w_pad) = diffusion_tiling.ensure_min_latent_shape(
+            keyframes.latents, (1, min_h, min_w)
+        )
+        if (keyframe_h_pad, keyframe_w_pad) != (h_pad, w_pad):
+            raise RuntimeError(
+                f"keyframe spatial pad {(keyframe_h_pad, keyframe_w_pad)} != video pad {(h_pad, w_pad)}; "
+                "the two streams must share one spatial origin"
+            )
+        padded_keyframes = dataclasses.replace(keyframes, latents=keyframe_latents)
+
+        # Ghost pad is a temporal-border workaround for the video stream; keyframe planes have
+        # no temporal extent to pad. The appendix is cropped off context before stage 5.
+        latent_padded = diffusion_tiling.pad_trailing_latent_for_natten_border(
+            latent, self._natten_trailing_pad_latent_frames
+        )
+        feat_s4, stream = self.forward_stages_1_to_3_with_keyframes(
+            latent_padded, padded_keyframes, drop_leading_frame=True
+        )
+
+        batch = latent.shape[0]
+        timestep = self.default_inference_timesteps.to(latent.device).unsqueeze(0).expand(batch, -1)
+        if tiling_config is not None:
+            yield from self._decode_groups_with_keyframes(
+                feat_s4,
+                stream,
+                keyframes.pixel_frame_indices,
+                latent,
+                tiling_config,
+                timestep,
+                generator,
+                content_pixel=content_pixel,
+                h_pad=h_pad,
+                w_pad=w_pad,
+                as_fhwc=as_fhwc,
+                clip_start_frame=keyframes.clip_start_frame,
+            )
+            return
+
+        logger.info("keyframe decode: untiled, %d frames, %d planes", content_pixel.frames, stream.num_planes)
+        pixels = self._decode_one_tile_with_keyframes(
+            feat_s4,
+            stream,
+            keyframes.pixel_frame_indices,
+            is_origin=True,
+            timestep=timestep,
+            pad_trailing=True,
+            generator=generator,
+            compute_dtype=latent.dtype,
+            clip_start_frame=keyframes.clip_start_frame,
+        )
+        pixels = diffusion_tiling.crop_pixels_to_content(
+            pixels,
+            content_pixel.frames,
+            content_pixel.height,
+            content_pixel.width,
+            h_pad=diffusion_tiling.scale_axis_pad(h_pad, self.video_downscale_factors.height),
+            w_pad=diffusion_tiling.scale_axis_pad(w_pad, self.video_downscale_factors.width),
+        ).to(latent.dtype)
+        if as_fhwc:
+            yield pixels[0].permute(1, 2, 3, 0).contiguous()
+        else:
+            yield pixels
+
+    def _decode_video_with_keyframes(
+        self,
+        latent: torch.Tensor,
+        keyframes: DecodeKeyframes,
+        tiling_config: TilingConfig | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Iterator[torch.Tensor]:
+        """Keyframe-aware decode, yielding float chunk(s) ``[f, h, w, c]`` in ``[0, 1]``.
+        Implementation of :meth:`decode_video` when ``keyframes`` is set. ``keyframes`` carries
+        single-frame latents plus their global pixel frame indices; every video token then
+        attends to the nearest planes through a joint neighborhood-attention window.
+        """
+
+        def to_rgb(frames: torch.Tensor) -> torch.Tensor:
+            return frames.add_(1).mul_(0.5).clamp_(0, 1)
+
+        for chunk in self._decode_pixels_with_keyframes(
+            latent, keyframes, tiling_config, generator=generator, as_fhwc=True
+        ):
+            yield to_rgb(chunk)
 
     def _decode_temporal_group_isolated(
         self,
@@ -686,39 +1547,6 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
         """Decode via ``_decode_pixels`` with ``tiling_config=None`` (single full tile)."""
         return next(self._decode_pixels(sample, tiling_config=None, generator=generator))
 
-    def recommended_tiling_config(
-        self,
-        *,
-        height: int,
-        width: int,
-        num_frames: int,
-        mode: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
-        free_bytes: int | None = None,
-        model_bytes: int | None = None,
-    ) -> TileSizeConfig:
-        """DiffVAE-aware tiling: stage-4/5 overlaps + memory-capped tile sizes."""
-        if free_bytes is None:
-            device = next(self.parameters()).device
-            free_bytes = cuda_activation_budget_bytes(device) if device.type == "cuda" else 0
-        if model_bytes is None:
-            model_bytes = sum(p.numel() * p.element_size() for p in self.parameters())
-        pixel_scale = diffusion_tiling.stage4_to_pixel_scale_factors(
-            tuple(self.upsamples[3].stride),  # type: ignore[arg-type]
-            self.patch_size,
-        )
-        return diffusion_tiling.recommended_decode_tiling_config(
-            tile_halos=self.tile_halos,
-            pixel_scale=pixel_scale,
-            min_tile_size_s4=self.tile_min_sizes,
-            patch_size=self.patch_size,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            mode=mode,
-            free_bytes=free_bytes,
-            model_bytes=model_bytes,
-        )
-
     def tiled_decode(
         self,
         latent: torch.Tensor,
@@ -733,16 +1561,31 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
         latent: torch.Tensor,
         tiling_config: TilingConfig | None = None,
         generator: torch.Generator | None = None,
+        *,
+        keyframes: DecodeKeyframes | None = None,
     ) -> Iterator[torch.Tensor]:
         """Decode latent video, yielding float chunk(s) ``[f, h, w, c]`` in ``[0, 1]``.
         Untiled and tiled both go through ``_decode_pixels``. Tiled decode may yield
         multiple times when ``tiling_config.frames`` splits the video.
+        With ``keyframes`` this is :meth:`_decode_video_with_keyframes`; the argument exists on
+        every decoder so a caller can pass planes without first asking which VAE it holds.
         Layout is packed once to contiguous FHWC on emit; ``to_rgb`` only does
         inplace ``[-1, 1]→[0, 1]`` (no second realloc).
         """
+        if keyframes is not None:
+            yield from self._decode_video_with_keyframes(latent, keyframes, tiling_config, generator)
+            return
 
         def to_rgb(frames: torch.Tensor) -> torch.Tensor:
             return frames.add_(1).mul_(0.5).clamp_(0, 1)
 
         for chunk in self._decode_pixels(latent, tiling_config, generator=generator, as_fhwc=True):
             yield to_rgb(chunk)
+
+    def decode_single_frames(
+        self,
+        latents: Sequence[torch.Tensor],
+        generator: torch.Generator | Sequence[torch.Generator | None] | None = None,
+    ) -> Iterator[torch.Tensor]:
+        """Decode each latent as its own one-frame clip, yielding one RGB tensor per latent."""
+        yield from iter_decoded_single_frames(self, latents, generator)

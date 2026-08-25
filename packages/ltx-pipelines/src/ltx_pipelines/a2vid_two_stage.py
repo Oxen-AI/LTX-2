@@ -1,5 +1,5 @@
+import argparse
 import logging
-from collections.abc import Iterator
 
 import torch
 
@@ -30,13 +30,16 @@ from ltx_pipelines.utils.blocks import (
 )
 from ltx_pipelines.utils.constants import (
     STAGE_2_DISTILLED_SIGMAS,
+    PipelineParams,
 )
 from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
+    audio_duration_seconds,
     combined_image_conditionings,
     ensure_tiling_config,
     get_device,
+    num_frames_from_audio_duration,
     tiling_scale_factors_for_vae,
 )
 from ltx_pipelines.utils.media_io import (
@@ -47,7 +50,9 @@ from ltx_pipelines.utils.media_io import (
     vae_dtype_for_hdr,
 )
 from ltx_pipelines.utils.model_paths import ModelPaths
-from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, PipelineOutput
+
+logger = logging.getLogger(__name__)
 
 
 class A2VidPipelineTwoStage:
@@ -56,6 +61,9 @@ class A2VidPipelineTwoStage:
     Stage 1 generates video at half the target resolution with audio conditioning
     (video-only denoising, audio frozen), then Stage 2 upsamples by 2x and refines
     both video and audio using a distilled LoRA for higher quality output.
+    When ``num_frames`` is omitted, the frame count is derived from the effective
+    conditioning-audio duration (``min(audio_max_duration, remaining audio after
+    audio_start_time)``) at ``frame_rate``, snapped to the VAE temporal grid.
     """
 
     def __init__(  # noqa: PLR0913
@@ -147,7 +155,7 @@ class A2VidPipelineTwoStage:
         seed: int,
         height: int,
         width: int,
-        num_frames: int,
+        num_frames: int | None,
         frame_rate: float,
         num_inference_steps: int,
         video_guider_params: MultiModalGuiderParams,
@@ -163,7 +171,7 @@ class A2VidPipelineTwoStage:
         stage_1_sigmas: torch.Tensor | None = None,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
         color_space: HDRColorSpace | None = None,
-    ) -> tuple[Iterator[torch.Tensor], Audio, TilingConfig | None]:
+    ) -> PipelineOutput:
         images = self.image_conditioner.resolve_crf(images)
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -172,6 +180,20 @@ class A2VidPipelineTwoStage:
         dtype = torch.bfloat16
         if vae_dtype is None:
             vae_dtype = dtype
+
+        # Decode audio first so the frame count can follow the effective clip length
+        # (``audio_max_duration`` capped by remaining audio after ``audio_start_time``).
+        decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
+        if decoded_audio is None:
+            raise ValueError(f"Failed to decode audio from {audio_path}. Please check the file and try again.")
+        if num_frames is None:
+            num_frames = num_frames_from_audio_duration(decoded_audio, frame_rate=frame_rate)
+            logger.info(
+                "Derived num_frames=%d from %.2fs of audio @ %.2f fps",
+                num_frames,
+                audio_duration_seconds(decoded_audio),
+                frame_rate,
+            )
 
         ctx_p, ctx_n = self.prompt_encoder(
             [prompt, negative_prompt],
@@ -191,11 +213,6 @@ class A2VidPipelineTwoStage:
             diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
         )
-
-        # Encode audio.
-        decoded_audio = decode_audio_from_file(audio_path, self.device, audio_start_time, audio_max_duration)
-        if decoded_audio is None:
-            raise ValueError(f"Failed to decode audio from {audio_path}. Please check the file and try again.")
 
         encoded_audio_latent = self.audio_conditioner(lambda enc: vae_encode_audio(decoded_audio, enc, None))
         audio_shape = AudioLatentShape.from_duration(batch=1, duration=num_frames / frame_rate, channels=8, mel_bins=16)
@@ -300,15 +317,47 @@ class A2VidPipelineTwoStage:
 
         # Return the original input audio instead of VAE-decoded audio to preserve fidelity.
         # decode_audio_from_file already returns normalised [-1, 1] float values.
-        original_audio = Audio(waveform=decoded_audio.waveform.squeeze(0), sampling_rate=decoded_audio.sampling_rate)
+        # Trim to the snapped video duration so a slightly longer clip cannot freeze
+        # the last frames. Floor so a half-sample leftover cannot outlast the video.
+        video_samples = max(1, int((num_frames / frame_rate) * decoded_audio.sampling_rate))
+        original_audio = Audio(
+            waveform=decoded_audio.waveform.squeeze(0)[..., :video_samples],
+            sampling_rate=decoded_audio.sampling_rate,
+        )
 
-        return decoded_video, original_audio, tiling_config
+        return PipelineOutput(decoded_video, original_audio, num_frames, tiling_config, None, video_state.latent)
 
 
-@torch.inference_mode()
-def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    parser = default_2_stage_arg_parser(params=resolve_cli_params())
+def resolve_a2vid_cli_duration(
+    *,
+    num_frames: int | None,
+    audio_max_duration: float | None,
+    frame_rate: float,
+    default_num_frames: int,
+) -> tuple[int | None, float]:
+    """Pick the single duration driver for the A2Vid CLI.
+    ``--num-frames`` and ``--audio-max-duration`` are mutually exclusive. Returns
+    ``(num_frames_for_pipeline, audio_max_duration)``:
+    * only ``--audio-max-duration``: ``num_frames`` is ``None`` so the pipeline derives
+      frames from the decoded clip (capped by remaining audio after start time).
+    * only ``--num-frames``, or neither: use that frame count (defaulting to
+      ``default_num_frames``) and clip audio to ``num_frames / frame_rate``.
+    """
+    if num_frames is not None and audio_max_duration is not None:
+        raise ValueError("argument --num-frames: not allowed with argument --audio-max-duration")
+    if audio_max_duration is not None:
+        return None, audio_max_duration
+    frames = default_num_frames if num_frames is None else num_frames
+    return frames, frames / frame_rate
+
+
+def build_a2vid_arg_parser(params: PipelineParams) -> argparse.ArgumentParser:
+    """Two-stage parser plus A2Vid audio flags; ``--num-frames`` default is unset.
+    Leaving ``--num-frames`` as ``None`` when omitted is what lets
+    ``resolve_a2vid_cli_duration`` tell "user passed --audio-max-duration" apart from
+    "user passed both" (the shared parser would otherwise fill in ``params.num_frames``).
+    """
+    parser = default_2_stage_arg_parser(params=params)
     parser.add_argument(
         "--audio-path",
         type=str,
@@ -325,9 +374,53 @@ def main() -> None:
         "--audio-max-duration",
         type=float,
         default=None,
-        help="Maximum audio duration in seconds. Defaults to video duration (num_frames / frame_rate).",
+        help=(
+            "Maximum audio duration in seconds, measured from --audio-start-time. "
+            "The video length is derived from the effective clip "
+            "(this value capped by remaining audio in the file) at --frame-rate. "
+            "Mutually exclusive with --num-frames. "
+            f"If neither is given, audio is clipped to the default "
+            f"--num-frames / --frame-rate ({params.num_frames} frames)."
+        ),
     )
+    for action in parser._actions:
+        if "--num-frames" in action.option_strings:
+            action.default = None
+            action.help = (
+                "Number of frames to generate, num_frames = 8 * k + 1 "
+                f"(default: {params.num_frames}). Mutually exclusive with --audio-max-duration; "
+                "when set, audio is clipped to this length / --frame-rate."
+            )
+            break
+    return parser
+
+
+def resolve_a2vid_duration_or_exit(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    *,
+    default_num_frames: int,
+) -> tuple[int | None, float]:
+    """Resolve duration knobs, or ``parser.error`` if both flags were given."""
+    try:
+        return resolve_a2vid_cli_duration(
+            num_frames=args.num_frames,
+            audio_max_duration=args.audio_max_duration,
+            frame_rate=args.frame_rate,
+            default_num_frames=default_num_frames,
+        )
+    except ValueError as e:
+        parser.error(str(e))
+        raise  # parser.error always exits; keep the type checker happy
+
+
+@torch.inference_mode()
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    params = resolve_cli_params()
+    parser = build_a2vid_arg_parser(params)
     args = parser.parse_args()
+    num_frames, audio_max_duration = resolve_a2vid_duration_or_exit(parser, args, default_num_frames=params.num_frames)
     pipeline = A2VidPipelineTwoStage(
         model_paths=args.model_paths,
         distilled_lora=args.distilled_lora,
@@ -341,13 +434,13 @@ def main() -> None:
     )
     hdr = resolve_hdr_color_space(images=args.images, hdr=args.hdr)
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
-    video, audio, tiling_config = pipeline(
+    result = pipeline(
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
         seed=args.seed,
         height=args.height,
         width=args.width,
-        num_frames=args.num_frames,
+        num_frames=num_frames,
         frame_rate=args.frame_rate,
         num_inference_steps=args.num_inference_steps,
         video_guider_params=MultiModalGuiderParams(
@@ -366,19 +459,15 @@ def main() -> None:
         enhance_static_cache=args.enhance_static_cache,
         audio_path=args.audio_path,
         audio_start_time=args.audio_start_time,
-        audio_max_duration=args.audio_max_duration
-        if args.audio_max_duration is not None
-        else args.num_frames / args.frame_rate,
+        audio_max_duration=audio_max_duration,
         max_batch_size=args.max_batch_size,
     )
-    video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
-
     encode_video(
-        video=video,
+        video=result.video,
         fps=args.frame_rate,
-        audio=audio,
+        audio=result.audio,
         output_path=args.output_path,
-        video_chunks_number=video_chunks_number,
+        video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
         color_space=hdr,
     )
 

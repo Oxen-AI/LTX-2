@@ -11,6 +11,7 @@ from ltx_core.model.video_vae.transformer.swiglu import (
     _fused_gate_up_swiglu_triton,
     _fused_up_mul_torch,
     _fused_up_mul_triton,
+    _resolve_use_triton,
     _tile_from_op_args,
     dual_gate_up_triton_eligible,
     token_intervals,
@@ -67,12 +68,15 @@ def _chunked_residual_modulated_impl(
     if n_tok == 0:
         return
 
+    # Triton needs every pointer on the launch device; all-CPU falls back to torch.mm.
+    use_triton = _resolve_use_triton(bool(use_triton), x_flat, w_gate, w_up, w_down)
+
     s, sh = _channel_affine_bc(scale, shift, dim)
     max_chunk = max((iv.end - iv.start for iv in intervals), default=0)
     workspace = torch.empty((max_chunk, hidden), device=x.device, dtype=x.dtype)
     y_buf = torch.empty((max_chunk, dim), device=x.device, dtype=x.dtype)
     out_buf = torch.empty((max_chunk, dim), device=x.device, dtype=x.dtype)
-    use_dual = bool(use_triton) and dual_gate_up_triton_eligible(x, w_gate, w_up)
+    use_dual = use_triton and dual_gate_up_triton_eligible(x, w_gate, w_up)
     w_gate_c = w_gate.contiguous() if use_dual else w_gate
     w_up_c = w_up.contiguous() if use_triton else w_up
 

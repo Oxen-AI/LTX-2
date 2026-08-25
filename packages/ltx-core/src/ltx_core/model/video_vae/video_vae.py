@@ -1,5 +1,6 @@
 import itertools
 import logging
+from collections.abc import Sequence
 from typing import Any, Callable, Iterator, List, Protocol, Tuple
 
 import torch
@@ -11,6 +12,7 @@ from ltx_core.model.transformer.attention import AttentionCallable, AttentionFun
 from ltx_core.model.video_vae.attention import AttnBlock3D
 from ltx_core.model.video_vae.convolution import make_conv_nd
 from ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
+from ltx_core.model.video_vae.keyframes import DecodeKeyframes
 from ltx_core.model.video_vae.ops import PerChannelStatistics, patchify
 from ltx_core.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
 from ltx_core.model.video_vae.sampling import SpaceToDepthDownsample
@@ -479,6 +481,40 @@ def prepare_tiles_for_encoding(
     return tiles
 
 
+def _clip_generators(
+    count: int,
+    generator: torch.Generator | Sequence[torch.Generator | None] | None,
+) -> Sequence[torch.Generator | None]:
+    if generator is None:
+        return (None,) * count
+    if isinstance(generator, torch.Generator):
+        return (generator,) * count
+    if len(generator) != count:
+        raise ValueError(f"decode_single_frames got {count} latents and {len(generator)} generators")
+    return generator
+
+
+def iter_decoded_single_frames(
+    decoder: "VideoDecoder",
+    latents: Sequence[torch.Tensor],
+    generator: torch.Generator | Sequence[torch.Generator | None] | None = None,
+) -> Iterator[torch.Tensor]:
+    """Decode each latent through ``decode_video`` as its own clip.
+    Dist must pass the inner SGPU decoder, not itself: ``decode_video`` on Dist splits the
+    volume and workers return an empty iterator.
+    """
+    gens = _clip_generators(len(latents), generator)
+    for index, (latent, gen) in enumerate(zip(latents, gens, strict=True)):
+        if latent.ndim != 5 or latent.shape[2] != 1:
+            raise ValueError(
+                f"decode_single_frames expects (B, C, 1, H, W) latents, got {tuple(latent.shape)} at index {index}"
+            )
+        chunks = list(decoder.decode_video(latent, tiling_config=None, generator=gen))
+        if not chunks:
+            raise RuntimeError(f"Decoder returned no pixels for single-frame latent {index}")
+        yield torch.cat(chunks, dim=0)
+
+
 class VideoDecoder(Protocol):
     """Structural interface for video VAE decoders.
     Implementations decode a latent tensor into pixel-space video chunks
@@ -493,8 +529,25 @@ class VideoDecoder(Protocol):
         latent: torch.Tensor,
         tiling_config: TileSizeConfig | TileCountConfig | None = None,
         generator: torch.Generator | None = None,
+        *,
+        keyframes: "DecodeKeyframes | None" = None,
     ) -> Iterator[torch.Tensor]:
-        """Decode a video latent tensor, yielding float chunks ``[f, h, w, c]`` in ``[0, 1]``."""
+        """Decode a video latent tensor, yielding float chunks ``[f, h, w, c]`` in ``[0, 1]``.
+        ``keyframes`` anchors the decode on already-encoded single-frame planes. It is a hint,
+        not a contract: a decoder that cannot use it says so once and decodes plainly, so a
+        caller never has to ask which decoder it got before handing keyframes over.
+        """
+        ...
+
+    def decode_single_frames(
+        self,
+        latents: Sequence[torch.Tensor],
+        generator: torch.Generator | Sequence[torch.Generator | None] | None = None,
+    ) -> Iterator[torch.Tensor]:
+        """Decode each latent as its own one-frame clip, yielding one RGB tensor per latent.
+        A causal VAE cannot decode stacked independent planes without bleeding neighbours.
+        Dist implementations decode locally on every rank; they do not split or gather.
+        """
         ...
 
 

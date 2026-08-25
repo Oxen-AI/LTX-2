@@ -61,7 +61,35 @@ uv run python -m ltx_pipelines.distilled \
 
 In cases of GPU memory constraints, consider `--quantization fp8-cast --offload {cpu, disk}`. See [additional flags](packages/ltx-pipelines/docs/installation.md#common-cli-flags).
 
-This uses the distilled model and pipeline for fast results. For better quality or other capabilities, see [Models](#full-model-list) and [Pipelines](#available-pipelines).
+This is **DistilledPipeline**: the fast starting point. For **production quality** (slower, more VRAM), run [DFR](#dfr-production-quality) below. For other capabilities, see [Models](#full-model-list) and [Pipelines](#available-pipelines).
+
+### DFR (production quality)
+
+**DFR** (Diffusion Fidelity Rendering) is the production-quality text/image-to-video path. It uses the **same distilled transformer** as the command above, plus a detailing IC-LoRA — extra generated keyframes and a spatial detailing pass. Expect longer runtime and more VRAM, not a different prompting style. Do not pass the full (dev) transformer.
+
+Reuse the text encoder, VAEs, spatial upscaler, and distilled transformer from the first download; add the detailing IC-LoRA (separate repository):
+
+```bash
+hf download Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler \
+    ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors \
+    --local-dir models/ltx-2.5/loras
+```
+
+```bash
+uv run python -m ltx_pipelines.dfr_pipeline \
+    --transformer-path       models/ltx-2.5/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors \
+    --text-encoder-path      models/ltx-2.5/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
+    --video-vae-path         models/ltx-2.5/vae/ltx-2.5-video-vae-bf16.safetensors \
+    --audio-vae-path         models/ltx-2.5/vae/ltx-2.5-audio-vae-bf16.safetensors \
+    --detailing-lora         models/ltx-2.5/loras/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors \
+    --spatial-upsampler-path models/ltx-2.5/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+    --num-frames 121 \
+    --seed 42 \
+    --output-path output_dfr.mp4 \
+    --prompt "A medium close-up shot features a Caucasian man with a beard, wearing a green and white baseball cap without any letters on the front, and a light blue shirt over a white t-shirt. He is positioned in the center of the frame, looking intently directly at the camera, his eyes focused on camera. His facial expression is one of deep concentration, with his brow slightly raised. As he looks straight at the camera, a quick sniff sound is heard, and then he speaks with a deep male voice and a satisfied tone, saying, 'I think it's so good.' The camera remains static throughout, maintaining a shallow depth of field, which keeps the man in sharp focus while the background is softly blurred, showing a beige wall behind him. After a brief pause, another short, audible sniff is heard. The man then continues to speak, his voice maintaining the same quality, as he states, 'So good. So good.' He elaborates further, emphasizing his point with a final statement, 'This got to be, it's got to be the best tool I've ever seen.'"
+```
+
+Defaults are 1024×1536 at 24 fps (`--temporal-upscalings 0`). UHD 4K is `--width 3840 --height 2176` (not 2160). `--temporal-upscalings 1` or `2` needs the [temporal upscaler](#full-model-list). Size, fps, and memory notes: [Running DFR](packages/ltx-pipelines/docs/pipelines.md#running-dfr).
 
 ### Full Model List
 
@@ -70,8 +98,8 @@ LTX-2.5 is the recommended model, and what the [Quick Start](#-quick-start) uses
 Download from the [LTX-2.5 HuggingFace repository](https://huggingface.co/Lightricks/LTX-2.5):
 
 **Transformer** (choose and download one of the following)
-  * [`ltx-2.5-22b-dev-transformer-bf16.safetensors`](https://huggingface.co/Lightricks/LTX-2.5/blob/main/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors) - the full model; used by the guided two-stage pipelines
-  * [`ltx-2.5-22b-distilled-transformer-bf16.safetensors`](https://huggingface.co/Lightricks/LTX-2.5/blob/main/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors) - runs in far fewer steps; what `DistilledPipeline`, `ICLoraPipeline` and `DubItPipeline` expect
+  * [`ltx-2.5-22b-dev-transformer-bf16.safetensors`](https://huggingface.co/Lightricks/LTX-2.5/blob/main/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors) - the full model; used by the guided two-stage pipelines (TI2Vid, Keyframe, A2Vid)
+  * [`ltx-2.5-22b-distilled-transformer-bf16.safetensors`](https://huggingface.co/Lightricks/LTX-2.5/blob/main/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors) - runs in far fewer steps; what `DistilledPipeline`, [`DFRPipeline`](packages/ltx-pipelines/src/ltx_pipelines/dfr_pipeline.py), `ICLoraPipeline` and `DubItPipeline` expect
 
 **Text Encoder** - Gemma 4 12B, fine-tuned for LTX, with the text projection bundled in; required by every pipeline. It is bundled with the model, so no separate Gemma download is needed. Google's stock Gemma 4 release is not a substitute: loading checks the encoder's version against the one the checkpoint was trained with (`gemma4-12b-ltx-v1`)
   * [`gemma4-12b-with-proj-ltx-2.5-bf16.safetensors`](https://huggingface.co/Lightricks/LTX-2.5/blob/main/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors)
@@ -86,13 +114,13 @@ Download from the [LTX-2.5 HuggingFace repository](https://huggingface.co/Lightr
 **Spatial Upscaler** - required by the two-stage pipeline implementations in this repository
   * [`ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors`](https://huggingface.co/Lightricks/LTX-2.5/blob/main/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors)
 
-**Temporal Upscaler** - required by [`DFRPipeline`](packages/ltx-pipelines/src/ltx_pipelines/dfr_pipeline.py) when running temporal refine rounds (`--temporal-upsample-rounds`)
+**Temporal Upscaler** - required by [`DFRPipeline`](packages/ltx-pipelines/src/ltx_pipelines/dfr_pipeline.py) when running temporal refine rounds (`--temporal-upscalings`)
   * [`ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors`](https://huggingface.co/Lightricks/LTX-2.5/blob/main/latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors)
 
-**Distilled LoRA** - required by the two-stage pipeline implementations that run the full model in stage 1 (all except DistilledPipeline, ICLoraPipeline and DubItPipeline)
+**Distilled LoRA** - required by the two-stage pipeline implementations that run the full model in stage 1 (TI2Vid two-stage / HQ, Keyframe, A2Vid; not DistilledPipeline, DFRPipeline, ICLoraPipeline, or DubItPipeline)
   * [`ltx-2.5-22b-distilled-lora-450-bf16.safetensors`](https://huggingface.co/Lightricks/LTX-2.5/blob/main/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.5/resolve/main/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors)
 
-**Detailing IC-LoRA** - optional; the 2x spatial detailing LoRA for [`DFRPipeline`](packages/ltx-pipelines/src/ltx_pipelines/dfr_pipeline.py)'s refinement stage (`--detailing-lora`). It lives in its own repository, [`LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler)
+**Detailing IC-LoRA** - required by [`DFRPipeline`](packages/ltx-pipelines/src/ltx_pipelines/dfr_pipeline.py)'s refinement stage (`--detailing-lora`). It lives in its own repository, [`LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler`](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler)
   * [`ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors`](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler/blob/main/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Pixel-Spatial-Upscaler/resolve/main/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors)
 
 **Duration Head** - optional; lets you omit `--num-frames` and have the clip length predicted from the prompt
@@ -109,10 +137,10 @@ See **[LTX-2.3 models](MODELS-LTX-2.3.md)** for the full list.
 
 ### Available Pipelines
 
-* **[DistilledPipeline](packages/ltx-pipelines/src/ltx_pipelines/distilled.py)** - Fastest inference with 8 predefined sigmas (recommended)
-* **[DFRPipeline](packages/ltx-pipelines/src/ltx_pipelines/dfr_pipeline.py)** - Detail-fidelity rendering: generated keyframes and a spatial detailing pass, with optional temporal 2x/4x refinement
-* **[TI2VidTwoStagesPipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages.py)** - Production-quality text/image-to-video with 2x upsampling
-* **[TI2VidTwoStagesHQPipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages_hq.py)** - Same two-stage flow as above but uses the res_2s second-order sampler (fewer steps, better quality)
+* **[DistilledPipeline](packages/ltx-pipelines/src/ltx_pipelines/distilled.py)** - Fastest text/image-to-video (starting point)
+* **[DFRPipeline](packages/ltx-pipelines/src/ltx_pipelines/dfr_pipeline.py)** - Production-quality text/image-to-video (slower, more VRAM): same distilled transformer, generated keyframes, spatial detailing, optional 2x/4x fps. How to run: [DFR in Quick Start](#dfr-production-quality) and [Running DFR](packages/ltx-pipelines/docs/pipelines.md#running-dfr)
+* **[TI2VidTwoStagesPipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages.py)** - Guided two-stage text/image-to-video with CFG/STG and 2x upsampling
+* **[TI2VidTwoStagesHQPipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages_hq.py)** - Same guided two-stage flow with the res_2s sampler (fewer steps)
 * **[TI2VidOneStagePipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_one_stage.py)** - Single-stage generation for quick prototyping
 * **[ICLoraPipeline](packages/ltx-pipelines/src/ltx_pipelines/ic_lora.py)** - Video-to-video and image-to-video transformations (uses distilled model.)
 * **[KeyframeInterpolationPipeline](packages/ltx-pipelines/src/ltx_pipelines/keyframe_interpolation.py)** - Interpolate between keyframe images
@@ -124,7 +152,7 @@ See **[LTX-2.3 models](MODELS-LTX-2.3.md)** for the full list.
 
 ### ⚡ Optimization Tips
 
-* **Use DistilledPipeline** - Fastest inference with only 8 predefined sigmas (8 steps stage 1, 4 steps stage 2)
+* **Use DistilledPipeline for speed** - Fastest inference with only 8 predefined sigmas (8 steps stage 1, 4 steps stage 2). For production quality, use [DFR](#dfr-production-quality) instead.
 * **Enable FP8 quantization** - Enables lower memory footprint: `--quantization fp8-cast` (CLI) or `quantization=QuantizationPolicy.fp8_cast()` (Python). Fp8-cast should be used with bf16 checkpoints, it shall downcast them on the fly. On Hopper+ GPUs with native FP8 support, use `--quantization fp8-scaled-mm` for FP8 scaled matrix multiplication. Fp8-scaled-mm should be used with fp8 checkpoints.
 * **Install attention optimizations** - On datacenter Blackwell GPUs (B200), install FlashAttention 4 manually: `uv pip install 'flash-attn-4==4.0.0b9'` (this specific revision is the one we have verified against torch 2.9.1+cu128; newer betas have known issues on consumer Blackwell). On Hopper GPUs, install the FlashAttention 3 wheel. On other CUDA GPUs, PyTorch SDPA is used automatically. An installed backend is selected automatically at runtime; forcing a specific one is a Python-API option (`AttentionFunction.FLASH_ATTENTION_3`/`FLASH_ATTENTION_4`), not a CLI flag.
 * **Use gradient estimation** - Reduce inference steps from 40 to 20-30 while maintaining quality (see [pipeline documentation](packages/ltx-pipelines/docs/optimization.md#denoising-loop-optimization))

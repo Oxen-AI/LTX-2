@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.3.0 - 2026-08-25
+
+### Added
+
+- DFR can finish 4K in a tiled spatial epilogue instead of denoising the full canvas in stage 2. `--spatial-upscalings 2` keeps stage 2 at half resolution and upscales in that epilogue, which is the path for better-quality 4K (use `3840x2176`; `3840x2160` is not on the size grid). Default `--spatial-upscalings 1` is unchanged.
+- Added `ltx_pipelines.dfr_mgpu`, a multi-GPU DFR runner with the same flags as `ltx_pipelines.dfr_pipeline`.
+- Added keyframe-aware diffusion-VAE decoding, which sharpens detail at the frames a generator anchored on. Pass keyframe latents into `VideoDecoder.decode_video(..., keyframes=)`. Needs a keyframe-trained video VAE; older checkpoints decode as before.
+- `--compile max_video_tokens=N max_audio_tokens=N` (and the matching `CompilationConfig` fields) cap CUDA-graph input memory when `capture=true`, so several captured shapes share one buffer sized for the largest instead of paying for each separately.
+- `DiffusionStage.with_model_wrapper()` runs a callable on each built transformer before denoising, and still composes with block streaming and quantization.
+- `VideoDecoder.decode_single_frames()` decodes independent one-frame latents without neighbouring frames bleeding into each other.
+- `DecodeKeyframes.for_frame_span()` and `.crop_spatial()` crop keyframe planes to a decode window, keeping the nearest anchors outside the window so a tiled decode matches a whole one.
+- `DiffusionStage.__call__` accepts optional `audio_fps=` when audio should be sized from a different frame rate than the video RoPE time base.
+
+### Changed
+
+- `DFRPipeline` and `ltx_pipelines.dfr_mgpu` take a distilled checkpoint (`--distilled-checkpoint-path`) instead of a full checkpoint plus a distilled LoRA. Detailing IC-LoRA and optional user LoRAs are unchanged.
+- DFR temporal rounds use `--temporal-upscalings` instead of `--temporal-upsample-rounds`.
+- DFR snaps transformer conditioning fps to 60 whenever playback fps is above 30 (previously only values above 60 were capped), so 48 and 50 fps stay in the trained range. Playback fps is unchanged.
+- `--diffvae-optimization combined_compile` no longer requires the `natten` extra. Without it the mode falls back to Triton, or to PyTorch when Triton is unavailable.
+- Automatic decode tiling sizes tiles for keyframe-aware decoding as well as plain decoding, so a keyframe decode is less likely to run out of memory on a clip a plain decode fits.
+- Video pipelines now return a named `PipelineOutput` instead of a 3- or 4-tuple. Extra fields are `keyframes` and `video_latent`. Existing unpacking must switch to `result.video`, `result.audio`, and so on.
+- `VideoDecoder.decode_video()` takes `keyframes=` on every implementation. The diffusion decoder uses them; conv logs a warning and decodes without them; distributed splits them across ranks. Callers that never pass keyframes are unaffected; decoder implementations must accept the keyword.
+- NVFP4 quantization and CuTe DSL DiffVAE kernels (`blackwell_dsl`) now support Jetson Thor. Build NVFP4 with the arch-specific `110a` target.
+
+### Removed
+
+- `DiffusionVideoDecoder.decode_video_with_keyframes`; use `decode_video(..., keyframes=)`.
+- `DFROutput`; use `PipelineOutput`.
+- `--checkpoint-path` and `--distilled-lora` on `ltx_pipelines.dfr_pipeline` and `ltx_pipelines.dfr_mgpu`; pass `--distilled-checkpoint-path` instead.
+- `--num-generated-keyframes` on DFR; slot positions come from DFR's segment grid.
+- `--temporal-upsample-rounds` on DFR; use `--temporal-upscalings`.
+
+### Fixed
+
+- Automatic decode tiling no longer OOMs in colour conversion on clips that looked like they had spare VRAM. The budget now reserves encoder memory for each chunk, so long videos decode in temporal pieces instead of as one oversize frame dump.
+- A pipelines-only install (`ltx-core` / `ltx-pipelines`, no trainer) no longer fails to load Gemma 4 for missing torchvision.
+- `uv sync` on macOS no longer fails looking for CUDA-only torch wheels. Macs use PyPI (MPS on Apple Silicon); Linux and Windows still use the CUDA 13.2 indexes.
+- `--quantization fp8-cast` with a LoRA no longer crashes on pre-Ada GPUs such as RTX 3060 or A100.
+- Blockwise FP8/FP6 quantization no longer fails on very long sequences or token counts that are not a multiple of 4.
+- Multi-GPU DFR no longer crashes at tiling resolve, during carry-keyframe decode, or by dropping context at a temporal tile boundary.
+- DFR image-to-video stills land on the correct frame after temporal upsampling (opening-frame `frame_idx=0` was already correct).
+- `AUTO_TILING` is recognised after it crosses a process boundary, so multi-GPU pipelines resolve automatic tiling instead of rejecting the sentinel.
+
 ## 1.2.0 - 2026-08-11
 
 Support for LTX 2.5
@@ -50,6 +93,7 @@ Support for LTX 2.5
 - Fixed diffusion-VAE tiled decoding and multi-GPU blending to use checkpoint-specific geometry with lower peak host memory.
 - Fixed 8-bit Gemma loading to resolve standard tokenizer assets and use architecture-agnostic Hugging Face model loading.
 - Fixed CUDA builds using mismatched system toolkits or cuDNN sublibraries.
+- Fixed diffusion-VAE decode tiling on Apple Silicon. The decode memory budget was probed only on CUDA, so on other backends it reported zero bytes available and no decode tile could ever fit, at any resolution. Automatic tiling now sizes itself from the Metal working set on MPS.
 
 ### Removed
 

@@ -10,23 +10,26 @@ from ltx_core.conditioning import (
     VideoConditionByLatentIndex,
     VideoGeneratedKeyframeSlots,
 )
-from ltx_core.devices import cleanup_accelerator_memory, cuda_activation_budget_bytes, get_preferred_device
+from ltx_core.devices import activation_budget_bytes, cleanup_accelerator_memory, get_preferred_device
 from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 from ltx_core.model.audio_vae import encode_audio
 from ltx_core.model.transformer import Modality
-from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TileSizeConfig, TilingConfig, VideoEncoder
+from ltx_core.model.video_vae import AutoTiling, TileSizeConfig, TilingConfig, VideoEncoder
 from ltx_core.model.video_vae.diffusion_tiling import recommended_decode_tiling_config
+from ltx_core.model.video_vae.keyframes import DecodeKeyframes
 from ltx_core.model.video_vae.model_configurator import (
     diffvae_tiling_geometry_from_vae_config,
     estimate_diffusion_decoder_weight_bytes,
     is_diffusion_video_vae,
 )
 from ltx_core.model.video_vae.transformer.config import DiffVAEMode
+from ltx_core.model.video_vae.transformer.fallback_na import joint_sdpa_materializes_scores
 from ltx_core.text_encoders.gemma import LTXGemmaTextEncoder
 from ltx_core.tiling import DimensionSizeConfig
 from ltx_core.tools import LatentTools
 from ltx_core.types import (
     VIDEO_SCALE_FACTORS,
+    Audio,
     AudioLatentShape,
     LatentState,
     SpatioTemporalScaleFactors,
@@ -47,6 +50,8 @@ from ltx_pipelines.utils.media_io import (
     video_preprocess,
 )
 from ltx_pipelines.utils.media_io.color_config import HDRColorSpace
+
+logger = logging.getLogger(__name__)
 
 
 def get_device() -> torch.device:
@@ -81,10 +86,13 @@ def tiling_config_for_vae(
     diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
     device: torch.device | None = None,
     free_bytes: int | None = None,
+    keyframes: bool = False,
 ) -> TilingConfig:
     """Decode tiling for pipelines.
     Conv VAE: aspect-coupled long-side 768/64 + temporal 80/24.
     DiffVAE: halo/memory-aware :func:`recommended_decode_tiling_config`.
+    Pass ``keyframes=True`` for a keyframe-aware ``decode_video(keyframes=)`` decode: joint attention runs
+    eager blocks, which changes both the stage-5 coefficient and the withheld reserve.
     """
     if not is_diffusion_video_vae(vae_checkpoint_path):
         _ = num_frames  # API parity with DiffVAE; Conv auto layout is aspect-only.
@@ -101,9 +109,9 @@ def tiling_config_for_vae(
     geometry = diffvae_tiling_geometry_from_vae_config(vae_config)
     model_bytes = estimate_diffusion_decoder_weight_bytes(vae_checkpoint_path)
 
+    resolved_device = device if device is not None else get_device()
     if free_bytes is None:
-        dev = device if device is not None else get_device()
-        free_bytes = cuda_activation_budget_bytes(dev) if dev.type == "cuda" and torch.cuda.is_available() else 0
+        free_bytes = activation_budget_bytes(resolved_device)
 
     return recommended_decode_tiling_config(
         **geometry,
@@ -113,6 +121,8 @@ def tiling_config_for_vae(
         mode=diffvae_optimization,
         free_bytes=free_bytes,
         model_bytes=model_bytes,
+        keyframes=keyframes,
+        joint_sdpa_materializes=keyframes and joint_sdpa_materializes_scores(resolved_device),
     )
 
 
@@ -125,14 +135,16 @@ def ensure_tiling_config(
     diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
     device: torch.device | None = None,
     free_bytes: int | None = None,
+    keyframes: bool = False,
 ) -> TilingConfig | None:
     """Resolve pipeline tiling: ``AUTO_TILING`` → recommend; ``None`` → untiled; else validate.
     ``scale_factors`` must be the same factors decode will pass to ``to_splitters``
     (from :func:`tiling_scale_factors_for_vae`). Call only after ``video_shape.frames`` is known.
+    Pass ``keyframes=True`` when the decode will use the keyframe-aware VAE path.
     """
     if tiling_config is None:
         return None
-    if tiling_config is AUTO_TILING:
+    if isinstance(tiling_config, AutoTiling):
         return tiling_config_for_vae(
             vae_checkpoint_path,
             height=video_shape.height,
@@ -141,6 +153,7 @@ def ensure_tiling_config(
             diffvae_optimization=diffvae_optimization,
             device=device,
             free_bytes=free_bytes,
+            keyframes=keyframes,
         )
     tiling_config.validate(scale_factors, video_shape)
     return tiling_config
@@ -425,6 +438,29 @@ def generated_keyframe_conditionings(
     return [VideoGeneratedKeyframeSlots(pixel_frame_indices=positions)]
 
 
+def decode_keyframes_from_slots(
+    latents: torch.Tensor | None,
+    positions: Sequence[int],
+    num_frames: int,
+) -> DecodeKeyframes | None:
+    """Build ``DecodeKeyframes`` for slots that still land inside a ``num_frames`` canvas.
+    The canvas may pad its tail and be trimmed back to the caller's frame count, so a
+    carried keyframe can sit past the end. Those must be dropped rather than handed on: a
+    decode indexes keyframes by pixel frame and would otherwise anchor off-canvas.
+    """
+    if latents is None or not positions:
+        return None
+    kept = [(index, int(position)) for index, position in enumerate(positions) if 0 <= int(position) < num_frames]
+    if not kept:
+        return None
+    if len(kept) != len(positions):
+        logger.info("Dropping %d keyframe(s) past the trimmed %d-frame canvas.", len(positions) - len(kept), num_frames)
+    return DecodeKeyframes(
+        latents=torch.cat([latents[:, :, index : index + 1] for index, _ in kept], dim=2),
+        pixel_frame_indices=torch.tensor([position for _, position in kept], dtype=torch.long),
+    )
+
+
 def create_noised_state(
     tools: LatentTools,
     conditionings: list[ConditioningItem],
@@ -537,12 +573,14 @@ def generate_enhanced_prompt(
     return clean_response(prompt)
 
 
-def assert_resolution(height: int, width: int, is_two_stage: bool) -> None:
+def assert_resolution(height: int, width: int, is_two_stage: bool, *, divisor: int | None = None) -> None:
     """Assert that the resolution is divisible by the required divisor.
     For two-stage pipelines, the resolution must be divisible by 64.
     For one-stage pipelines, the resolution must be divisible by 32.
+    Pass ``divisor`` to override (e.g. 128 for a two-spatial-upsample DFR run).
     """
-    divisor = 64 if is_two_stage else 32
+    if divisor is None:
+        divisor = 64 if is_two_stage else 32
     if height % divisor != 0 or width % divisor != 0:
         raise ValueError(
             f"Resolution ({height}x{width}) is not divisible by {divisor}. "
@@ -583,3 +621,22 @@ def seconds_to_clamped_num_frames(
         time_scale = scale_factors.time
         frames = min(-(-(min_frames - 1) // time_scale) * time_scale + 1, max_frames)
     return frames
+
+
+def audio_duration_seconds(audio: Audio) -> float:
+    """Wall-clock duration of ``audio`` from its last waveform axis and sample rate."""
+    return audio.waveform.shape[-1] / float(audio.sampling_rate)
+
+
+def num_frames_from_audio_duration(audio: Audio, *, frame_rate: float) -> int:
+    """Convert decoded audio length to a VAE-grid frame count at ``frame_rate``.
+    ``decode_audio_from_file`` already applies ``audio_max_duration`` and stops at
+    EOF, so this uses the *effective* clip duration: ``min(requested max, remaining
+    audio after start time)``.
+    The raw frame count is floored (not rounded) before snapping so a leftover
+    half-frame cannot jump onto the next ``8k+1`` grid point and request more
+    video than the clip can cover.
+    """
+    raw_frames = int(audio_duration_seconds(audio) * frame_rate)
+    raw_frames = max(1, min(raw_frames, 1024))
+    return snap_frames_to_grid(raw_frames)

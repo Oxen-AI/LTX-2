@@ -44,6 +44,26 @@ class CompilationConfig:
     # than reduce-overhead's 48-block cudagraph tree. Requires GPU-resident weights
     # (keeps_gpu_resident_weights).
     capture: bool = False
+    # Largest video / audio token count the job denoises, used ONLY under `capture` to size the
+    # static input buffers every CUDA-graph capture shares, so their cost is that of the largest
+    # shape instead of the sum over shapes. Counts are per rank and taken as given: whatever a
+    # multi-GPU split (sequence parallel, TDP) leaves this rank with, overlap included -- in a
+    # single-GPU run, the whole thing. 0 gives each capture private static buffers; set only the
+    # modalities the job actually denoises (a modality that shows up without a budget raises).
+    max_video_tokens: int = 0
+    max_audio_tokens: int = 0
+
+    def __post_init__(self) -> None:
+        # A budget only reaches the buffer pool as an allocation size, where a negative or fractional
+        # count fails as an opaque bad-size error well after the config was written.
+        for name in ("max_video_tokens", "max_audio_tokens"):
+            budget = getattr(self, name)
+            if not isinstance(budget, int) or budget < 0:
+                raise ValueError(
+                    f"CompilationConfig.{name} must be a non-negative token count, got {budget!r}. "
+                    f"Set it to the largest count this rank denoises, or leave it 0 to give each "
+                    f"capture its own static buffers."
+                )
 
 
 class CompiledBlockPerturbationsProcessor(BlockPerturbationsProcessor):
@@ -200,7 +220,12 @@ def compile_transformer_captured(model: LTXModel, config: CompilationConfig) -> 
         with _compile_config_patches(config):
             return original_block_loop(video, audio, perturbations)
 
-    model._process_transformer_blocks = CudaGraphRunner(patched_block_loop, model.block_input_processor)
+    model._process_transformer_blocks = CudaGraphRunner(
+        patched_block_loop,
+        model.block_input_processor,
+        max_video_tokens=config.max_video_tokens,
+        max_audio_tokens=config.max_audio_tokens,
+    )
     return model
 
 

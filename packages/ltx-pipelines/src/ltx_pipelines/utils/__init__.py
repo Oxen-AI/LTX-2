@@ -12,6 +12,7 @@ from ltx_pipelines.utils.helpers import (
     assert_resolution,
     cleanup_memory,
     combined_image_conditionings,
+    decode_keyframes_from_slots,
     evenly_spaced_keyframe_positions,
     generated_keyframe_conditionings,
     get_device,
@@ -25,7 +26,7 @@ from ltx_pipelines.utils.samplers import (
     gradient_estimating_euler_denoising_loop,
     res2s_audio_video_denoising_loop,
 )
-from ltx_pipelines.utils.types import DenoisedLatentResult, Denoiser, ModalitySpec
+from ltx_pipelines.utils.types import DenoisedLatentResult, Denoiser, ModalitySpec, PipelineOutput
 
 __all__ = [
     "AudioConditioner",
@@ -37,6 +38,7 @@ __all__ = [
     "GuidedDenoiser",
     "ImageConditioner",
     "ModalitySpec",
+    "PipelineOutput",
     "PromptEncoder",
     "SimpleDenoiser",
     "VideoDecoder",
@@ -44,6 +46,7 @@ __all__ = [
     "assert_resolution",
     "cleanup_memory",
     "combined_image_conditionings",
+    "decode_keyframes_from_slots",
     "euler_ancestral_denoising_loop",
     "euler_cfg_pp_denoising_loop",
     "euler_denoising_loop",

@@ -17,8 +17,10 @@ reduction order changes. The all2all kernels move bytes only — the round-trip
 `gather(send(x)) == x` is byte-exact. SP is the appropriate choice whenever the
 single-GPU result is required at lower latency.
 
-This is the default for **stage 1** (`ti2vid_two_stages_mgpu`) and the **shared stage**
-(`distilled_mgpu`, where one SP wrapping covers both the half-res and full-res calls).
+This is the default for **stage 1** (`ti2vid_two_stages_mgpu`), the **shared stage**
+(`distilled_mgpu`, where one SP wrapping covers both the half-res and full-res calls),
+and **both DFR stages** (`dfr_mgpu`: `stage` and `stage_detailing` share one
+`AttentionManager`, sized for 4K ~300-frame generation).
 
 ## How the forward pass works
 
@@ -96,5 +98,7 @@ pipeline.stage_1._transformer_builder = SequenceParallelBuilder(
 
 `max_tokens` must cover the largest step. Reference: stage 1 at 512x768x121 is
 ~6k video tokens; the distilled shared stage's full-res call (1024x1536x121) is
-~24k — both ship with `sp_max_tokens=32768`. Exceeding it raises with a clear
+~24k — both ship with `sp_max_tokens=32768`. DFR stage 2 at 4K (3840x2176, ~300
+frames after canvas padding, plus keyframe slots and the x2 IC-LoRA reference) is
+~514k and ships with `sp_max_tokens=524288`. Exceeding it raises with a clear
 "use a smaller resolution or fewer frames" message.

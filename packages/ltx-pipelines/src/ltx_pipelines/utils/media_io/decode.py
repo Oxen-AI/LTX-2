@@ -11,7 +11,7 @@ import av
 import numpy as np
 import OpenImageIO
 import torch
-from PIL import ExifTags, Image, ImageCms
+from PIL import ExifTags, Image, ImageCms, UnidentifiedImageError
 from torch._prims_common import DeviceLikeType
 
 from ltx_core.hdr import HDRTransfer
@@ -138,36 +138,39 @@ def load_video_conditioning_hdr(
 
 def decode_image(image_path: str) -> np.ndarray:
     """Load an image as an oriented, sRGB, three-channel uint8 RGB array."""
-    with Image.open(image_path) as source_image:
-        image = source_image
-        orientation = image.getexif().get(_ORIENTATION_EXIF_KEY)
-        if orientation in _ORIENTATION_TO_ROTATION:
-            image = image.rotate(_ORIENTATION_TO_ROTATION[orientation], expand=True)
+    try:
+        with Image.open(image_path) as source_image:
+            image = source_image
+            orientation = image.getexif().get(_ORIENTATION_EXIF_KEY)
+            if orientation in _ORIENTATION_TO_ROTATION:
+                image = image.rotate(_ORIENTATION_TO_ROTATION[orientation], expand=True)
 
-        icc_profile = image.info.get("icc_profile")
+            icc_profile = image.info.get("icc_profile")
 
-        if image.mode == "RGBA":
-            image = image.convert("RGB")
-        elif image.mode == "LA":
-            image = image.convert("L")
-
-        if icc_profile:
-            try:
-                source_profile = ImageCms.ImageCmsProfile(BytesIO(icc_profile))
-                destination_profile = ImageCms.ImageCmsProfile(_SRGB_PROFILE)
-                image = ImageCms.profileToProfile(
-                    image,
-                    source_profile,
-                    destination_profile,
-                    outputMode="RGB",
-                )
-            except (ImageCms.PyCMSError, OSError, ValueError) as error:
-                logger.warning("Failed to convert image to sRGB: %s", error)
+            if image.mode == "RGBA":
                 image = image.convert("RGB")
-        else:
-            image = image.convert("RGB")
+            elif image.mode == "LA":
+                image = image.convert("L")
 
-        return np.array(image, dtype=np.uint8)
+            if icc_profile:
+                try:
+                    source_profile = ImageCms.ImageCmsProfile(BytesIO(icc_profile))
+                    destination_profile = ImageCms.ImageCmsProfile(_SRGB_PROFILE)
+                    image = ImageCms.profileToProfile(
+                        image,
+                        source_profile,
+                        destination_profile,
+                        outputMode="RGB",
+                    )
+                except (ImageCms.PyCMSError, OSError, ValueError) as error:
+                    logger.warning("Failed to convert image to sRGB: %s", error)
+                    image = image.convert("RGB")
+            else:
+                image = image.convert("RGB")
+
+            return np.array(image, dtype=np.uint8)
+    except UnidentifiedImageError as err:
+        raise ValueError(f"Cannot decode image file '{image_path}'.") from err
 
 
 def _audio_frame_to_float(frame: av.AudioFrame) -> np.ndarray:

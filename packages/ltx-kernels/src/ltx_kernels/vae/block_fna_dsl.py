@@ -18,9 +18,13 @@ Structure, in the order the kernel runs it:
   makes RMSNorm, RoPE, bias and the softmax register-local; splitting the *columns*
   keeps that while giving the CTA ``4 * NUM_WARPGROUPS`` warps to hide latency behind.
 * **A grid-shared K/V slab.** Panel tokens are shared by neighbouring query tiles, so
-  :func:`_fill_slab_kv_cache` projects a whole slab's halo box into a fixed K/V cache
-  once, a device-wide barrier follows, and :func:`_run_query_tile` gathers from it.
+  :func:`_fill_slab_caches` projects a whole slab's halo box into a fixed K/V cache
+  once, a device-wide barrier follows, and :func:`_run_tile` gathers from it.
   Per-query redundancy drops from ~27x (at an 11^3 window) to ~1.4x.
+* **One body per stream pair.** The keyframe stream's rows go through the same fill and the
+  same query tile as the video stream's, with :func:`ltx_kernels.vae.fna_smem.select_tensor`
+  picking the buffer at runtime. Tracing either of them twice cost ~70 s of backend compile
+  on a kernel whose plain build is already 25 s.
 * **The attention half is not here.** The window mask, the pipelined KV loop and the
   softmax are :func:`ltx_kernels.vae.fna_attn_core.attention_tile`, shared verbatim
   with the standalone NA kernel.
@@ -38,7 +42,7 @@ parts and why.
 import dataclasses
 import functools
 import os
-from typing import Any
+from typing import Any, NamedTuple
 
 import cutlass
 import cutlass.cute as cute
@@ -54,6 +58,7 @@ from ltx_kernels.vae.fna_attn_core import (
     _dyn_act,
     _dyn_w,
     apply_rope,
+    apply_rope_float_t,
     attention_tile,
     attn_epilogue,
     attn_zero_accumulators,
@@ -82,6 +87,7 @@ from ltx_kernels.vae.fna_geometry import (
     query_row_indices,
     query_slot_in_tile,
     unflatten_3d,
+    window_bounds_in_panel,
     window_origin_in_panel,
 )
 from ltx_kernels.vae.fna_smem import (
@@ -92,6 +98,7 @@ from ltx_kernels.vae.fna_smem import (
     _scatter_a,
     _store_head_row,
     cooperative_copy_slot,
+    select_tensor,
 )
 from ltx_kernels.vae.fna_types import (
     ACC,
@@ -110,6 +117,12 @@ from ltx_kernels.vae.fna_types import (
     TILER_N128,
     WARPGROUPS_PER_HEAD,
     M,
+)
+from ltx_kernels.vae.keyframe_slots import (
+    KEYFRAME_CONTEXT_SLOTS,
+    nearest_keyframe_slots,
+    nearest_video_frames,
+    tile_plane_union,
 )
 
 _COMPILED: "dict[tuple, Any]" = {}
@@ -143,19 +156,22 @@ SLAB_BOX_MAX = (128, 128, 128)
 OUT_SLACK_ROWS = M
 
 
-def _check_out(out: torch.Tensor, rows: int, channels: int, x_: torch.Tensor) -> torch.Tensor:
-    """Validate a caller-supplied output buffer for :func:`run_block_fna_dsl`."""
+def _check_out(out: torch.Tensor, rows: int, channels: int, x_: torch.Tensor, name: str = "out") -> torch.Tensor:
+    """Validate a caller-supplied output buffer for :func:`run_block_fna_dsl`.
+    ``x_`` is the stream's own input rows -- the video volume for ``out``, the anchor
+    planes for ``out_keyframes`` -- since that is what the buffer must not alias.
+    """
     if tuple(out.shape) != (rows, channels):
         raise ValueError(
-            f"out must be {(rows, channels)} -- the volume plus {OUT_SLACK_ROWS} lane-slack "
+            f"{name} must be {(rows, channels)} -- the volume plus {OUT_SLACK_ROWS} lane-slack "
             f"rows -- got {tuple(out.shape)}"
         )
     if out.dtype != torch.bfloat16 or not out.is_contiguous():
-        raise ValueError(f"out must be contiguous bfloat16, got {out.dtype}, contiguous={out.is_contiguous()}")
+        raise ValueError(f"{name} must be contiguous bfloat16, got {out.dtype}, contiguous={out.is_contiguous()}")
     if out.device != x_.device:
-        raise ValueError(f"out is on {out.device}, x on {x_.device}")
+        raise ValueError(f"{name} is on {out.device}, its input on {x_.device}")
     if out.data_ptr() == x_.data_ptr():
-        raise ValueError("out must not alias x: the kernel reads neighborhoods of x while writing out")
+        raise ValueError(f"{name} must not alias its input: the kernel reads neighborhoods while writing")
     return out
 
 
@@ -270,6 +286,20 @@ class _Workspace:
     norm_cache: cute.Tensor  # the slab's per-token RMSNorm factor for ``post``
     barrier: cute.Tensor
 
+    # ---- the keyframe stream, mirroring the video tensors above ----
+    x_kf: cute.Tensor
+    stage4_kf: cute.Tensor
+    y_kf: cute.Tensor
+    kv_cache_kf: cute.Tensor
+    norm_cache_kf: cute.Tensor
+    kf_times: cute.Tensor
+    kf_slots: cute.Tensor
+    kf_planes: cute.Tensor
+    kf_counts: cute.Tensor
+    kf_video: cute.Tensor
+    kf_video_counts: cute.Tensor
+    kf_slab: cute.Tensor
+
     # ---- SMEM operands, all aliased onto one pool; see the map in _fna_kernel ----
     s_a: cute.Tensor  # the activation / A operand
     s_b: cute.Tensor  # the streamed weight tile / B operand
@@ -335,6 +365,8 @@ class _Workspace:
     slab_tiles: tuple  # query tiles per slab, per axis
     max_box: tuple  # the largest halo box this call chose
     cache_row_stride: Any  # rows between heads in kv_cache; one whole max box
+    n_kf: Any
+    kf_cache_row_stride: Any
 
     @property
     def n_volume_tokens(self):
@@ -348,6 +380,7 @@ class _Slab:
 
     core_origin: tuple  # first token of the core, per axis
     core_end: tuple  # one past its last, clamped into the volume
+    t_index: Any  # this slab's position along the temporal slab axis
     box_origin: tuple  # first token of the halo box
     box_shape: tuple  # the box's extents
     box_hw: Any  # box_shape[1] * box_shape[2], hoisted
@@ -368,6 +401,19 @@ def _fna_kernel(
     kv_cache: cute.Tensor,  # (2*NH*cache_row_stride, HD) bf16, K's heads then V's
     norm_cache: cute.Tensor,  # (cache_row_stride + M,) f32, post's RMSNorm factor
     barrier: cute.Tensor,  # (2,) int32 device-wide barrier: arrivals, then sense
+    # ---- the keyframe stream; inert placeholders when KF is False ----
+    x_kf: cute.Tensor,  # (n_kf*H*W, C) bf16
+    stage4_kf: cute.Tensor,  # (n_kf*H_lo*W_lo, Ctx) bf16
+    y_kf: cute.Tensor,  # (n_kf*H*W + M, C) bf16
+    kv_cache_kf: cute.Tensor,  # (2*NH*kf_row_stride, HD) bf16
+    norm_cache_kf: cute.Tensor,  # (kf_row_stride + M,) f32
+    kf_times: cute.Tensor,  # (n_kf,) f32 stage-local chunk-center positions
+    kf_slots: cute.Tensor,  # (T*SLOTS,) i32
+    kf_planes: cute.Tensor,  # (n_t_tiles*P_MAX,) i32
+    kf_counts: cute.Tensor,  # (n_t_tiles,) i32
+    kf_video: cute.Tensor,  # (n_kf*SLOTS,) i32
+    kf_video_counts: cute.Tensor,  # (n_kf,) i32
+    kf_slab: cute.Tensor,  # (n_kf,) i32 -- which slab owns this plane's query tiles
     # ---- weights, each as its TMA atom and the tensor it reads ----
     a_ctx,  # fused upsample x context projection, (P*C, Ctx)
     m_ctx,
@@ -409,6 +455,8 @@ def _fna_kernel(
     max_box_h,
     max_box_w,
     cache_row_stride,  # rows between heads in kv_cache == max_box_t*h*w
+    n_kf,  # keyframe planes carried alongside the video stream
+    kf_cache_row_stride,  # rows between heads in kv_cache_kf == n_kf*max_box_h*max_box_w
     # ---- compile-time block shape ----
     C: cutlass.Constexpr,  # channels
     Ctx: cutlass.Constexpr,  # stage-4 channels; a multiple of C
@@ -434,6 +482,10 @@ def _fna_kernel(
     BT: cutlass.Constexpr,  # SLAB_BOX_MAX; sizes the rope tables only
     BH: cutlass.Constexpr,
     BW: cutlass.Constexpr,
+    KF: cutlass.Constexpr,  # keyframe stream compiled in at all
+    SLOTS: cutlass.Constexpr,
+    P_MAX: cutlass.Constexpr,  # cap on a query tile's keyframe-plane union
+    NKV_KF: cutlass.Constexpr,  # KV tiles over one keyframe panel, ceil(PH*PW / M)
     # ---- compile-time layouts ----
     mma128: cute.TiledMma,
     mma64: cute.TiledMma,
@@ -546,6 +598,18 @@ def _fna_kernel(
         kv_cache=kv_cache,
         norm_cache=norm_cache,
         barrier=barrier,
+        x_kf=x_kf,
+        stage4_kf=stage4_kf,
+        y_kf=y_kf,
+        kv_cache_kf=kv_cache_kf,
+        norm_cache_kf=norm_cache_kf,
+        kf_times=kf_times,
+        kf_slots=kf_slots,
+        kf_planes=kf_planes,
+        kf_counts=kf_counts,
+        kf_video=kf_video,
+        kf_video_counts=kf_video_counts,
+        kf_slab=kf_slab,
         s_a=s_a,
         s_b=s_b,
         s_q=s_q,
@@ -598,27 +662,45 @@ def _fna_kernel(
         slab_tiles=(slab_tiles_t, slab_tiles_h, slab_tiles_w),
         max_box=(max_box_t, max_box_h, max_box_w),
         cache_row_stride=cache_row_stride,
+        n_kf=n_kf,
+        kf_cache_row_stride=kf_cache_row_stride,
     )
 
     slab_index = 0
     while slab_index < slab_count:
         slab = _slab_geometry(ws, shape, slab_index)
         _build_rope_tables(ws, shape, slab)
-        _fill_slab_kv_cache(ws, shape, slab)
+        _fill_slab_caches(ws, shape, slab, KF)
         # Every CTA must see the whole cache before any of them reads it.
         grid_barrier(barrier, tidx, n_ctas, 2 * slab_index)
 
+        # One loop over both streams' tiles, video first. The keyframe stream's queries ride
+        # this slab's barrier because both key sets they read -- their own plane, and the <=2
+        # nearest video frames -- are single-plane panels in caches it has already filled.
+        # A plane's tokens are split across slabs exactly like video tokens: the slab whose
+        # *h/w core* holds the token, among those whose *temporal* core owns the plane. That
+        # is what keeps every token written once and every read inside the box -- the h/w
+        # panel is the core grown by the radius, and the plane's <=2 nearest video frames are
+        # a step away from its own position, so the temporal box (radius >= 1) covers them.
         n_tiles, tile_plane, tile_row = _core_tile_grid(ws, shape, slab)
         tile_id = ids.cta
-        while tile_id < n_tiles:
-            local = unflatten_3d(tile_id, tile_plane, tile_row)
-            _run_query_tile(
-                ws,
-                shape,
-                slab,
-                tuple(slab.core_origin[i] + local[i] * shape.tile[i] for i in range(3)),
-            )
-            tile_id += n_ctas
+        if cutlass.const_expr(KF):
+            # The two call sites below are one binary each: ``KF`` is compile-time, so a
+            # keyframe build traces only the guarded call and a plain build only the bare
+            # one. Written as a single call under a runtime-or-constant guard instead, the
+            # plain build would carry a branch it can never take.
+            while tile_id < n_tiles + ws.n_kf * tile_plane:
+                live = cutlass.Int32(1)
+                if tile_id >= n_tiles:
+                    plane = unflatten_3d(tile_id - n_tiles, tile_plane, tile_row)[0]
+                    live = cutlass.Int32(1) if ws.kf_slab[plane] == slab.t_index else cutlass.Int32(0)
+                if live != 0:
+                    _run_tile(ws, shape, slab, tile_id, n_tiles, tile_plane, tile_row, KF, SLOTS, P_MAX, NKV_KF)
+                tile_id += n_ctas
+        else:
+            while tile_id < n_tiles:
+                _run_tile(ws, shape, slab, tile_id, n_tiles, tile_plane, tile_row, KF, SLOTS, P_MAX, NKV_KF)
+                tile_id += n_ctas
         # ... and no CTA may start the next slab's cache fill until they all have.
         grid_barrier(barrier, tidx, n_ctas, 2 * slab_index + 1)
         slab_index += 1
@@ -656,6 +738,7 @@ def _slab_geometry(ws: _Workspace, shape: _BlockShape, slab_index) -> _Slab:
     return _Slab(
         core_origin=core_origin,
         core_end=core_end,
+        t_index=slab_t,
         box_origin=box_origin,
         box_shape=box_shape,
         box_hw=box_hw,
@@ -714,7 +797,7 @@ def _build_rope_tables(ws: _Workspace, shape: _BlockShape, slab: _Slab) -> None:
 
 
 @cute.jit
-def _fill_slab_kv_cache(ws, shape: cutlass.Constexpr, slab):
+def _fill_slab_caches(ws, shape: cutlass.Constexpr, slab, KF: cutlass.Constexpr = False):
     """Project the whole slab box into the K/V cache, ``M`` tokens per CTA per step.
     Every token of the box gets the block's front half run over it exactly once:
     ``post = x + fused_ctx(stage4)``, its RMSNorm factor, AdaLN, then the K and V
@@ -722,6 +805,11 @@ def _fill_slab_kv_cache(ws, shape: cutlass.Constexpr, slab):
     and in ``norm_cache``, because every query tile in this slab's core needs the same
     two values and rebuilding them per tile would cost a context gather, the context
     GEMM, an x gather and the residual add.
+    With ``KF`` the keyframe planes' rows are walked by this same loop, after the video box's
+    and appended to its step space: every weight, bias, norm and AdaLN constant is the video
+    pass's -- which is exactly why the softmax bound stays a bound once these keys join a
+    video query's row -- so a second copy of the body would only have cost compile time.
+    :func:`_keyframe_fill_step` supplies the row indices and ``select_tensor`` the buffers.
     ``fused_ctx`` is the stage-4 upsample composed with ``context_proj``: one Linear per
     pixel-shuffle subpixel, packed as ``P`` stacked N-tiles of one ``(C, Ctx)`` weight.
     So a token's context is the row of ``stage4`` at its parent cell projected by *its*
@@ -744,9 +832,12 @@ def _fill_slab_kv_cache(ws, shape: cutlass.Constexpr, slab):
     cells = tuple((slab.box_shape[i] + stride[i] - 1) // stride[i] for i in range(3))
     n_cells = cells[0] * cells[1] * cells[2]
     n_steps = shape.n_subpixels * ((n_cells + M - 1) // M)
+    n_steps_kf = 0
+    if cutlass.const_expr(KF):
+        n_steps_kf = _keyframe_fill_steps(ws, shape, slab)
 
     step = ws.ids.cta
-    while step < n_steps:
+    while step < n_steps + n_steps_kf:
         subpixel, box_offset, in_box = _subpixel_step(ws, shape, slab, step, cells, n_cells)
         pos = tuple(slab.box_origin[i] + box_offset[i] for i in range(3))
         row = flatten_3d(pos[0], pos[1], pos[2], vol_h, vol_w)
@@ -757,8 +848,7 @@ def _fill_slab_kv_cache(ws, shape: cutlass.Constexpr, slab):
         # clamped coordinates would otherwise target a real token, whose factor a
         # legitimate lane is already writing.
         norm_row = token if in_box else slab.n_box_tokens + lane
-        ws.rowix[lane] = row
-        ws.rowix_lo[lane] = flatten_3d(
+        row_lo = flatten_3d(
             (pos[0] + ws.drop_leading) // stride[0], pos[1] // stride[1], pos[2] // stride[2], lo_h, lo_w
         )
         # ``post`` is published only for the rows this slab owns. A halo row belongs to
@@ -768,7 +858,40 @@ def _fill_slab_kv_cache(ws, shape: cutlass.Constexpr, slab):
         owned = in_box and pos[0] >= slab.core_origin[0] and pos[0] < slab.core_end[0]
         owned = owned and pos[1] >= slab.core_origin[1] and pos[1] < slab.core_end[1]
         owned = owned and pos[2] >= slab.core_origin[2] and pos[2] < slab.core_end[2]
-        ws.rowix_w[lane] = row if owned else ws.n_volume_tokens + lane
+        write_row = row if owned else ws.n_volume_tokens + lane
+        src_x, src_ctx, out, norms = ws.x, ws.stage4, ws.y, ws.norm_cache
+        cache, cache_stride, kf_time = ws.kv_cache, ws.cache_row_stride, None
+        rope_offset = box_offset
+
+        if cutlass.const_expr(KF):
+            # The keyframe planes' rows, walked by the same loop. Every quantity above is
+            # recomputed for a plane and then selected, which is a handful of instructions per
+            # ``M``-token step; the body below -- three gathers, the context GEMM, the residual,
+            # the AdaLN and ``n_heads`` K/V projections -- is traced once instead of twice.
+            kf_row = step >= n_steps
+            kf = _keyframe_fill_step(ws, shape, slab, step - n_steps)
+            row = kf.row if kf_row else row
+            token = kf.token if kf_row else token
+            norm_row = kf.norm_row if kf_row else norm_row
+            row_lo = kf.row_lo if kf_row else row_lo
+            write_row = kf.write_row if kf_row else write_row
+            subpixel = kf.subpixel if kf_row else subpixel
+            rope_offset = (
+                box_offset[0],
+                kf.box_offset[1] if kf_row else box_offset[1],
+                kf.box_offset[2] if kf_row else box_offset[2],
+            )
+            kf_time = kf.time
+            src_x = select_tensor(kf_row, ws.x_kf, ws.x)
+            src_ctx = select_tensor(kf_row, ws.stage4_kf, ws.stage4)
+            out = select_tensor(kf_row, ws.y_kf, ws.y)
+            norms = select_tensor(kf_row, ws.norm_cache_kf, ws.norm_cache)
+            cache = select_tensor(kf_row, ws.kv_cache_kf, ws.kv_cache)
+            cache_stride = ws.kf_cache_row_stride if kf_row else ws.cache_row_stride
+
+        ws.rowix[lane] = row
+        ws.rowix_lo[lane] = row_lo
+        ws.rowix_w[lane] = write_row
 
         cute.arch.sync_threads()
         # A ``Ctx``-wide stage-4 row does not fit one C-wide operand, so it lands in two:
@@ -777,9 +900,9 @@ def _fill_slab_kv_cache(ws, shape: cutlass.Constexpr, slab):
         # the barriers and the GEMM's own pipeline stand-up cost far more at these shapes
         # than the extra K-tiles do, so this is the whole difference between the deferred
         # context and a full-resolution one.
-        _fill_a_gather(ws.s_a, ws.stage4, ws.rowix_lo, ws.copy_slot, channels)
+        _fill_a_gather(ws.s_a, src_ctx, ws.rowix_lo, ws.copy_slot, channels)
         if cutlass.const_expr(shape.ctx_groups > 1):
-            _fill_a_gather(ws.s_q, ws.stage4, ws.rowix_lo, ws.copy_slot, channels, channels)
+            _fill_a_gather(ws.s_q, src_ctx, ws.rowix_lo, ws.copy_slot, channels, channels)
         cute.arch.sync_threads()
         for n in cutlass.range_constexpr(shape.n_chunks):
             _project(
@@ -793,7 +916,7 @@ def _fill_slab_kv_cache(ws, shape: cutlass.Constexpr, slab):
                 a_split=shape.n_k_tiles if shape.ctx_groups > 1 else 0,
             )
         cute.arch.sync_threads()
-        _fill_a_gather(ws.s_a, ws.x, ws.rowix, ws.copy_slot, channels)
+        _fill_a_gather(ws.s_a, src_x, ws.rowix, ws.copy_slot, channels)
         cute.arch.sync_threads()
 
         post_sq = _add_residual(ws, shape, ws.acc_main, param["ctx_bias"], subpixel * channels)
@@ -801,8 +924,8 @@ def _fill_slab_kv_cache(ws, shape: cutlass.Constexpr, slab):
         # Publish the factor with ``post``; both warpgroups hold the reduced value, so
         # one writes it. One f32 a token, a 256th of what caching the normed row costs.
         if wg == 0:
-            ws.norm_cache[norm_row] = rms_inv
-        _scatter_a(ws.s_a, ws.y, ws.rowix_w, ws.copy_slot, channels)
+            norms[norm_row] = rms_inv
+        _scatter_a(ws.s_a, out, ws.rowix_w, ws.copy_slot, channels)
         # A cooperative copy spans the whole operand -- every thread touches rows and
         # channels outside its own warpgroup's slice -- so it has to finish before the
         # per-warpgroup norm below rewrites s_a. Without this the two overlap whenever
@@ -813,8 +936,105 @@ def _fill_slab_kv_cache(ws, shape: cutlass.Constexpr, slab):
         cute.arch.sync_threads()
 
         for head in cutlass.range_constexpr(shape.n_heads):
-            _project_head_kv(ws, shape, head, token, box_offset)
+            if cutlass.const_expr(KF):
+                _project_head_kv(ws, shape, head, token, rope_offset, cache, cache_stride, kf_time, kf_row)
+            else:
+                _project_head_kv(ws, shape, head, token, rope_offset)
         step += ws.n_ctas
+
+
+class _KeyframeFillStep(NamedTuple):
+    """Where one keyframe fill step reads and writes, mirroring the video walk's quantities."""
+
+    row: Any  # into ``x_kf`` / the output: (plane, h, w) over the whole volume grid
+    row_lo: Any  # into ``stage4_kf``: its parent stage-4 cell
+    token: Any  # into the keyframe K/V cache, and the norm cache
+    norm_row: Any  # ``token``, or a scratch entry for a lane past the end of the box
+    write_row: Any  # ``row`` if this slab owns it, else a scratch row past the output
+    subpixel: Any  # which fused-context N-tile this row's parent projects through
+    box_offset: Any  # (0, h, w) inside the slab box -- the spatial rope index
+    time: Any  # the plane's float chunk-center position, for the temporal rope
+
+
+@cute.jit
+def _keyframe_fill_steps(ws, shape: cutlass.Constexpr, slab):
+    """How many fill steps the keyframe planes need in this slab.
+    Only the slab box's ``h/w`` rectangle is filled: a query in the core reads a keyframe
+    window around its own ``(h, w)``, and the box is the core grown by the NA radius, so that
+    rectangle is already the whole reachable set. The temporal axis is the plane index, not a
+    box offset -- a keyframe plane is one slice however wide the box is in ``t``, so the walk
+    covers the spatial subpixels only.
+    """
+    stride = shape.stride
+    cells_h = (slab.box_shape[1] + stride[1] - 1) // stride[1]
+    cells_w = (slab.box_shape[2] + stride[2] - 1) // stride[2]
+    n_cells = ws.n_kf * cells_h * cells_w
+    return stride[1] * stride[2] * ((n_cells + M - 1) // M)
+
+
+@cute.jit
+def _keyframe_fill_step(ws, shape: cutlass.Constexpr, slab, step):
+    """Locate keyframe fill step ``step``: the video walk's geometry, one plane deep.
+    Two things differ from the video pass and both are forced by the plane being a single
+    temporal slice. Its stage-4 parent is looked up without a temporal divide, and under a
+    joint ``(2,2,2)`` upsample it takes the temporal subpixel a one-frame input would shuffle
+    out to -- ``drop_leading % SP_T``, which is subpixel 1 for the shipped stride and 0 when
+    the hop is spatial-only. Never both: a keyframe stays ``n_kf`` planes across every stage.
+    Called for video steps too, whose results are then selected away, so ``step`` may be
+    negative and ``plane`` out of range: both are clamped, and every table read below lands
+    on a real entry (row 0 at worst) rather than off the end.
+    """
+    lane = ws.ids.lane
+    _, vol_h, vol_w = ws.volume
+    _, lo_h, lo_w = ws.ctx_volume
+    stride = shape.stride
+    zero = cutlass.Int32(0)
+    cells_h = (slab.box_shape[1] + stride[1] - 1) // stride[1]
+    cells_w = (slab.box_shape[2] + stride[2] - 1) // stride[2]
+    n_cells = ws.n_kf * cells_h * cells_w
+    sub_t = ws.drop_leading % stride[0]
+    kf_hw = slab.box_shape[1] * slab.box_shape[2]
+
+    step = at_least(step, zero)
+    sub_hw = step % (stride[1] * stride[2])
+    cell = (step // (stride[1] * stride[2])) * M + lane
+    in_box = cell < n_cells
+    plane, cell_h, cell_w = unflatten_3d(at_most(cell, at_least(n_cells - 1, zero)), cells_h * cells_w, cells_w)
+    plane = at_most(plane, at_least(ws.n_kf - 1, zero))
+    sub_h = sub_hw // stride[2]
+    sub_w = sub_hw - sub_h * stride[2]
+    # Smallest box offset whose absolute position carries this subpixel, then step by
+    # the stride -- the video pass's rule with the temporal axis removed.
+    first_h = (sub_h + stride[1] - slab.box_origin[1] % stride[1]) % stride[1]
+    first_w = (sub_w + stride[2] - slab.box_origin[2] % stride[2]) % stride[2]
+    off_h = first_h + stride[1] * at_most(cell_h, (slab.box_shape[1] - 1 - first_h) // stride[1])
+    off_w = first_w + stride[2] * at_most(cell_w, (slab.box_shape[2] - 1 - first_w) // stride[2])
+    in_box = in_box and first_h + stride[1] * cell_h < slab.box_shape[1]
+    in_box = in_box and first_w + stride[2] * cell_w < slab.box_shape[2]
+    pos_h = slab.box_origin[1] + off_h
+    pos_w = slab.box_origin[2] + off_w
+
+    row = flatten_3d(plane, pos_h, pos_w, vol_h, vol_w)
+    token = flatten_3d(plane, off_h, off_w, slab.box_shape[1], slab.box_shape[2])
+    # ``post`` is published only for the rows this slab owns -- same rule as the video
+    # pass, and load-bearing for the same reason. Every slab projects every plane over
+    # its own halo rectangle (that is what makes the keyframe keys available to its video
+    # queries), so without the gate a later slab would overwrite the *finished* block
+    # output an earlier slab left in ``y_kf`` with ``post`` again. A plane's rows belong
+    # to the slab whose temporal core owns the plane and whose h/w core holds the token.
+    owned = in_box and ws.kf_slab[plane] == slab.t_index
+    owned = owned and pos_h >= slab.core_origin[1] and pos_h < slab.core_end[1]
+    owned = owned and pos_w >= slab.core_origin[2] and pos_w < slab.core_end[2]
+    return _KeyframeFillStep(
+        row=row,
+        row_lo=flatten_3d(plane, pos_h // stride[1], pos_w // stride[2], lo_h, lo_w),
+        token=token,
+        norm_row=token if in_box else ws.n_kf * kf_hw + lane,
+        write_row=row if owned else ws.n_kf * vol_h * vol_w + lane,
+        subpixel=sub_t * stride[1] * stride[2] + sub_hw,
+        box_offset=(zero, off_h, off_w),
+        time=ws.kf_times[plane],
+    )
 
 
 def _subpixel_step(ws, shape: cutlass.Constexpr, slab, step, cells, n_cells):
@@ -858,16 +1078,35 @@ def _subpixel_step(ws, shape: cutlass.Constexpr, slab, step, cells, n_cells):
 
 
 @cute.jit
-def _project_head_kv(ws, shape: cutlass.Constexpr, head: cutlass.Constexpr, cache_row, box_offset):
+def _project_head_kv(
+    ws,
+    shape: cutlass.Constexpr,
+    head: cutlass.Constexpr,
+    cache_row,
+    box_offset,
+    dst=None,
+    row_stride=None,
+    kf_time=None,
+    kf_row=None,
+):
     """Project one head's K and V out of the normed row and store both to the cache.
     The packed K|V weight puts K in the accumulator's first ``HD`` columns and V in
     the second, which lines the warpgroup split up with the two paths: the first
     ``WARPGROUPS_PER_HEAD`` warpgroups take K (bias, RMSNorm, RoPE), the rest take V (bias only).
+    ``dst`` / ``row_stride`` retarget the store, and ``kf_time`` swaps the temporal RoPE for a
+    float chunk-center position: that is the whole difference between filling the video cache
+    and filling the keyframe one. The projection, both biases, ``k_norm`` and the spatial RoPE
+    are identical -- which is also what keeps the softmax bound a bound for keyframe keys.
+    ``kf_row`` decides that swap at *runtime*, for the merged fill that walks both streams'
+    rows in one loop. Given, both temporal ropes are traced and one is selected; left ``None``
+    only the lattice one is, which is what a plain build gets.
     """
     lane, wg = ws.ids.lane, ws.ids.wg
     areg, params, param = ws.areg, ws.params, shape.param
     n_heads, rope_dims = shape.n_heads, shape.rope_dims
     acc = ws.acc_scratch
+    dst = ws.kv_cache if dst is None else dst
+    row_stride = ws.cache_row_stride if row_stride is None else row_stride
 
     _project(ws, shape, ws.w_kv, acc, head)
     k_sq = ACC(0.0)
@@ -893,11 +1132,17 @@ def _project_head_kv(ws, shape: cutlass.Constexpr, head: cutlass.Constexpr, cach
             if cutlass.const_expr(g < WARPGROUPS_PER_HEAD):
                 for d in cutlass.range(ACC_COLS, unroll_full=True):
                     areg[d] = areg[d] * k_rms * params[param["k_norm"] + c0 + d]
-                apply_rope(areg, *rope_dims, ws.rope, *box_offset, c0, ACC_COLS)
-                _store_head_row(ws.kv_cache, head * ws.cache_row_stride + cache_row, areg, ACC_COLS, c0)
+                if cutlass.const_expr(kf_time is None):
+                    apply_rope(areg, *rope_dims, ws.rope, *box_offset, c0, ACC_COLS)
+                elif kf_row:
+                    apply_rope_float_t(
+                        areg, *rope_dims, ws.rope, kf_time, box_offset[1], box_offset[2], ws.rope_inv[0], c0, ACC_COLS
+                    )
+                else:
+                    apply_rope(areg, *rope_dims, ws.rope, *box_offset, c0, ACC_COLS)
+                _store_head_row(dst, head * row_stride + cache_row, areg, ACC_COLS, c0)
             else:
-                row = (n_heads + head) * ws.cache_row_stride + cache_row
-                _store_head_row(ws.kv_cache, row, areg, ACC_COLS, c0)
+                _store_head_row(dst, (n_heads + head) * row_stride + cache_row, areg, ACC_COLS, c0)
 
 
 # --------------------------------------------------------------------------
@@ -905,21 +1150,65 @@ def _project_head_kv(ws, shape: cutlass.Constexpr, head: cutlass.Constexpr, cach
 # --------------------------------------------------------------------------
 
 
-@cute.jit
-def _run_query_tile(ws, shape: cutlass.Constexpr, slab, tile_origin):
-    """The whole back half of the block for one ``M``-query tile.
-    Reads ``post`` and its RMSNorm factor back out of the slab's caches, projects Q,
-    runs windowed NA against the slab's K/V cache, then the out-projection, its
-    residual and AdaLN, the SwiGLU MLP and the closing residual. Every intermediate
-    lives in ``s_a`` or in TMEM; the only global traffic is the output row, read and
-    rewritten as each residual needs it.
+class _TileGeometry(NamedTuple):
+    """Where one query tile reads and writes, for either stream.
+    Everything :func:`_run_tile` needs to locate itself, which is also the only part of it
+    that differs between the two streams. Under ``KF`` the keyframe quantities are computed
+    unconditionally -- pure arithmetic plus small table lookups, cheaper than branching
+    around them -- so a video tile evaluates them too and selects the results away. That is
+    why these are runtime selections rather than one branch's two exits.
     """
-    ids, param = ws.ids, shape.param
-    lane, channels = ids.lane, shape.channels
 
+    kf_tile: Any  # this tile is a keyframe plane's; None in a binary without that stream
+    video_tile: Any  # its complement, which the deep temporal panel keys off
+    plane: Any  # the anchor plane a keyframe tile carries, clamped into range
+    query_pos: tuple  # this lane's (t, h, w) in the volume
+    read_row: Any  # the row ``post`` is gathered from
+    write_row: Any  # where the result lands; a scratch row for an out-of-range lane
+    norm_row: Any  # into the stream's norm cache, indexed over the slab box
+    panel_origin: tuple  # the video halo panel's (t, h, w)
+    panel_h0: Any  # the panel's spatial origin for *this* stream
+    panel_w0: Any
+    window: tuple  # the NA window's low bounds, panel-relative
+    window_hi: Any  # its high bounds under clamp-and-mask; None under the inward shift
+    rope_pos: tuple  # the box offset the rope tables are indexed by
+    kf_time: Any  # a plane's float chunk-center time; None for a video tile
+    t_idx: Any  # this tile's video temporal index, which the plane union is keyed by
+
+
+@cute.jit
+def _tile_geometry(
+    ws,
+    shape: cutlass.Constexpr,
+    slab,
+    tile_id,
+    n_core_tiles,
+    tile_plane,
+    tile_row,
+    KF: cutlass.Constexpr = False,
+):
+    """Locate query tile ``tile_id``: which stream owns it, and every index it reads with.
+    ``tile_id`` indexes the two grids end to end: ``[0, n_core_tiles)`` are this slab's
+    video tiles and the rest are ``(plane, h, w)`` keyframe tiles. Both unflatten with the
+    same divisors -- a keyframe grid is ``(n_kf, tiles_h, tiles_w)`` against the video's
+    ``(tiles_t, tiles_h, tiles_w)`` -- so only the temporal component's *meaning* differs:
+    a tile origin for video, a plane index for keyframes.
+    """
+    lane = ws.ids.lane
+    zero = cutlass.Int32(0)
+    _, vol_h, vol_w = ws.volume
+
+    index = tile_id
+    kf_tile, video_tile, plane = None, None, None
+    if cutlass.const_expr(KF):
+        kf_tile = tile_id >= n_core_tiles
+        video_tile = tile_id < n_core_tiles
+        index = tile_id - n_core_tiles if kf_tile else tile_id
+    local = unflatten_3d(index, tile_plane, tile_row)
     # Tiles partition the volume: edge tiles are partial and their out-of-range lanes
     # write to scratch, so no output row is touched by two CTAs. (The MMA still runs at
     # full M; the extra rows are garbage.)
+    tile_origin = tuple(slab.core_origin[i] + local[i] * shape.tile[i] for i in range(3))
     panel_origin = halo_panel_origin(tile_origin, shape.radius, shape.panel, ws.volume)
     cute.arch.sync_threads()
     query_pos, read_row, write_row = query_row_indices(
@@ -928,54 +1217,269 @@ def _run_query_tile(ws, shape: cutlass.Constexpr, slab, tile_origin):
         lane,
         ws.n_volume_tokens,
     )
-    window = window_origin_in_panel(query_pos, panel_origin, shape.radius, shape.kernel, ws.volume)
+    # Two window rules. The joint keyframe operator is defined on clamp-and-mask, every
+    # other caller on NATTEN's inward shift, and ``KF`` is exactly that distinction -- keyed
+    # off the compile flag so the no-keyframe binary keeps a byte-identical trace.
+    if cutlass.const_expr(KF):
+        bounds = window_bounds_in_panel(query_pos, panel_origin, shape.radius, shape.kernel, ws.volume)
+        window = tuple(lo for lo, _ in bounds)
+        window_hi = tuple(hi for _, hi in bounds)
+    else:
+        window = window_origin_in_panel(query_pos, panel_origin, shape.radius, shape.kernel, ws.volume)
+        window_hi = None
     # Where this query sits inside the slab box: the index for both the rope tables,
     # which were built over the box, and the cached RMSNorm factor.
     box_pos = tuple(query_pos[i] - slab.box_origin[i] for i in range(3))
+    norm_row = flatten_3d(box_pos[0], box_pos[1], box_pos[2], slab.box_shape[1], slab.box_shape[2])
+    panel_h0, panel_w0 = panel_origin[1], panel_origin[2]
+    rope_pos, kf_time = box_pos, None
+    t_idx = tile_origin[0] // shape.tile[0]
+
+    if cutlass.const_expr(KF):
+        # The keyframe tile's geometry: the video tile's with the temporal axis replaced by
+        # the plane. Its ``h/w`` origin is already ``tile_origin[1:]``, so only the temporal
+        # half, the row indices and the buffers are recomputed. Every read below is index-
+        # clamped because a video tile evaluates this arithmetic too -- it is pure arithmetic
+        # plus small table lookups, and selecting the results is cheaper than branching
+        # around them.
+        plane = at_most(at_least(local[0], zero), at_least(ws.n_kf - 1, zero))
+        slot_t, slot_h, slot_w = ws.query_slot
+        q_h = tile_origin[1] + slot_h
+        q_w = tile_origin[2] + slot_w
+        r_h = q_h if q_h < vol_h else vol_h - 1
+        r_w = q_w if q_w < vol_w else vol_w - 1
+        kf_read = flatten_3d(plane, r_h, r_w, vol_h, vol_w)
+        kf_write = kf_read
+        # One plane per tile, so the borrowed tile's other temporal slots hold duplicates
+        # of ``slot_t == 0``; they compute and park on a scratch row.
+        if slot_t != 0 or q_h >= vol_h or q_w >= vol_w:
+            kf_write = ws.n_kf * vol_h * vol_w + lane
+        # The *panel* still shifts inward -- it only has to contain every key the tile can
+        # reach, and the inward-shifted box is the larger of the two -- but the per-query
+        # window is clamp-and-mask, like every window on the joint path.
+        kf_panel_h0 = clamp_window_start(tile_origin[1] - shape.radius[1], shape.panel[1], vol_h)
+        kf_panel_w0 = clamp_window_start(tile_origin[2] - shape.radius[2], shape.panel[2], vol_w)
+        kf_bounds = window_bounds_in_panel(
+            (zero, r_h, r_w),
+            (zero, kf_panel_h0, kf_panel_w0),
+            (0, shape.radius[1], shape.radius[2]),
+            (1, shape.kernel[1], shape.kernel[2]),
+            (cutlass.Int32(1), vol_h, vol_w),
+        )
+        kf_box_h = r_h - slab.box_origin[1]
+        kf_box_w = r_w - slab.box_origin[2]
+
+        read_row = kf_read if kf_tile else read_row
+        write_row = kf_write if kf_tile else write_row
+        norm_row = flatten_3d(plane, kf_box_h, kf_box_w, slab.box_shape[1], slab.box_shape[2]) if kf_tile else norm_row
+        panel_h0 = kf_panel_h0 if kf_tile else panel_h0
+        panel_w0 = kf_panel_w0 if kf_tile else panel_w0
+        window = (window[0], kf_bounds[1][0] if kf_tile else window[1], kf_bounds[2][0] if kf_tile else window[2])
+        window_hi = (
+            window_hi[0],
+            kf_bounds[1][1] if kf_tile else window_hi[1],
+            kf_bounds[2][1] if kf_tile else window_hi[2],
+        )
+        rope_pos = (
+            box_pos[0],
+            kf_box_h if kf_tile else box_pos[1],
+            kf_box_w if kf_tile else box_pos[2],
+        )
+        # A keyframe query sits at a float chunk-center time, off the lattice the slab's
+        # temporal rope table was built over.
+        kf_time = ws.kf_times[plane]
+        # The tail's plane union is indexed by video temporal tile; a keyframe tile has no
+        # such index, and reads row 0 whose value it then selects away.
+        t_idx = zero if kf_tile else t_idx
+
+    return _TileGeometry(
+        kf_tile=kf_tile,
+        video_tile=video_tile,
+        plane=plane,
+        query_pos=query_pos,
+        read_row=read_row,
+        write_row=write_row,
+        norm_row=norm_row,
+        panel_origin=panel_origin,
+        panel_h0=panel_h0,
+        panel_w0=panel_w0,
+        window=window,
+        window_hi=window_hi,
+        rope_pos=rope_pos,
+        kf_time=kf_time,
+        t_idx=t_idx,
+    )
+
+
+@cute.jit
+def _run_tile(
+    ws,
+    shape: cutlass.Constexpr,
+    slab,
+    tile_id,
+    n_core_tiles,
+    tile_plane,
+    tile_row,
+    KF: cutlass.Constexpr = False,
+    SLOTS: cutlass.Constexpr = 2,
+    P_MAX: cutlass.Constexpr = 1,
+    NKV_KF: cutlass.Constexpr = 1,
+):
+    """The whole back half of the block for one ``M``-query tile, of either stream.
+    Reads ``post`` and its RMSNorm factor back out of the slab's caches, projects Q,
+    runs windowed NA against the slab's K/V cache, then the out-projection, its
+    residual and AdaLN, the SwiGLU MLP and the closing residual. Every intermediate
+    lives in ``s_a`` or in TMEM; the only global traffic is the output row, read and
+    rewritten as each residual needs it.
+    One body serves video and keyframe tiles, and that is a compile-time decision, not a
+    tidiness one. Everything after the geometry is identical between the two streams --
+    same weights, same AdaLN constants, same MLP -- so a second copy of it bought nothing
+    and cost 60 s of ptxas and MLIR on a kernel that is already the compile-time floor.
+    What differs is which buffers the rows live in, and :func:`select_tensor` makes that a
+    runtime address rather than a second instantiation.
+    :func:`_tile_geometry` carries the whole of that difference except the buffers, which
+    stay here because there is nothing to compute about them: given its ``kf_tile``, each
+    pair is one ``select_tensor``.
+    """
+    ids, param = ws.ids, shape.param
+    lane, channels = ids.lane, shape.channels
+    zero = cutlass.Int32(0)
+
+    # ---------------- which tile, and where it reads ----------------------
+    geom = _tile_geometry(ws, shape, slab, tile_id, n_core_tiles, tile_plane, tile_row, KF)
+    out, norms = ws.y, ws.norm_cache
+    if cutlass.const_expr(KF):
+        out = select_tensor(geom.kf_tile, ws.y_kf, ws.y)
+        norms = select_tensor(geom.kf_tile, ws.norm_cache_kf, ws.norm_cache)
 
     # ---------------- residual, AdaLN, Q ---------------------------------
-    ws.rowix[lane] = read_row
-    ws.rowix_w[lane] = write_row
+    ws.rowix[lane] = geom.read_row
+    ws.rowix_w[lane] = geom.write_row
     # The cache fill already built ``post = x + ctx_proj(context)`` for every row this
     # slab owns and left it in the output, so read it back instead of rebuilding it per
     # tile -- and its RMSNorm factor with it, sparing this tile a pass over the whole
     # row and the CTA-wide reduction that pass feeds.
     cute.arch.sync_threads()
-    _fill_a_gather(ws.s_a, ws.y, ws.rowix, ws.copy_slot, channels)
+    _fill_a_gather(ws.s_a, out, ws.rowix, ws.copy_slot, channels)
     cute.arch.sync_threads()
-    rms_inv = ws.norm_cache[flatten_3d(box_pos[0], box_pos[1], box_pos[2], slab.box_shape[1], slab.box_shape[2])]
+    rms_inv = norms[geom.norm_row]
     _apply_adaln(ws, shape, rms_inv, param["msa_weight"], param["msa_shift"])
     cute.arch.sync_threads()
 
-    _project_queries(ws, shape, box_pos)
+    _project_queries(ws, shape, geom.rope_pos, geom.kf_time, geom.kf_tile)
     attn_zero_accumulators(ws.acc_o, ws.l_sm, ws.oreg, lane, ids.wg, shape.n_heads)
 
     # ---------------- windowed neighborhood attention --------------------
     # The K/V source is this slab's fused cache, so both halves are ``kv_cache`` --
     # K's heads first, then V's -- the head stride is the halo box this call chose, and
     # one panel row is one cache row.
-    attention_tile(
-        (ws.fr_q, ws.fr_k, ws.fr_p, ws.fr_v),
-        (ws.s_k, ws.s_v, ws.s_p),
-        ws.acc_qk,
-        ws.acc_o,
-        (ws.qkbar, ws.pvbar),
-        ws.m_sm,
-        ws.l_sm,
-        ws.areg,
-        ws.kvfrag,
-        (ws.kv_cache, ws.kv_cache),
-        (cutlass.Int32(0), shape.n_heads * ws.cache_row_stride),
-        ws.cache_row_stride,
-        (*panel_origin, *slab.box_origin, slab.box_shape[1], slab.box_shape[2]),
-        window,
-        (ids.tidx, lane, ids.wg, ids.warp),
-        shape.n_heads,
-        1,
-        *shape.panel,
-        *shape.kernel,
-        shape.n_kv_tiles,
-    )
+    # A video query runs this deep ``PT``-tall panel; a keyframe query has no local
+    # temporal neighborhood at all, so it skips it and takes only the single-plane passes
+    # below. That asymmetry is the reason the deep panel stays its own instantiation.
+    deep = True
+    if cutlass.const_expr(KF):
+        deep = geom.video_tile
+    if deep:
+        attention_tile(
+            (ws.fr_q, ws.fr_k, ws.fr_p, ws.fr_v),
+            (ws.s_k, ws.s_v, ws.s_p),
+            ws.acc_qk,
+            ws.acc_o,
+            (ws.qkbar, ws.pvbar),
+            ws.m_sm,
+            ws.l_sm,
+            ws.areg,
+            ws.kvfrag,
+            (ws.kv_cache, ws.kv_cache),
+            (cutlass.Int32(0), shape.n_heads * ws.cache_row_stride),
+            ws.cache_row_stride,
+            (*geom.panel_origin, *slab.box_origin, slab.box_shape[1], slab.box_shape[2]),
+            geom.window,
+            (ids.tidx, lane, ids.wg, ids.warp),
+            shape.n_heads,
+            1,
+            *shape.panel,
+            *shape.kernel,
+            shape.n_kv_tiles,
+            None,
+            geom.window_hi,
+        )
+
+    # Single-plane passes, into the same (m_sm, l_sm, acc_o). The fixed softmax offset means
+    # continuing the accumulation *is* a joint softmax -- no rescale, no state merge -- and
+    # the keyframe keys were normed by the same ``k_norm``, so the offset still bounds them.
+    # Both streams' extra key sets are single planes on the query's own spatial window, so
+    # one instantiation covers all three uses: a video query's selected keyframe planes, a
+    # keyframe query's own plane, and its <=2 nearest video frames. Which cache a pass reads
+    # is an address, and the pass count is runtime.
+    if cutlass.const_expr(KF):
+        pass_i = zero
+        n_passes = ws.kf_counts[geom.t_idx]
+        if geom.kf_tile:
+            n_passes = 1 + ws.kf_video_counts[geom.plane]
+        while pass_i < n_passes:
+            # Video tail: this tile's plane union, with each lane gated out of the planes its
+            # own ``t`` did not pick -- the plane is a per-tile gather but the nearest-S set
+            # is per ``t``, and a tile spans ``TT`` of them.
+            source = ws.kf_planes[geom.t_idx * P_MAX + at_most(pass_i, P_MAX - 1)]
+            sel = zero
+            for s in cutlass.range_constexpr(SLOTS):
+                if ws.kf_slots[geom.query_pos[0] * SLOTS + s] == source:
+                    sel = cutlass.Int32(1)
+            video_kv = zero
+            if geom.kf_tile:
+                # A keyframe query's passes are tile-uniform -- one plane per tile, and its
+                # video frames are a property of the plane -- so no lane gating.
+                sel = cutlass.Int32(1)
+                if pass_i == 0:
+                    source = geom.plane
+                else:
+                    source = ws.kf_video[geom.plane * SLOTS + at_most(pass_i - 1, SLOTS - 1)]
+                    video_kv = cutlass.Int32(1)
+            cache = select_tensor(video_kv != 0, ws.kv_cache, ws.kv_cache_kf)
+            row_stride = ws.cache_row_stride if video_kv != 0 else ws.kf_cache_row_stride
+            # The keyframe cache is (n_kf, box_h, box_w): a plane index is absolute, so its
+            # box origin is 0, while a video frame index is relative to the box.
+            attention_tile(
+                (ws.fr_q, ws.fr_k, ws.fr_p, ws.fr_v),
+                (ws.s_k, ws.s_v, ws.s_p),
+                ws.acc_qk,
+                ws.acc_o,
+                (ws.qkbar, ws.pvbar),
+                ws.m_sm,
+                ws.l_sm,
+                ws.areg,
+                ws.kvfrag,
+                (cache, cache),
+                (zero, shape.n_heads * row_stride),
+                row_stride,
+                (
+                    source,
+                    geom.panel_h0,
+                    geom.panel_w0,
+                    slab.box_origin[0] if video_kv != 0 else zero,
+                    slab.box_origin[1],
+                    slab.box_origin[2],
+                    slab.box_shape[1],
+                    slab.box_shape[2],
+                ),
+                (zero, geom.window[1], geom.window[2]),
+                (ids.tidx, lane, ids.wg, ids.warp),
+                shape.n_heads,
+                1,
+                1,
+                shape.panel[1],
+                shape.panel[2],
+                1,
+                shape.kernel[1],
+                shape.kernel[2],
+                NKV_KF,
+                sel,
+                # One plane deep; the spatial pair is the query's own window, keeping both
+                # key sets aligned for the query sharing a softmax over them.
+                (cutlass.Int32(1), geom.window_hi[1], geom.window_hi[2]),
+            )
+            pass_i += 1
 
     # ---------------- out projection, residual, AdaLN --------------------
     cute.arch.sync_threads()
@@ -986,12 +1490,12 @@ def _run_query_tile(ws, shape: cutlass.Constexpr, slab, tile_origin):
     # s_a is free once the out-projection has consumed it, so ``post`` comes back
     # through it coalesced rather than one cache line per lane.
     cute.arch.sync_threads()
-    _fill_a_gather(ws.s_a, ws.y, ws.rowix, ws.copy_slot, channels)
+    _fill_a_gather(ws.s_a, out, ws.rowix, ws.copy_slot, channels)
     cute.arch.sync_threads()
     resid_sq = _add_residual(ws, shape, ws.acc_main, param["out_bias"])
     rms_inv = cute.rsqrt(row_sum(ws.red_c, lane, ids.wg, resid_sq) / ACC(channels) + ACC(EPS))
     cute.arch.sync_threads()
-    _scatter_a(ws.s_a, ws.y, ws.rowix_w, ws.copy_slot, channels)
+    _scatter_a(ws.s_a, out, ws.rowix_w, ws.copy_slot, channels)
     # A cooperative copy spans the whole operand -- every thread touches rows and
     # channels outside its own warpgroup's slice -- so it has to finish before the
     # per-warpgroup norm below rewrites s_a. Without this the two overlap whenever the
@@ -1006,16 +1510,21 @@ def _run_query_tile(ws, shape: cutlass.Constexpr, slab, tile_origin):
     # s_a is free again after the last gate/up, so the final residual add reloads and
     # stores through it, coalesced.
     cute.arch.sync_threads()
-    _fill_a_gather(ws.s_a, ws.y, ws.rowix, ws.copy_slot, channels)
+    _fill_a_gather(ws.s_a, out, ws.rowix, ws.copy_slot, channels)
     cute.arch.sync_threads()
     _add_accumulator(ws, shape, ws.acc_down)
     cute.arch.sync_threads()
-    _scatter_a(ws.s_a, ws.y, ws.rowix_w, ws.copy_slot, channels)
+    _scatter_a(ws.s_a, out, ws.rowix_w, ws.copy_slot, channels)
 
 
 @cute.jit
-def _project_queries(ws, shape: cutlass.Constexpr, rope_pos):
+def _project_queries(ws, shape: cutlass.Constexpr, rope_pos, kf_time=None, kf_tile=None):
     """Project, normalise and rotate this tile's queries into ``s_q``.
+    ``kf_time`` given, this tile may be a keyframe tile, and ``kf_tile`` says at runtime
+    whether it is: a keyframe query sits at a float chunk-center time, off the lattice the
+    slab's temporal rope table was built over, while h and w are still on it. Both temporal
+    ropes are then traced, which is a few hundred instructions -- the alternative was tracing
+    the whole projection twice.
     ``HEADS_PER_TILE`` heads at a time: an N=128 tile of ``w_q`` is already
     ``[head 2n | head 2n+1]``, so with one warpgroup per head the RMSNorm and RoPE stay
     inside a warpgroup -- no reduction, and half the GEMM calls of the per-head N=64
@@ -1067,7 +1576,22 @@ def _project_queries(ws, shape: cutlass.Constexpr, rope_pos):
                     ws.m_sm[lane, head] = cute.sqrt(q_norm_sq) * q_rms * params[param["k_bound"]] * LOG2E
                 for d in cutlass.range(ACC_COLS, unroll_full=True):
                     areg[d] = areg[d] * q_rms * params[param["q_norm"] + c0 + d]
-                apply_rope(areg, *shape.rope_dims, ws.rope, *rope_pos, c0, ACC_COLS)
+                if cutlass.const_expr(kf_time is None):
+                    apply_rope(areg, *shape.rope_dims, ws.rope, *rope_pos, c0, ACC_COLS)
+                elif kf_tile:
+                    apply_rope_float_t(
+                        areg,
+                        *shape.rope_dims,
+                        ws.rope,
+                        kf_time,
+                        rope_pos[1],
+                        rope_pos[2],
+                        ws.rope_inv[0],
+                        c0,
+                        ACC_COLS,
+                    )
+                else:
+                    apply_rope(areg, *shape.rope_dims, ws.rope, *rope_pos, c0, ACC_COLS)
                 _fill_a_chunk(ws.s_q, lane, areg, head * HD + c0, ACC_COLS)
 
 
@@ -1359,6 +1883,180 @@ def pack_fused_ctx_weights(
     )
 
 
+@functools.lru_cache(maxsize=8)
+def _inert_keyframe_operands(channels: int, device: torch.device) -> "tuple":
+    """Never-read stand-ins for the keyframe operands, wrapped once per device.
+    Cached rather than built per call: the kernel takes all twelve unconditionally but reads
+    none of them with the keyframe stream compiled out, so they only have to be *typed*
+    right. Both the allocation and the ``from_dlpack`` wrap are hoisted here -- the wrap
+    especially, since twelve of them on the hot path measured as ~9% of a small block launch.
+    """
+    act = _dyn_act(torch.zeros((1, channels), device=device, dtype=torch.bfloat16))
+    f32 = _dyn(torch.zeros(1, device=device, dtype=torch.float32))
+    i32 = _dyn(torch.zeros(1, device=device, dtype=torch.int32))
+    return (act, act, act, act, f32, f32, i32, i32, i32, i32, i32, i32)
+
+
+class _KeyframeWorkspace(NamedTuple):
+    """The keyframe half of one launch: its compile-key facts, its operands, its output."""
+
+    #: The caller supplied a keyframe stream -- so this launch is the *joint* operator, whose
+    #: window rule is clamp-and-mask rather than NATTEN's inward shift. Deliberately not
+    #: conditioned on the plane count: the rule belongs to the operator, and keying both it
+    #: and the tail off "has planes" quietly served two different window rules depending on
+    #: whether a caller passed zero planes or planes nothing selected. With no planes the
+    #: tail is a zero-trip loop over real, empty tables.
+    enabled: bool
+    n_kf: int
+    cache_row_stride: int
+    #: The twelve keyframe arguments, already DSL-wrapped and in signature order.
+    operands: tuple
+    #: ``operands``' output buffer, unwrapped, because the return value slices it. ``None``
+    #: with the stream compiled out, where there is nothing to slice.
+    y: "torch.Tensor | None"
+
+
+def _absent_keyframe_workspace(channels: int, device: torch.device) -> _KeyframeWorkspace:
+    """No keyframe stream at all: inert operands, and nothing the kernel will read."""
+    return _KeyframeWorkspace(
+        enabled=False,
+        n_kf=0,
+        cache_row_stride=1,
+        operands=_inert_keyframe_operands(channels, device),
+        y=None,
+    )
+
+
+def _keyframe_workspace(
+    x_keyframes: torch.Tensor | None,
+    stage4_keyframes: torch.Tensor | None,
+    keyframe_times: torch.Tensor | None,
+    t: int,
+    h: int,
+    w: int,
+    channels: int,
+    ctx_channels: int,
+    num_heads: int,
+    head_dim: int,
+    tile: "tuple[int, int, int]",
+    plan: _SlabPlan,
+    device: torch.device,
+    out: torch.Tensor | None = None,
+) -> _KeyframeWorkspace:
+    """Allocate the keyframe caches and precompute the two lookups, or hand back placeholders.
+    The keyframe cache is the video cache with the box's temporal extent replaced by ``n_kf``:
+    a plane is one slice however deep the slab is, and the box's ``h/w`` rectangle is already
+    everything a core query can reach spatially. That makes it ``n_kf / box_t`` of the video
+    cache -- a few percent at any real shape.
+    ``out`` is the anchor stream's output buffer, ``(n_kf*H*W + OUT_SLACK_ROWS, C)``, so a
+    chain can recycle it exactly as it recycles the video stream's.
+    """
+    supplied = (x_keyframes, stage4_keyframes, keyframe_times)
+    if all(v is None for v in supplied):
+        if out is not None:
+            raise ValueError("out_keyframes needs a keyframe stream to write")
+        return _absent_keyframe_workspace(channels, device)
+    if any(v is None for v in supplied):
+        raise ValueError("x_keyframes, stage4_keyframes and keyframe_times must be given together")
+
+    n_kf = int(x_keyframes.shape[1])
+    if n_kf == 0:
+        # Still the joint operator, so still the joint binary -- only with nothing for the
+        # tail to iterate. Everything the kernel indexes by *query tile* is real and sized;
+        # everything it indexes by plane is a placeholder behind a zero-trip loop.
+        inert = _dyn_act(torch.zeros((1, channels), device=device, dtype=torch.bfloat16))
+        inert_f32 = _dyn(torch.zeros(1, device=device, dtype=torch.float32))
+        n_tiles_t = -(-t // tile[0])
+        # Only the lane slack, since there is no plane to store -- but still a real buffer
+        # the out-of-range stores can land in, and still ``out``-able, so a chain does not
+        # have to special-case an empty selection.
+        empty_y = (
+            torch.empty((M, channels), device=device, dtype=torch.bfloat16)
+            if out is None
+            else _check_out(out, M, channels, x_keyframes, "out_keyframes")
+        )
+        return _KeyframeWorkspace(
+            enabled=True,
+            n_kf=0,
+            cache_row_stride=1,
+            operands=(
+                inert,
+                inert,
+                _dyn_act(empty_y),
+                _dyn_act(torch.empty((2 * num_heads, head_dim), device=device, dtype=torch.bfloat16)),
+                _dyn(torch.empty(1 + M, device=device, dtype=torch.float32)),
+                inert_f32,
+                _dyn(torch.full((t * KEYFRAME_CONTEXT_SLOTS,), -1, dtype=torch.int32, device=device)),
+                _dyn(torch.full((n_tiles_t,), -1, dtype=torch.int32, device=device)),
+                _dyn(torch.zeros(n_tiles_t, dtype=torch.int32, device=device)),
+                _dyn(torch.zeros(1, dtype=torch.int32, device=device)),
+                _dyn(torch.zeros(1, dtype=torch.int32, device=device)),
+                _dyn(torch.zeros(1, dtype=torch.int32, device=device)),
+            ),
+            y=empty_y,
+        )
+    if tuple(x_keyframes.shape) != (1, n_kf, h, w, channels):
+        raise ValueError(f"x_keyframes must be {(1, n_kf, h, w, channels)}, got {tuple(x_keyframes.shape)}")
+    if tuple(stage4_keyframes.shape)[:2] != (1, n_kf) or int(stage4_keyframes.shape[-1]) != ctx_channels:
+        raise ValueError(f"stage4_keyframes must be (1, {n_kf}, H_lo, W_lo, {ctx_channels})")
+    if int(keyframe_times.numel()) != n_kf:
+        raise ValueError(f"keyframe_times must have {n_kf} entries, got {int(keyframe_times.numel())}")
+
+    slots = nearest_keyframe_slots(keyframe_times, t)
+    # ``SLOTS * tile[0]``, not ``min(n_kf, ...)``: the stride into ``planes`` is a compile-time
+    # constant of the tile and must not move with the anchor layout. Slack columns are -1.
+    planes, _ = tile_plane_union(slots, tile_t=tile[0], max_planes=KEYFRAME_CONTEXT_SLOTS * tile[0])
+    counts = (planes >= 0).sum(dim=-1).to(torch.int32)
+    video = nearest_video_frames(keyframe_times, t)
+    # Which slab owns each plane's query tiles: the one whose core holds the plane's own
+    # position. Its box is that core grown by the NA radius (>=1 on every stage) and the <=2
+    # nearest video frames are within a step, so the box always covers them.
+    # ``plan.core`` counts query *tiles*, so the core's temporal extent in tokens is that
+    # times the tile depth. Dividing by the tile count instead sends most planes to a slab
+    # index that never comes up, and their query tiles silently never run.
+    core_tokens = plan.core[0] * tile[0]
+    positions = keyframe_times.detach().cpu().round().clamp_(0, t - 1).to(torch.int64)
+    owner = (positions // core_tokens).clamp_(0, plan.grid[0] - 1).to(torch.int32)
+
+    kf_rows = n_kf * h * w
+    cache_row_stride = n_kf * plan.box[1] * plan.box[2]
+
+    def rows(x: torch.Tensor, ch: int) -> torch.Tensor:
+        return _as_rows(x[0].detach().to(dtype=torch.bfloat16)).reshape(-1, ch)
+
+    def i32(x: torch.Tensor) -> torch.Tensor:
+        return x.reshape(-1).contiguous().to(device=device, dtype=torch.int32)
+
+    x_rows = rows(x_keyframes, channels)
+    y = (
+        torch.empty((kf_rows + M, channels), device=device, dtype=torch.bfloat16)
+        if out is None
+        # Against ``x_rows`` rather than ``x_keyframes``: what the kernel reads is the row
+        # view, and for a non-contiguous input that is a copy the caller cannot alias anyway.
+        else _check_out(out, kf_rows + M, channels, x_rows, "out_keyframes")
+    )
+    return _KeyframeWorkspace(
+        enabled=True,
+        n_kf=n_kf,
+        cache_row_stride=cache_row_stride,
+        operands=(
+            _dyn_act(x_rows),
+            _dyn_act(rows(stage4_keyframes, ctx_channels)),
+            _dyn_act(y),
+            _dyn_act(torch.empty((2 * num_heads * cache_row_stride, head_dim), device=device, dtype=torch.bfloat16)),
+            _dyn(torch.empty(cache_row_stride + M, device=device, dtype=torch.float32)),
+            _dyn(keyframe_times.detach().to(device=device, dtype=torch.float32).reshape(-1)),
+            _dyn(i32(slots)),
+            _dyn(i32(planes)),
+            _dyn(i32(counts)),
+            _dyn(i32(video)),
+            _dyn(i32((video >= 0).sum(dim=-1))),
+            _dyn(i32(owner)),
+        ),
+        y=y,
+    )
+
+
 def run_block_fna_dsl(
     x: torch.Tensor,
     stage4: torch.Tensor,
@@ -1396,7 +2094,11 @@ def run_block_fna_dsl(
     kernel_size: "tuple[int, int, int]",
     tile_thw: "tuple[int, int, int] | None" = None,
     out: torch.Tensor | None = None,
-) -> torch.Tensor:
+    x_keyframes: torch.Tensor | None = None,
+    stage4_keyframes: torch.Tensor | None = None,
+    keyframe_times: torch.Tensor | None = None,
+    out_keyframes: torch.Tensor | None = None,
+) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor]":
     """Run one fused ``DiffusionNABlock``. ``x`` is ``(1, T, H, W, C)``.
     ``stage4`` is the context *before* its pixel-shuffle upsample,
     ``(1, T/p_t, H/p_h, W/p_w, Ctx)``, and ``w_ctx`` / ``b_ctx`` are that upsample fused
@@ -1417,6 +2119,9 @@ def run_block_fna_dsl(
     It must be ``(T*H*W + OUT_SLACK_ROWS, C)`` contiguous bf16: the kernel stores
     out-of-range lanes of partial tiles past the volume. It must not alias ``x`` --
     the kernel reads neighborhoods of ``x`` while writing, so in-place is not safe.
+    ``out_keyframes`` is the same thing for the anchor stream, sized
+    ``(n_kf*H*W + OUT_SLACK_ROWS, C)``; without it a joint launch allocates that stream's
+    output itself and the chain's alternation stops one stream short.
     """
     if not block_fna_available(x.device.index or 0):
         raise RuntimeError(UNSUPPORTED_MESSAGE)
@@ -1476,6 +2181,23 @@ def run_block_fna_dsl(
     norm_cache = torch.empty(plan.cache_row_stride + M, device=x_.device, dtype=torch.float32)
     barrier = torch.zeros(2, device=x_.device, dtype=torch.int32)
 
+    kf = _keyframe_workspace(
+        x_keyframes,
+        stage4_keyframes,
+        keyframe_times,
+        T,
+        H,
+        W,
+        C,
+        Ctx,
+        num_heads,
+        hd,
+        tile,
+        plan,
+        x_.device,
+        out_keyframes,
+    )
+
     def f32(t: torch.Tensor):
         return _dyn(t.detach().contiguous().float().to(device=x_.device).view(-1))
 
@@ -1513,6 +2235,7 @@ def run_block_fna_dsl(
         rope_dim_split=rope_dim_split,
         kernel_size=kernel_size,
         tile_thw=tile,
+        keyframes=kf.enabled,
     )
     compiled(
         _dyn_act(_as_rows(x_)),
@@ -1521,6 +2244,7 @@ def run_block_fna_dsl(
         _dyn_act(kv_cache),
         _dyn(norm_cache),
         _dyn(barrier),
+        *kf.operands,
         bf(w_ctx),
         bf(w_q),
         bf(_pack_kv(w_k, w_v, num_heads)),
@@ -1532,9 +2256,21 @@ def run_block_fna_dsl(
         f32(inv_t),
         f32(inv_h),
         f32(inv_w),
-        *_runtime_scalars(volume=(T, H, W), ctx_volume=(T_lo, H_lo, W_lo), drop_leading=drop, n_ctas=n_ctas, plan=plan),
+        *_runtime_scalars(
+            volume=(T, H, W),
+            ctx_volume=(T_lo, H_lo, W_lo),
+            drop_leading=drop,
+            n_ctas=n_ctas,
+            plan=plan,
+            n_kf=kf.n_kf,
+            kf_cache_row_stride=kf.cache_row_stride,
+        ),
     )
-    return y_buf[: T * H * W].view(T, H, W, C).unsqueeze(0).to(dtype=x.dtype)
+    video_out = y_buf[: T * H * W].view(T, H, W, C).unsqueeze(0).to(dtype=x.dtype)
+    if not kf.enabled:
+        return video_out
+    # The arity follows the call, so an empty stream still returns a (possibly empty) pair.
+    return video_out, kf.y[: kf.n_kf * H * W].view(kf.n_kf, H, W, C).unsqueeze(0).to(dtype=x.dtype)
 
 
 def block_fna_available(device_index: int = 0) -> bool:
@@ -1586,6 +2322,18 @@ def _launch(
     kv_cache,
     norm_cache,
     barrier,
+    x_kf,
+    stage4_kf,
+    y_kf,
+    kv_cache_kf,
+    norm_cache_kf,
+    kf_times,
+    kf_slots,
+    kf_planes,
+    kf_counts,
+    kf_video,
+    kf_video_counts,
+    kf_slab,
     w_ctx,
     w_q,
     w_kv,
@@ -1615,6 +2363,8 @@ def _launch(
     max_box_h,
     max_box_w,
     cache_row_stride,
+    n_kf,
+    kf_cache_row_stride,
     C: cutlass.Constexpr,
     Ctx: cutlass.Constexpr,
     SP_T: cutlass.Constexpr,
@@ -1638,6 +2388,10 @@ def _launch(
     BT: cutlass.Constexpr,
     BH: cutlass.Constexpr,
     BW: cutlass.Constexpr,
+    KF: cutlass.Constexpr,
+    SLOTS: cutlass.Constexpr,
+    P_MAX: cutlass.Constexpr,
+    NKV_KF: cutlass.Constexpr,
 ):
     mma128 = cute.make_tiled_mma(_mma_op("n128"))
     mma64 = cute.make_tiled_mma(_mma_op("pv"))
@@ -1677,6 +2431,18 @@ def _launch(
         kv_cache,
         norm_cache,
         barrier,
+        x_kf,
+        stage4_kf,
+        y_kf,
+        kv_cache_kf,
+        norm_cache_kf,
+        kf_times,
+        kf_slots,
+        kf_planes,
+        kf_counts,
+        kf_video,
+        kf_video_counts,
+        kf_slab,
         a_ctx,
         m_ctx,
         a_q,
@@ -1713,6 +2479,8 @@ def _launch(
         max_box_h,
         max_box_w,
         cache_row_stride,
+        n_kf,
+        kf_cache_row_stride,
         C,
         Ctx,
         SP_T,
@@ -1736,6 +2504,10 @@ def _launch(
         BT,
         BH,
         BW,
+        KF,
+        SLOTS,
+        P_MAX,
+        NKV_KF,
         mma128,
         mma64,
         a_layout,
@@ -1757,9 +2529,28 @@ def _compile(
     tile_thw: "tuple[int, int, int]",
     Ctx: int | None = None,
     upsample_stride: "tuple[int, int, int]" = (1, 1, 1),
+    keyframes: bool = False,
 ):
     Ctx = C if Ctx is None else Ctx
-    key = (C, Ctx, upsample_stride, Hidd, num_heads, rope_dim_split, tile_thw, kernel_size, MAXP_TOKENS, SLAB_BOX_MAX)
+    # ``keyframes`` keys the binary so the no-keyframe kernel keeps exactly the trace, and
+    # the register allocation, it had before the keyframe stream existed.
+    # Everything else here is structural too, and must stay that way. The per-tile plane
+    # union bound used to be in this key; because it moves with the clip length it recompiled
+    # the ladder on every new duration, which cost 12+ minutes of in-process MLIR before a
+    # 545-frame decode could start. It is now ``SLOTS * TT``, a constant of ``tile_thw``.
+    key = (
+        C,
+        Ctx,
+        upsample_stride,
+        Hidd,
+        num_heads,
+        rope_dim_split,
+        tile_thw,
+        kernel_size,
+        MAXP_TOKENS,
+        SLAB_BOX_MAX,
+        keyframes,
+    )
     if key in _COMPILED:
         return _COMPILED[key]
     kt, kh, kw = kernel_size
@@ -1801,6 +2592,13 @@ def _compile(
         act(2 * num_heads * M, hd),  # kv_cache -- its head stride is a runtime argument
         vec(2 * M),  # norm_cache
         _dyn(torch.zeros(2, device=dev, dtype=torch.int32)),  # barrier
+        act(M, C),  # x_kf
+        act(M, Ctx),  # stage4_kf
+        act(M, C),  # y_kf
+        act(2 * num_heads * M, hd),  # kv_cache_kf
+        vec(2 * M),  # norm_cache_kf
+        vec(1),  # kf_times
+        *(_dyn(torch.zeros(max(n, 1), device=dev, dtype=torch.int32)) for n in (1, 1, 1, 1, 1, 1)),
         weight(subpixels * C, Ctx),  # w_ctx -- the fused upsample x context_proj
         weight(C, C),  # w_q
         weight(2 * C, C),  # w_kv
@@ -1822,6 +2620,7 @@ def _compile(
             rope_dim_split=rope_dim_split,
             kernel_size=kernel_size,
             tile_thw=tile_thw,
+            keyframes=keyframes,
         ),
         **({"options": opts} if opts else {}),
     )
@@ -1835,6 +2634,8 @@ def _runtime_scalars(
     drop_leading: int,
     n_ctas: int,
     plan: _SlabPlan,
+    n_kf: int = 0,
+    kf_cache_row_stride: int = 1,
 ) -> tuple:
     """The kernel's runtime scalar arguments, in signature order.
     Both :func:`_compile`'s trace call and the real call site build their argument
@@ -1851,6 +2652,8 @@ def _runtime_scalars(
         *plan.core,
         *plan.box,
         plan.cache_row_stride,
+        n_kf,
+        kf_cache_row_stride,
     )
 
 
@@ -1864,12 +2667,15 @@ def _static_shape(
     rope_dim_split: "tuple[int, int, int]",
     kernel_size: "tuple[int, int, int]",
     tile_thw: "tuple[int, int, int]",
+    keyframes: bool = False,
 ) -> tuple:
     """The kernel's compile-time arguments, in signature order."""
     kt, kh, kw = kernel_size
     tt, th, tw = tile_thw
     panel = (tt + kt - 1, th + kh - 1, tw + kw - 1)
     n_kv = (panel[0] * panel[1] * panel[2] + TILE_N - 1) // TILE_N
+    # Keyframe panels drop the temporal axis: the video panel's h/w rectangle, one plane deep.
+    n_kv_kf = (panel[1] * panel[2] + TILE_N - 1) // TILE_N
     return (
         C,
         Ctx,
@@ -1886,6 +2692,12 @@ def _static_shape(
         *panel,
         n_kv,
         *SLAB_BOX_MAX,
+        keyframes,
+        KEYFRAME_CONTEXT_SLOTS,
+        # The stride into ``kf_planes``: a tile's ``TT`` timesteps contribute at most
+        # ``SLOTS`` planes each, so this bounds the union without consulting the layout.
+        KEYFRAME_CONTEXT_SLOTS * tt,
+        n_kv_kf,
     )
 
 

@@ -1,5 +1,4 @@
 import logging
-from collections.abc import Iterator
 
 import torch
 
@@ -12,7 +11,7 @@ from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, VideoEncoder, get_video_chunks_number
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.types import Audio, VideoPixelShape
+from ltx_core.types import VideoPixelShape
 from ltx_pipelines.iclora_utils import (
     append_ic_lora_reference_video_conditionings,
     read_lora_reference_downscale_factor,
@@ -54,7 +53,7 @@ from ltx_pipelines.utils.media_io import (
     video_preprocess,
 )
 from ltx_pipelines.utils.model_paths import ModelPaths
-from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, PipelineOutput
 
 
 class ICLoraPipeline:
@@ -192,7 +191,7 @@ class ICLoraPipeline:
         stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
         color_space: HDRColorSpace | None = None,
-    ) -> tuple[Iterator[torch.Tensor], Audio, TilingConfig | None]:
+    ) -> PipelineOutput:
         """
         Generate video with IC-LoRA conditioning.
         Args:
@@ -223,7 +222,7 @@ class ICLoraPipeline:
                 When None (default): scalar conditioning_attention_strength is used
                 directly.
         Returns:
-            Tuple of (video_iterator, audio_tensor).
+            PipelineOutput with decoded video and audio. ``keyframes`` is ``None``.
         """
         images = self.image_conditioner.resolve_crf(images)
         assert_resolution(height=height, width=width, is_two_stage=True)
@@ -242,7 +241,6 @@ class ICLoraPipeline:
             enhance_first_prompt=enhance_prompt,
             enhance_static_cache=enhance_static_cache,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
-            enhance_prompt_seed=seed,
         )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
 
@@ -304,7 +302,7 @@ class ICLoraPipeline:
             logging.info("[IC-LoRA] Skipping Stage 2 (--skip-stage-2 enabled)")
             decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
             decoded_audio = self.audio_decoder(audio_state.latent)
-            return decoded_video, decoded_audio, tiling_config
+            return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config, None, video_state.latent)
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
         upscaled_video_latent = self.upsampler(video_state.latent[:1])
@@ -346,7 +344,7 @@ class ICLoraPipeline:
 
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
         decoded_audio = self.audio_decoder(audio_state.latent)
-        return decoded_video, decoded_audio, tiling_config
+        return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config, None, video_state.latent)
 
     def _create_conditionings(
         self,
@@ -478,7 +476,7 @@ def main() -> None:
         hdr=args.hdr,
     )
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
-    video, audio, tiling_config = pipeline(
+    result = pipeline(
         prompt=args.prompt,
         seed=args.seed,
         height=args.height,
@@ -496,14 +494,12 @@ def main() -> None:
         skip_stage_2=args.skip_stage_2,
         conditioning_attention_mask=conditioning_attention_mask,
     )
-    video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
-
     encode_video(
-        video=video,
+        video=result.video,
         fps=args.frame_rate,
-        audio=audio,
+        audio=result.audio,
         output_path=args.output_path,
-        video_chunks_number=video_chunks_number,
+        video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
         color_space=hdr,
     )
 

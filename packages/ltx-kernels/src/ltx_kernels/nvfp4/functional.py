@@ -21,10 +21,12 @@ E2M1_MAX = 6.0
 GLOBAL_RANGE = E4M3_MAX * E2M1_MAX  # 2688.0
 BLOCK_SIZE = 16
 
-# Shared install hint used by extension/SM errors and by ``unavailable_reason``.
+# Shared install hint used by extension/SM errors and by ``unavailable_reason``. The arch
+# must match the target device -- 10.0 datacenter Blackwell, 11.0 Jetson Thor, 12.0 consumer
+# Blackwell -- because each builds an arch-specific cubin that will not launch on the others.
 REBUILD_HINT = (
-    "TORCH_CUDA_ARCH_LIST='10.0' uv pip install -e packages/ltx-kernels --no-build-isolation "
-    "(or `uv sync --group kernels`)"
+    "TORCH_CUDA_ARCH_LIST=<10.0|11.0|12.0> uv pip install -e packages/ltx-kernels "
+    "--no-build-isolation (or `uv sync --group kernels`)"
 )
 
 

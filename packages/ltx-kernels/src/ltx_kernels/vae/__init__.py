@@ -4,10 +4,10 @@ Two kernels sharing one attention half (``fna_attn_core.attention_tile``):
   ``DiffusionNABlock`` in one launch, with no full-volume Q/K/V.
 - :func:`~ltx_kernels.vae.na_attn_dsl.run_na_attention` -- standalone 3D neighborhood
   attention for the deterministic stages, a drop-in for ``natten.na3d``.
-Both need datacenter Blackwell (sm_100 / sm_103): they are built on ``tcgen05`` UMMA
-and Tensor Memory, which consumer Blackwell, Hopper and Ada do not have. Each launcher
-enforces that itself; ``block_fna_available`` / ``na_attn_available`` let a caller ask
-first and pick another path.
+Both need datacenter Blackwell (sm_100 / sm_103) or Jetson Thor (sm_110): they
+are built on ``tcgen05`` UMMA and Tensor Memory, which consumer Blackwell, Hopper
+and Ada do not have. Each launcher enforces that itself; ``block_fna_available`` /
+``na_attn_available`` let a caller ask first and pick another path.
 """
 
 from ltx_kernels.vae.block_fna_dsl import (

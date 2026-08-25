@@ -32,11 +32,13 @@ if TYPE_CHECKING:
     from ltx_pipelines.t2a_one_stage import T2AOneStagePipeline
     from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
     from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
+    from ltx_pipelines.utils.types import PipelineOutput
 
 # Public name -> module that defines it. Used for lazy resolution in __getattr__.
 _EXPORTS = {
     "A2VidPipelineTwoStage": "ltx_pipelines.a2vid_two_stage",
     "DFRPipeline": "ltx_pipelines.dfr_pipeline",
+    "PipelineOutput": "ltx_pipelines.utils.types",
     "DistilledPipeline": "ltx_pipelines.distilled",
     "DubItPipeline": "ltx_pipelines.dubit",
     "ICLoraPipeline": "ltx_pipelines.ic_lora",
@@ -54,6 +56,7 @@ __all__ = [
     "DubItPipeline",
     "ICLoraPipeline",
     "KeyframeInterpolationPipeline",
+    "PipelineOutput",
     "RetakePipeline",
     "T2AOneStagePipeline",
     "TI2VidOneStagePipeline",

@@ -63,6 +63,28 @@ def default_tile_thw(kernel_size: "tuple[int, int, int]") -> "tuple[int, int, in
     return best
 
 
+def default_keyframe_tile_hw(kernel_size: "tuple[int, int, int]") -> "tuple[int, int]":
+    """Pick the ``M``-token *spatial* query box for a keyframe query tile.
+    Keyframe query tiles hold one plane each, not ``TT`` of them: every key set a keyframe
+    query reads -- its own plane's window, and each of the <=2 nearest video frames' -- is a
+    single-plane ``PT=1`` panel, and which video frames those are is a property of the
+    plane. One plane per tile makes all of that tile-uniform, so the tail needs no per-lane
+    ``sel`` and costs 1 self pass plus <=2 cross passes instead of scaling with ``TT``.
+    The trade is a second compile-time tile geometry, which is why this is separate from
+    :func:`default_tile_thw` rather than a ``tt=1`` call into it.
+    """
+    _, kh, kw = kernel_size
+    best, best_panel = (8, 16), 1 << 60
+    for th in (2, 4, 8, 16, 32):
+        tw = M // th
+        if tw < 1 or tw > 32:
+            continue
+        panel = (th + kh - 1) * (tw + kw - 1)
+        if panel < best_panel:
+            best, best_panel = (th, tw), panel
+    return best
+
+
 def cta_count(n_tiles: int, device: torch.device) -> int:
     """Persistent grid size: one CTA per SM, capped by the work available.
     ``block_fna_dsl``'s device-wide barrier requires every CTA to be resident, so the
@@ -224,6 +246,41 @@ def apply_rope(reg, d_t, d_h, d_w, tbl, li_t, li_h, li_w, c0: int = 0, n: int = 
             reg[c - c0 + 1] = e * sa + o * ca
 
 
+def apply_rope_float_t(reg, d_t, d_h, d_w, tbl, t_value, li_h, li_w, inv_t, c0: int = 0, n: int = HD):
+    """:func:`apply_rope` with the temporal axis at an arbitrary *float* position.
+    Keyframe planes sit at chunk-center coordinates ``t_s(f) = (f + (r_s-1)/2) / r_s``, which
+    are not on the integer lattice the slab's ``cos``/``sin`` tables are built over. The h and
+    w axes still are, so only ``t`` is recomputed and the tables carry the other two.
+    Done inline rather than through a keyframe ``t`` table on purpose: at ``head_dim=64`` the
+    temporal axis is 8 pairs, so this is 16 MUFU per token hoisted outside the head loop, and
+    SMEM in the fused kernel is the scarce resource -- see the pool/rope/params budget in
+    ``block_fna_dsl``. A table would be small but the headroom is smaller.
+    """
+    (_, _, ch, sh, cw, sw) = tbl
+    for rp in range(d_t // 2):
+        c = 2 * rp
+        if c < c0 or c + 1 >= c0 + n:
+            continue
+        ang = ACC(t_value) * inv_t[rp]
+        ca = cute.cos(ang)
+        sa = cute.sin(ang)
+        e = reg[c - c0]
+        o = reg[c - c0 + 1]
+        reg[c - c0] = e * ca - o * sa
+        reg[c - c0 + 1] = e * sa + o * ca
+    for base, dim, cos_t, sin_t, li in ((d_t, d_h, ch, sh, li_h), (d_t + d_h, d_w, cw, sw, li_w)):
+        for rp in range(dim // 2):
+            c = base + 2 * rp
+            if c < c0 or c + 1 >= c0 + n:
+                continue
+            ca = cos_t[li, rp]
+            sa = sin_t[li, rp]
+            e = reg[c - c0]
+            o = reg[c - c0 + 1]
+            reg[c - c0] = e * ca - o * sa
+            reg[c - c0 + 1] = e * sa + o * ca
+
+
 @cute.jit
 def fill_rope_axis(cos_t, sin_t, tidx, origin, span, half: cutlass.Constexpr, inv):
     """Cooperatively tabulate cos/sin for one axis over ``span`` positions."""
@@ -279,6 +336,8 @@ def attention_tile(
     kh: cutlass.Constexpr,
     kw: cutlass.Constexpr,
     NKV: cutlass.Constexpr,
+    sel=None,
+    window_hi=None,
 ):
     """Windowed NA over one query tile's halo panel, for ``NHG`` heads.
     Args:
@@ -296,13 +355,29 @@ def attention_tile(
         kv_hstride: rows between consecutive heads, in ``HD``-wide rows.
         panel: ``(t_s, h_s, w_s, pt0, ph0, pw0, bh2, bw2)`` -- the tile's halo panel
             origin, the source box's origin, and that box's H and W extents.
-        window: ``(lt0, lh0, lw0)`` -- this query's clamped NA window, panel-relative.
+        window: ``(lt0, lh0, lw0)`` -- this query's NA window origin, panel-relative.
         ids: ``(tidx, lane, wg, warp_i)``.
         NHG: heads processed per call; must be even (the pipeline's buffer parity).
         KVRM: rows between consecutive panel positions in the K/V source.
         PT, PH, PW: halo panel extents.
         kt, kh, kw: NA window extents.
         NKV: KV tiles spanning the panel, ``ceil(PT*PH*PW / M)``.
+        sel: optional per-lane ``Int32`` 0/1 gating this lane's whole score row, for the
+            keyframe tail (see the mask below). ``None`` -- the local pass -- traces to the
+            pre-keyframe code exactly.
+        window_hi: optional ``(hi_t, hi_h, hi_w)`` exclusive panel-relative upper bounds,
+            from :func:`~ltx_kernels.vae.fna_geometry.window_bounds_in_panel`. Given, the
+            window is **clamp-and-mask** -- the rule the joint keyframe operator is defined
+            on, where a boundary query keeps a truncated window and renormalises over it.
+            ``None`` is NATTEN's inward shift, ``[lt0, lt0 + kt)`` etc., and traces to the
+            byte-identical pre-keyframe code. The two agree only in the interior, so the
+            choice belongs to the caller's operator, not to this function.
+    A keyframe tail is this same call with ``PT=1`` and ``kt=1``: ``panel_key_row`` then
+    reduces to ``flatten_3d(plane, ...)`` and the mask's ``rdt`` test to ``0 <= 0 < 1``, so
+    a spatial-only window over one keyframe plane needs no separate code. Because the
+    softmax offset is fixed rather than an online max (see ``m_sm``), a tail called after
+    the local pass -- same ``m_sm``/``l_sm``/``acc_o``, no re-zeroing -- *is* a joint
+    softmax over both key sets, with no rescale.
     On return ``acc_o[nh]`` holds the unnormalised attention output and
     ``l_sm[lane, wg, nh]`` this warpgroup's share of the denominator;
     :func:`attn_epilogue` divides them.
@@ -325,6 +400,13 @@ def attention_tile(
     k_src, v_src = kv_src
     k_base, v_base = kv_base
     lt0, lh0, lw0 = window
+    if cutlass.const_expr(window_hi is None):
+        # NATTEN's inward shift: exactly ``k`` keys per axis, so the upper bounds are the
+        # origins plus the compile-time kernel extents -- the same expressions the mask
+        # tested inline before clamp-and-mask existed.
+        hi_t, hi_h, hi_w = lt0 + kt, lh0 + kh, lw0 + kw
+    else:
+        hi_t, hi_h, hi_w = window_hi
     _tidx, lane, wg, warp_i = ids
 
     N_KEYS = PT * PH * PW  # keys in the halo panel
@@ -371,7 +453,21 @@ def attention_tile(
         # wherever that row starts in the word, and only when its (dt, dh) is inside
         # this query's window. Three rows per word against 32 keys per word. Only the
         # words covering this warpgroup's score columns are built.
-        wrun = cutlass.Int32((1 << kw) - 1) << lw0
+        # Under clamp-and-mask the run is the surviving part of the kernel row, so both its
+        # width and its start are per-lane; under the inward shift it is always ``kw`` wide
+        # and the width folds into a compile-time constant.
+        if cutlass.const_expr(window_hi is None):
+            wrun = cutlass.Int32((1 << kw) - 1) << lw0
+        else:
+            wrun = ((cutlass.Int32(1) << (hi_w - lw0)) - cutlass.Int32(1)) << lw0
+        # A keyframe tail pass hands each lane a 0/1 saying whether *its* query picked this
+        # plane -- the plane is a per-tile choice but the nearest-2 set is per ``t``, and a
+        # tile spans ``TT`` of them. Every mask bit below is a shifted copy of ``wrun``, so
+        # folding the predicate in here zeroes the lane's whole row in one AND, and the
+        # ``bw != 0`` arm downstream then skips its 32 exponentials. Left ``None`` this
+        # traces to exactly the pre-keyframe code.
+        if cutlass.const_expr(sel is not None):
+            wrun = wrun & (cutlass.Int32(0) - sel)
         mask = [cutlass.Int32(0) for _ in range(NBW)]
         for bb in cutlass.range_constexpr(NBW):
             b = wg * NBW + bb
@@ -382,7 +478,7 @@ def attention_tile(
                 r = r0 + u
                 rdt = r // PH
                 rdh = r - rdt * PH
-                if r < PT * PH and rdt >= lt0 and rdt < lt0 + kt and rdh >= lh0 and rdh < lh0 + kh:
+                if r < PT * PH and rdt >= lt0 and rdt < hi_t and rdh >= lh0 and rdh < hi_h:
                     # Where this row's dw=0 sits in the word. Negative for a row that
                     # started in the previous word; past 31 for one spilling into the
                     # next. Both shifts are guarded -- a shift wider than the type is

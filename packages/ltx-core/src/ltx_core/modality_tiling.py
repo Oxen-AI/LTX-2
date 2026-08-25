@@ -8,14 +8,27 @@ primitives are required.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 
 import torch
 
 from ltx_core.model.transformer.modality import Modality
-from ltx_core.tiling import Tile, TileCountConfig, create_tiles, identity_mapping_operation
+from ltx_core.tiling import (
+    DimensionTilingConfig,
+    SplitOperation,
+    Tile,
+    TileCountConfig,
+    create_tiles,
+    identity_mapping_operation,
+    split_at_seams,
+)
 from ltx_core.tools import VideoLatentTools
 from ltx_core.types import VideoLatentShape
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -35,12 +48,43 @@ class TilingContext:
     there are no conditioning tokens."""
 
 
+def seam_split(
+    seams: Sequence[int],
+    latent_frames: int,
+    frames: DimensionTilingConfig,
+) -> SplitOperation | None:
+    """A temporal split cut on ``seams``, or ``None`` when they cannot carry one.
+    ``seams`` are interior latent-frame indices supplied by the caller. A boundary there needs no
+    blending: the overlap is denoised for context and dropped (:func:`~ltx_core.tiling.split_at_seams`).
+    Leftover segments go to the leading tiles. Missing or non-interior seams fall back to the
+    requested overlap split, which blends.
+    """
+    if frames.num_tiles < 2:
+        return None
+    interior = sorted({cell for cell in seams if 0 < cell < latent_frames - 1})
+    if not interior:
+        if seams:
+            logger.info(
+                "Temporal tiling: seams %s are not interior to %d latent frames; keeping blended tiles",
+                list(seams),
+                latent_frames,
+            )
+        return None
+    boundaries = [0, *interior, latent_frames - 1]
+    logger.info("Temporal tiling: %d tiles cut on seams %s", frames.num_tiles, boundaries)
+    return split_at_seams(boundaries, frames.num_tiles, overlap=frames.overlap)
+
+
 class VideoModalityTilingHelper:
     """Stateless helper that tiles and blends video :class:`Modality` sequences.
     Constructed once with a :class:`TileCountConfig` and
     :class:`VideoLatentTools`.  Tiles are computed at construction and
     available via the :attr:`tiles` property.  Use :meth:`tile_modality`
     and :meth:`blend` with any tile from that list.
+    Passing ``seams`` (interior latent-frame indices) lets a temporal split land on those
+    cells instead of blended overlaps (:func:`seam_split`); leftover segments go to the
+    leading tiles. Missing or non-interior seams keep the blended split. A regular keyframe
+    belongs in that list only at strength 0; generated keyframe slots never do.
     Usage::
         helper = VideoModalityTilingHelper(tiling, video_tools)
         for tile in helper.tiles:
@@ -49,14 +93,24 @@ class VideoModalityTilingHelper:
             helper.blend(result, tile, ctx, output=output)
     """
 
-    def __init__(self, tiling: TileCountConfig, video_tools: VideoLatentTools) -> None:
+    def __init__(
+        self,
+        tiling: TileCountConfig,
+        video_tools: VideoLatentTools,
+        seams: Sequence[int] = (),
+    ) -> None:
         self._patchifier = video_tools.patchifier
         self._latent_shape = video_tools.target_shape
         self._num_generated_tokens = self._patchifier.get_token_count(self._latent_shape)
+        frames, height, width = tiling.to_splitters(video_tools.scale_factors, causal_temporal=False)
+        frames_mapper = identity_mapping_operation
+        seam_op = seam_split(seams, self._latent_shape.frames, tiling.frames)
+        if seam_op is not None:
+            frames, frames_mapper = seam_op, partial(identity_mapping_operation, rectangular=True)
         self._tiles = create_tiles(
             torch.Size([self._latent_shape.frames, self._latent_shape.height, self._latent_shape.width]),
-            splitters=list(tiling.to_splitters(video_tools.scale_factors, causal_temporal=False)),
-            mappers=[identity_mapping_operation] * 3,
+            splitters=[frames, height, width],
+            mappers=[frames_mapper, identity_mapping_operation, identity_mapping_operation],
         )
 
     @property

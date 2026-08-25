@@ -167,8 +167,13 @@ __global__ void quantize_kernel(const T *__restrict__ x, const float *__restrict
 // rows/cols for free (no torch::zeros needed).
 constexpr int kTileRows = 128;
 constexpr int kTileCols = 4; // scale columns == 64 elements
-constexpr int kTileThreads = 256;
-constexpr int kColsPerThread = 2;
+// One scale column (16 elements) per thread, so a CTA covering one 128x4 tile has 512
+// threads. Two columns per thread splits each thread's payload into two 8-byte stores
+// that land in alternating halves of a 32-byte sector, so every store instruction writes
+// partial sectors. Packed bytes are identical either way; GB200 CI goldens are the
+// layout contract if they ever drift.
+constexpr int kColsPerThread = 1;
+constexpr int kTileThreads = kTileRows * kTileCols / kColsPerThread;
 
 template <typename T, bool kHiFirst>
 __global__ void quantize_tiled_kernel(const T *__restrict__ x, const float *__restrict__ per_tensor_scale,
@@ -187,7 +192,7 @@ __global__ void quantize_tiled_kernel(const T *__restrict__ x, const float *__re
   // In-tile scale offsets for this thread's kColsPerThread adjacent columns.
   const int tile_off = (local_row & 31) * 16 + (local_row >> 5) * 4 + local_col;
 
-  uint8_t sf_bytes[kColsPerThread] = {0, 0};
+  uint8_t sf_bytes[kColsPerThread] = {};
   if (row < rows) {
 #pragma unroll
     for (int c = 0; c < kColsPerThread; ++c) {

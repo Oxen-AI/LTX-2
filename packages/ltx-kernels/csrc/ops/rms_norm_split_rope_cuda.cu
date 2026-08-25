@@ -12,7 +12,8 @@ using bf16 = __nv_bfloat16;
 using fp8 = __nv_fp8_e4m3;
 __device__ __forceinline__ void _load_x(bf16* x, float x_vals[8], int h){
     bf16 x_tmp[8];
-    *reinterpret_cast<int4*>(x_tmp) = reinterpret_cast<int4*>(x + blockIdx.x * h)[threadIdx.x];
+    const size_t row = static_cast<size_t>(blockIdx.x) * static_cast<size_t>(h);
+    *reinterpret_cast<int4*>(x_tmp) = reinterpret_cast<int4*>(x + row)[threadIdx.x];
     #pragma unroll
     for(int i = 0; i < 8; i++){
         x_vals[i] = float(x_tmp[i]);
@@ -44,7 +45,7 @@ __device__ __forceinline__ void _load_freqs(
 template<typename out_t>
 __global__ void _rms_norm_split_rope_kernel(bf16* x, bf16* sin_freqs, bf16* cos_freqs, void* out, bf16* weights, int b, int s, int n, int h,
     long cos_sb, long cos_sn, long cos_ss, long sin_sb, long sin_sn, long sin_ss){
-    int token_idx = blockIdx.x;
+    size_t token_idx = blockIdx.x;
     int tid = threadIdx.x;
     int lane_id = tid % 32;
     // freqs have shape [b, s, h/2]

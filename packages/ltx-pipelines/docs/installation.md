@@ -15,7 +15,9 @@ pip install -e packages/ltx-pipelines
 - **LTX-2 Model Checkpoint** - Local `.safetensors` file
 - **Gemma Text Encoder** - Local Gemma model directory
 - **Spatial Upscaler** - Required by two-stage pipelines, for the upsampling stage
-- **Distilled LoRA** - Required by two-stage non-distilled pipelines, used for the stage-2 refinement
+- **Distilled LoRA** - Required by two-stage non-distilled pipelines (TI2Vid, Keyframe, A2Vid), used for the stage-2 refinement. Not used by DFR.
+- **Detailing IC-LoRA** - Required by DFR (`--detailing-lora`)
+- **Temporal Upscaler** - Required by DFR when `--temporal-upscalings` is 1 or 2
 
 ## Running Pipelines
 
@@ -45,6 +47,8 @@ Every pipeline CLI accepts one of two mutually exclusive path sets.
 --checkpoint-path path/to/checkpoint.safetensors --gemma-root path/to/gemma
 ```
 
+DistilledPipeline and DFR use `--distilled-checkpoint-path` instead of `--checkpoint-path`.
+
 **Split** (Comfy-aligned) -- one file per component. Pass the subset this pipeline needs
 (unused flags may be omitted; the pipeline validates required slots on `ModelPaths`):
 
@@ -65,8 +69,9 @@ what pipeline constructors take.
 
 ### Available pipeline modules
 
-- `ltx_pipelines.distilled` - Fast text/image-to-video pipeline using only the distilled model (recommended). ([docs](pipelines.md#4-distilledpipeline), [source](../src/ltx_pipelines/distilled.py))
-- `ltx_pipelines.dfr_pipeline` - Detail-fidelity rendering: generated keyframes, spatial detailing, optional temporal 2x/4x. ([docs](pipelines.md#12-dfrpipeline), [source](../src/ltx_pipelines/dfr_pipeline.py))
+- `ltx_pipelines.distilled` - Fast text/image-to-video pipeline using only the distilled model (starting point). ([docs](pipelines.md#4-distilledpipeline), [source](../src/ltx_pipelines/distilled.py))
+- `ltx_pipelines.dfr_pipeline` - Production-quality text/image-to-video: distilled checkpoint, generated keyframes, spatial detailing, optional temporal 2x/4x. ([docs](pipelines.md#12-dfrpipeline), [how to run](pipelines.md#running-dfr), [source](../src/ltx_pipelines/dfr_pipeline.py))
+- `ltx_pipelines.dfr_mgpu` - Multi-GPU DFR: sequence parallelism on both stages. ([docs](multigpu/README.md), [source](../src/ltx_pipelines/dfr_mgpu.py))
 - `ltx_pipelines.ti2vid_two_stages` - Two-stage text/image-to-video. ([docs](pipelines.md#1-ti2vidtwostagespipeline), [source](../src/ltx_pipelines/ti2vid_two_stages.py))
 - `ltx_pipelines.ti2vid_two_stages_hq` - Two-stage text/image-to-video (different sampler, better quality). ([docs](pipelines.md#2-ti2vidtwostageshqpipeline), [source](../src/ltx_pipelines/ti2vid_two_stages_hq.py))
 - `ltx_pipelines.ti2vid_one_stage` - Single-stage text/image-to-video. ([docs](pipelines.md#3-ti2vidonestagepipeline), [source](../src/ltx_pipelines/ti2vid_one_stage.py))
@@ -90,9 +95,9 @@ These flags are shared across the pipeline CLIs (they come from a common base pa
 - `--offload {none,cpu,disk}` - offload transformer weights to reduce peak GPU memory. `cpu` holds them in system RAM; `disk` streams them from disk when RAM is also limited (slower). Default `none`.
 - `--quantization {fp8-cast,fp8-scaled-mm}` - run the transformer in FP8 to cut memory. `fp8-cast` downcasts a bf16 checkpoint on the fly (any FP8-capable GPU); `fp8-scaled-mm` expects an fp8 checkpoint and native FP8 support (best on Hopper+).
 - `--max-batch-size <int>` - max batch per transformer forward pass (default 1). Higher values reduce layer-streaming transfers at the cost of peak memory.
-- `--compile [key=value ...]` - enable `torch.compile`, optionally overriding the compilation config.
+- `--compile [key=value ...]` - enable `torch.compile`. Bare `--compile` compiles without CUDA graphs. CUDA-graph modes (`capture=true`, `mode=reduce-overhead`, `mode=max-autotune`) need `--offload cpu` or `disk` on single GPU (streaming reuses GPU weight slots; a registry by itself does not). `capture=true` captures one graph per (shape, perturbation); `max_video_tokens` / `max_audio_tokens` size a shared **static input** pool so those graphs do not each allocate their own activation buffers. See [Compilation](optimization.md#compilation-torchcompile).
 - `--lora <path> [strength]` - apply a LoRA (repeatable; default strength 1.0).
 - `--enhance-prompt` - rewrite the prompt with the built-in enhancer before generation.
 - `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}` - on pipelines that accept image / video conditioning (not Dub-It, HDR IC-LoRA, or T2A): declare the source colour space for EXR stills / EXR-frame folders. Required whenever any EXR input is passed; omit for SDR. With `--hdr` set, encode writes half EXR frames plus a BT.2020/HLG master. See [HDR Support](hdr.md).
 - `--video-vae-path <path>` - video VAE `.safetensors` (encoder + decoder). Split: the `vae/` component. Monolith: optional override of the VAE bundled in `--checkpoint-path`/`--distilled-checkpoint-path`. When it is a diffusion VAE, decoding builds a `DiffusionVideoDecoder`, which for best performance requires the `natten` extra. See [Optimization Tips](optimization.md#diffusion-vae-decoder).
-- `--diffvae-optimization {chunked_eager,chunked_compile,combined_compile}` - DiffVAE decode preset (ignored for convolutional VAEs).
+- `--diffvae-optimization {chunked_eager,chunked_compile,combined_compile,blackwell_dsl}` - DiffVAE decode preset (ignored for convolutional VAEs). `blackwell_dsl` is the fast path on datacenter Blackwell.

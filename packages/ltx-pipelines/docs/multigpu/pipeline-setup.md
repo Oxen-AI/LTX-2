@@ -114,7 +114,8 @@ skipped (`stored_sd` becomes a zero-copy view) and any swap/reset raises — sav
 
 The shipped runners are the reference: read
 [`ti2vid_two_stages_mgpu.py`](../../src/ltx_pipelines/ti2vid_two_stages_mgpu.py)
-(`setup()` lines ~54–132) and
-[`distilled_mgpu.py`](../../src/ltx_pipelines/distilled_mgpu.py). Each ends with a
+(`setup()` lines ~54–132),
+[`distilled_mgpu.py`](../../src/ltx_pipelines/distilled_mgpu.py), and
+[`dfr_mgpu.py`](../../src/ltx_pipelines/dfr_mgpu.py). Each ends with a
 `__main__` block wiring the runner into an `MGPUController` behind the standard
 two-stage CLI parser.

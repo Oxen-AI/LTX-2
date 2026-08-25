@@ -6,12 +6,18 @@ weights + shared AdaLN helpers only — no pathway forward.
 
 from __future__ import annotations
 
+import dataclasses
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 
 from ltx_core.model.video_vae.transformer.attention import NeighborhoodAttention3D
 from ltx_core.model.video_vae.transformer.layers import AdaLNZero
 from ltx_core.model.video_vae.transformer.swiglu import SwiGLU, plain_mlp
+
+if TYPE_CHECKING:
+    from ltx_core.model.video_vae.keyframes import KeyframeStream
 
 __all__ = [
     "DiffusionNABlock",
@@ -42,6 +48,28 @@ class NABlock(nn.Module):
         x = x + self.attn(self.norm1(x))
         x = plain_mlp(x, self.mlp, self.norm2, self.mlp.tile)
         return x
+
+    def forward_with_keyframes(
+        self,
+        x: torch.Tensor,
+        keyframes: KeyframeStream,
+    ) -> tuple[torch.Tensor, KeyframeStream]:
+        """Dual-stream block: video ``(B,T,H,W,C)`` and keyframe planes ``(B,P,H,W,C)``.
+        Every weight is shared with :meth:`forward`; the streams meet only inside the
+        joint attention softmax. Invalid planes are deliberately *not* re-zeroed here --
+        the decoder re-zeroes after each upsample instead, matching upstream, so a masked
+        plane's hidden state may drift within a stage. It is masked out of every softmax
+        regardless, so this is cosmetic; reproducing it keeps us comparable.
+        """
+        attn_out, keyframe_attn = self.attn.forward_with_keyframes(
+            self.norm1(x),
+            dataclasses.replace(keyframes, x=self.norm1(keyframes.x)),
+        )
+        x = x + attn_out
+        keyframe_x = keyframes.x + keyframe_attn.x
+        x = plain_mlp(x, self.mlp, self.norm2, self.mlp.tile)
+        keyframe_x = plain_mlp(keyframe_x, self.mlp, self.norm2, self.mlp.tile)
+        return x, dataclasses.replace(keyframes, x=keyframe_x)
 
 
 class DiffusionNABlock(nn.Module):

@@ -7,7 +7,7 @@ from typing import Callable, NamedTuple, Sequence
 
 import torch
 
-from ltx_core.types import SpatioTemporalScaleFactors, VideoPixelShape
+from ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors, VideoPixelShape
 
 
 def compute_trapezoidal_mask_1d(
@@ -301,6 +301,61 @@ def split_by_count_temporal_causal(
     return split
 
 
+def split_at_seams(boundaries: Sequence[int], num_tiles: int, overlap: int = 0) -> SplitOperation:
+    """Split a dimension on boundary cells whose content is already known, dropping the overlap.
+    ``boundaries`` are the ``K + 1`` segment edges in grid cells, starting at 0 and ending at the
+    last cell of the dimension. The ``K`` segments are dealt largest-first so leftover segments go to the leading tiles;
+    ``num_tiles`` larger than ``K`` is clamped. Each tile but the first starts ``overlap`` cells
+    before the boundary it resumes after. That run-up is context only: it lands in the interval's
+    ``left_ramp``, which :func:`identity_mapping_operation` with ``rectangular=True`` masks to zero,
+    so the earlier tile keeps the boundary cell and this one contributes strictly after it.
+    The point of cutting here is that nothing needs blending. A ramp is what a pair of tiles needs
+    when neither of them knows the truth at the seam; on a boundary cell both reproduce the same
+    known frame, so averaging them only smears it.
+    Args:
+        boundaries: Segment edges in grid cells, strictly increasing, starting at 0.
+        num_tiles: Number of tiles. Must be >= 1. Extra tiles beyond the segment count are dropped.
+        overlap: Context cells each non-first tile denoises before the cell it resumes at, in grid
+            units. Clamped at the start of the dimension.
+    Returns:
+        A split operation that divides a dimension on ``boundaries``.
+    """
+    boundaries = tuple(boundaries)
+    if num_tiles < 1:
+        raise ValueError(f"num_tiles must be >= 1, got {num_tiles}")
+    if overlap < 0:
+        raise ValueError(f"overlap must be >= 0, got {overlap}")
+    if len(boundaries) < 2 or boundaries[0] != 0:
+        raise ValueError(f"boundaries must start at 0 and hold at least one segment, got {list(boundaries)}")
+    if any(b <= a for a, b in itertools.pairwise(boundaries)):
+        raise ValueError(f"boundaries must be strictly increasing, got {list(boundaries)}")
+    n_segments = len(boundaries) - 1
+    n_tiles = min(num_tiles, n_segments)
+    base, leftover = divmod(n_segments, n_tiles)
+    counts = [base + (1 if index < leftover else 0) for index in range(n_tiles)]
+
+    def split(dim_size: int) -> DimensionIntervals:
+        if boundaries[-1] != dim_size - 1:
+            raise ValueError(f"boundaries must end at the last cell ({dim_size - 1}), got {boundaries[-1]}")
+        intervals: list[DimensionInterval] = []
+        cursor = 0
+        for tile_index, count in enumerate(counts):
+            resume = boundaries[cursor] + 1
+            start = 0 if tile_index == 0 else max(0, resume - overlap)
+            cursor += count
+            intervals.append(
+                DimensionInterval(
+                    start=start,
+                    end=boundaries[cursor] + 1,
+                    left_ramp=0 if tile_index == 0 else resume - start,
+                    right_ramp=0,
+                )
+            )
+        return DimensionIntervals(intervals=intervals)
+
+    return split
+
+
 def split_by_count(num_tiles: int, overlap: int = 0, min_tile_size: int | None = None) -> SplitOperation:
     """Split a dimension into a given number of tiles with overlap.
     Computes the tile size as
@@ -366,16 +421,24 @@ def split_by_count(num_tiles: int, overlap: int = 0, min_tile_size: int | None =
 # ---------------------------------------------------------------------------
 
 
-def identity_mapping_operation(intervals: DimensionIntervals) -> tuple[list[slice], list[torch.Tensor]]:
-    """Map each DimensionInterval to an output region at the same position, with trapezoidal blend masks.
-    For every interval the output start/end matches the input start/end and a
-    1-D blending mask is built from the interval's left_ramp and right_ramp.
+def identity_mapping_operation(
+    intervals: DimensionIntervals,
+    *,
+    rectangular: bool = False,
+) -> tuple[list[slice], list[torch.Tensor]]:
+    """Map each DimensionInterval to an output region at the same position.
+    For every interval the output start/end matches the input start/end and a 1-D mask is built
+    from the interval's left_ramp and right_ramp. The default mask is trapezoidal (blend on the
+    ramps). ``rectangular=True`` drops the ramps outright: the overlap is context the tile denoised
+    but does not contribute. Pair that with a split whose ramps are one-sided, such as
+    :func:`split_at_seams` -- ramps on both sides of an interval would leave a hole between tiles.
     """
+    mask_1d = compute_rectangular_mask_1d if rectangular else compute_trapezoidal_mask_1d
     out_slices: list[slice] = []
     masks: list[torch.Tensor] = []
     for iv in intervals.intervals:
         out_slices.append(slice(iv.start, iv.end))
-        masks.append(compute_trapezoidal_mask_1d(iv.end - iv.start, iv.left_ramp, iv.right_ramp))
+        masks.append(mask_1d(iv.end - iv.start, iv.left_ramp, iv.right_ramp))
     return out_slices, masks
 
 
@@ -833,12 +896,24 @@ class TileSizeConfig:
             enable_size_axis(scale_factors.width, min_w, self.width, "width", temporal=False),
         )
 
-    def video_chunks_number(self, num_frames: int) -> int:
-        """Number of temporal decode chunks for ``num_frames`` under this layout."""
+    def video_chunks_number(self, num_frames: int, *, time_scale: int = VIDEO_SCALE_FACTORS.time) -> int:
+        """Number of temporal decode chunks for ``num_frames`` under this layout.
+        Mirrors what decode actually does: :meth:`to_splitters` converts this axis to the
+        latent grid and hands it to :func:`split_by_size`, so the count must be taken there
+        too. Doing the arithmetic in pixel units instead over-reports by one whenever the
+        trailing tile is absorbed -- including the common case of a tile larger than the
+        clip, which is a single tile but used to report two.
+        """
         if not self.frames.is_tiled():
             return 1
-        frame_stride = self.frames.tile_size - self.frames.overlap
-        return (num_frames - 1 + frame_stride - 1) // frame_stride
+        # Same derivation as ``to_splitters.enable_size_axis``.
+        overlap = self.frames.overlap // time_scale
+        size = max(2, overlap + 1, self.frames.tile_size // time_scale)
+        latent_frames = (num_frames - 1) // time_scale + 1
+        if latent_frames <= size:
+            return 1
+        # Same tile count as ``split_by_size``.
+        return (latent_frames + size - 2 * overlap - 1) // (size - overlap)
 
 
 # Either size-based (single-GPU VAE) or count-based (MGPU / explicit counts).

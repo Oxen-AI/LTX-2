@@ -350,15 +350,39 @@ class _RunnersFleet:
 
     def poll(self) -> RuntimeError | None:
         """None while all workers are alive. Once any has exited, an error describing it.
-        Used only mid-job, where ANY exit is unexpected (workers only exit on the
-        shutdown sentinel), so a clean exit is reported as an error too.
+        Used only mid-job and at startup, where ANY exit is unexpected (workers only exit on
+        the shutdown sentinel), so a clean exit is reported as an error too.
         """
         result = self._pcontext.wait(timeout=0)
-        if result is None:
-            return None
-        if result.failures:
-            return _format_failures(result.failures)
-        return RuntimeError("MGPU workers exited unexpectedly")
+        if result is not None:
+            if result.failures:
+                return _format_failures(result.failures)
+            return RuntimeError("MGPU workers exited unexpectedly")
+        # wait() is all-or-nothing: a rank that exits WITHOUT recording a return value -- e.g.
+        # killed by a signal that torch's wrapper swallows -- leaves it reporting "still
+        # running" forever, with no failure and no traceback. That is exactly how a dead fleet
+        # turns into a hang, so check the processes themselves.
+        dead = self._dead_ranks()
+        if dead:
+            return RuntimeError(
+                f"MGPU worker(s) {dead} exited with no result and no error -- killed by a signal? "
+                "Check the worker logs. (A known cause: the thread that called start() returned, "
+                "and torch arms a thread-scoped parent-death signal in every rank.)"
+            )
+        return None
+
+    def _dead_ranks(self) -> list[int]:
+        """Ranks whose process is no longer running. is_alive() reaps zombies, so an exited
+        rank reads as dead here even when nothing has collected its status.
+        Reaching past the public API is deliberate: elastic exposes no liveness check (only
+        start/wait/close/pids), and the obvious public substitute -- pids() plus
+        os.kill(pid, 0) -- reports an unreaped zombie as ALIVE, so it would miss exactly the
+        exit this exists to catch. This mirrors elastic's own liveness check in _close().
+        """
+        pc = getattr(self._pcontext, "_pc", None)  # MultiprocessContext's ProcessContext
+        if pc is None:
+            return []
+        return [rank for rank, proc in enumerate(pc.processes) if not proc.is_alive()]
 
     def drain(self, timeout: float) -> bool:
         """Wait up to `timeout` for all workers to exit on their own. True if they did."""

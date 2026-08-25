@@ -53,8 +53,14 @@ class DSLChannelLinear(ChannelLinear):
 
 
 class DSLDiffusionBlockChain(nn.ModuleList):
-    """Stage-5 blocks as one callable chain, alternating two output buffers.
-    Signature matches deferred decode: ``(x, stage4_feat, modulation)``.
+    """Stage-5 blocks as one callable chain, alternating two output buffers per stream.
+    Signature matches deferred decode: ``(x, stage4_feat, modulation)``, with
+    :meth:`forward_x_ctx_with_keyframes` as the joint entry.
+    A block cannot write into its own input -- it reads neighborhoods of it -- so the
+    chain keeps the buffer it *stopped* reading and hands that back as the next block's
+    output. Two volumes per stream for the whole stage, rather than one per block. The
+    first block still allocates, because the entry volume is the caller's and the chain
+    has nothing spare yet; from the second on it alternates.
     """
 
     def forward(
@@ -77,3 +83,41 @@ class DSLDiffusionBlockChain(nn.ModuleList):
             spare = _recyclable_rows(x)
             x = y
         return x
+
+    def forward_x_ctx_with_keyframes(
+        self,
+        x: torch.Tensor,
+        stage4_feat: torch.Tensor,
+        keyframe_x: torch.Tensor,
+        keyframe_stage4_feat: torch.Tensor,
+        modulation: tuple[torch.Tensor, ...],
+        keyframe_times: torch.Tensor,
+        keyframe_valid: torch.Tensor,
+        *,
+        drop_leading_frame: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The joint chain, recycling both streams' buffers.
+        The anchor stream alternates on its own pair: its volume is ``n_kf`` planes against
+        the video's ``T`` frames, so the two buffer sizes differ and one pool cannot serve
+        both. Same rule per stream -- last block's input becomes this block's output. A
+        block that drops invalid planes returns a tight anchor tensor, which simply offers
+        nothing to recycle on the next hop.
+        """
+        spare: torch.Tensor | None = None
+        keyframe_spare: torch.Tensor | None = None
+        for block in self:
+            y, keyframe_y = block.forward_x_ctx_with_keyframes(
+                x,
+                stage4_feat,
+                keyframe_x,
+                keyframe_stage4_feat,
+                modulation,
+                keyframe_times,
+                keyframe_valid,
+                drop_leading_frame=drop_leading_frame,
+                out=spare,
+                out_keyframes=keyframe_spare,
+            )
+            spare, keyframe_spare = _recyclable_rows(x), _recyclable_rows(keyframe_x)
+            x, keyframe_x = y, keyframe_y
+        return x, keyframe_x

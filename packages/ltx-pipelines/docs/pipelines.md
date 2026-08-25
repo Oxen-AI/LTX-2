@@ -6,13 +6,13 @@ Full reference for each pipeline. See the [Pipeline Selection Guide](pipeline-se
 
 ## 1. TI2VidTwoStagesPipeline
 
-**Best for:** High-quality text/image-to-video generation with upsampling.
+**Best for:** Guided two-stage text/image-to-video with CFG/STG and 2x upsampling.
 
 **Source**: [`src/ltx_pipelines/ti2vid_two_stages.py`](../src/ltx_pipelines/ti2vid_two_stages.py)
 
-Two-stage generation: Stage 1 generates low-resolution video with [multimodal guidance](multimodal-guidance.md), Stage 2 upsamples to 2x resolution with distilled LoRA refinement. Supports image conditioning. Highest quality output, slower than one-stage but significantly better quality.
+Two-stage generation: Stage 1 generates low-resolution video with [multimodal guidance](multimodal-guidance.md), Stage 2 upsamples to 2x resolution with distilled LoRA refinement. Supports image conditioning. Slower than DistilledPipeline; for production quality use [`DFRPipeline`](#12-dfrpipeline).
 
-**Use when:** Production-quality video generation, higher resolution needed, quality over speed, text-to-video with image conditioning.
+**Use when:** You want CFG/STG-guided two-stage text/image-to-video, not the DFR detailing path.
 
 ---
 
@@ -34,7 +34,7 @@ Uses the **res_2s** second-order sampler instead of Euler. Same stage structure 
 
 **Source**: [`src/ltx_pipelines/ti2vid_one_stage.py`](../src/ltx_pipelines/ti2vid_one_stage.py)
 
-> **⚠️ Important:** This pipeline is primarily for educational purposes. For production-quality results, use `TI2VidTwoStagesPipeline` or other two-stage pipelines.
+> **⚠️ Important:** This pipeline is primarily for educational purposes. For production-quality results, use [`DFRPipeline`](#12-dfrpipeline). For guided CFG/STG two-stage, use `TI2VidTwoStagesPipeline`.
 
 Single-stage generation (no upsampling) with [multimodal guidance](multimodal-guidance.md) and image conditioning support. Faster inference but lower resolution output (typically 512x768).
 
@@ -44,7 +44,7 @@ Single-stage generation (no upsampling) with [multimodal guidance](multimodal-gu
 
 ## 4. DistilledPipeline
 
-**Best for:** Fastest inference with good quality using a distilled model with predefined sigma schedule. **Recommended default.**
+**Best for:** Fastest inference with good quality using a distilled model with predefined sigma schedule. **Starting point.**
 
 **Source**: [`src/ltx_pipelines/distilled.py`](../src/ltx_pipelines/distilled.py)
 
@@ -88,7 +88,7 @@ Two-stage generation with keyframe interpolation. Uses guiding latents (additive
 
 Two-stage audio-to-video generation. Stage 1 generates video at half resolution with audio conditioning (video-only denoising with the audio frozen), then Stage 2 upsamples by 2x and refines the video while keeping the audio fixed, using a distilled LoRA. The input audio is encoded via the audio VAE and used as the initial audio latent, but the original audio waveform is passed through and returned in the output to preserve fidelity. Supports image conditioning and prompt enhancement.
 
-**Extra CLI arguments:** `--audio-path` (required), `--audio-start-time`, `--audio-max-duration`.
+**Extra CLI arguments:** `--audio-path` (required), `--audio-start-time`, `--audio-max-duration`. `--num-frames` and `--audio-max-duration` are mutually exclusive. With `--audio-max-duration`, video length is derived from the effective clip (`min(--audio-max-duration, remaining audio after --audio-start-time)`) at `--frame-rate`, snapped to the VAE temporal grid (`8k+1`). With `--num-frames` (or neither), audio is clipped to `--num-frames / --frame-rate`.
 
 **Use when:** You have an audio clip and want to generate a matching video, audio-reactive video generation, or music visualization.
 
@@ -156,28 +156,66 @@ Single-stage, **audio-only** generation: the video branch is absent (`video=None
 
 ## 12. DFRPipeline
 
-**Best for:** Maximum detail fidelity — generating at half resolution with extra generated keyframes, then re-rendering at full resolution with a spatial detailing LoRA, optionally densifying time by 2x or 4x.
+**Best for:** Production-quality text/image-to-video — generating at half resolution with extra generated keyframes, then re-rendering at full resolution with a spatial detailing LoRA, optionally densifying time by 2x or 4x.
 
 **Source**: [`src/ltx_pipelines/dfr_pipeline.py`](../src/ltx_pipelines/dfr_pipeline.py)
 
-Diffusion Fidelity Rendering runs the distilled sigma schedule on a full checkpoint with a distilled LoRA. Stage 1 generates video **and [generated keyframe slots](conditioning.md#generated-keyframe-slots)** at half resolution, placing slots on an 8-frame-border segment grid; the half-resolution result is kept as a reference while video and keyframes are upsampled in latent space. Stage 2 re-denoises at full resolution with the distilled LoRA plus an optional 2x spatial detailing IC-LoRA, conditioned on the stage-1 reference.
+Diffusion Fidelity Rendering runs the distilled sigma schedule on a **distilled checkpoint** (the same transformer as DistilledPipeline). Stage 1 generates video **and [generated keyframe slots](conditioning.md#generated-keyframe-slots)** at half resolution, placing slots on an 8-frame-border segment grid; the half-resolution result is kept as a reference while video and keyframes are upsampled in latent space. Stage 2 re-denoises at full resolution with a 2x spatial detailing IC-LoRA, conditioned on the stage-1 reference.
 
 Audio comes from **stage 1**. Stage 2 still runs an audio pass, because the video branch needs the cross-modal attention, but nothing refines audio after stage 1.
 
-**Temporal refinement (optional).** `--temporal-upsample-rounds {0,1,2}` adds rounds that each double the frame rate: the canvas is upsampled temporally, split into `2**round` tiles that meet at shared keyframes, given fresh mid-segment slots, and densified with ancestral Euler. Whatever padding the canvas needs internally, you always get `(num_frames - 1) * 2**rounds + 1` frames back.
+**Temporal refinement (optional, default `0`).** `--temporal-upscalings {0,1,2}` adds rounds that each double the **playback** frame rate: the canvas is upsampled temporally, split into `2**round` tiles that meet at shared keyframes, given fresh mid-segment slots, and densified with ancestral Euler. Whatever padding the canvas needs internally, you always get `(num_frames - 1) * 2**rounds + 1` frames back. `--temporal-upsampler-path` is required when the count is greater than 0.
 
-**Extra CLI arguments:** `--detailing-lora PATH [STRENGTH]` (optional, off by default), `--temporal-upsampler-path` (required when rounds > 0), `--temporal-upsample-rounds {0,1,2}`. Unlike the other keyframe-capable pipelines, DFR does **not** take `--num-generated-keyframes` — it derives slot positions from its own segment grid.
+**Spatial epilogue (`--spatial-upscalings 2`).** Default `--spatial-upscalings` is `1`: stage 1 at `h/2`, stage 2 at the final `h×w`. With `2`, stage 1 is at `h/4` and stage 2 at `h/2`. The epilogue decodes each carry keyframe as its own latent, Lanczos-stretches the RGB x2, and encodes it again. Only the video latent is spatially upsampled. Time windows are seam-cut and 2x2-tiled (12 latent cells of overlap); the 3-step detailing schedule runs with those keyframes as strength-1 conditions, the previous-stage video as the IC-LoRA reference, and frozen stage-1 audio so video-audio cross-attention still has a stream. The pipeline still ships the original stage-1 audio. Spatial tiles blend after every Euler step. Detailing LoRA strength is fixed at 0.5. The same encoded keyframes are used for keyframe-aware DiffVAE decode.
+
+**Extra CLI arguments:** `--detailing-lora PATH [STRENGTH]` (required; strength is ignored and hardcoded to 0.5), `--spatial-upscalings {1,2}` (default `1`), `--temporal-upsampler-path` (required when `--temporal-upscalings` > 0), `--temporal-upscalings {0,1,2}` (default `0`). Unlike the other keyframe-capable pipelines, DFR does **not** take `--num-generated-keyframes` — it derives slot positions from its own segment grid. There is no `--distilled-lora`; the distilled weights are the checkpoint.
+
+### Running DFR
+
+`--height` / `--width` are the **final** output size. They must be divisible by **64** (by **128** when `--spatial-upscalings 2`). UHD 4K is `3840×2176`, not `3840×2160` (2160 is not on the 64-pixel grid).
+
+`--num-frames` is the **stage-1** count on the VAE temporal grid (`8k+1`). `--num-frames 121` at the default 24 fps is about 5.04 s. Output length is still that wall-clock duration; extra temporal rounds add frames, not seconds:
+
+| `--temporal-upscalings` | Frames from 121 | Playback fps | Duration |
+| --- | --- | --- | --- |
+| `0` (default) | 121 | 24 | ~5.04 s |
+| `1` | 241 | 48 | ~5.02 s |
+| `2` | 481 | 96 | ~5.01 s |
+
+The file is encoded at that playback fps. The transformer independently snaps conditioning fps to 60 whenever playback fps is above 30 (so a 48 fps clip still ships at 48 fps). Some players treat unusual H.264 rates such as 96 fps as 24 fps and play the file in slow motion.
+
+Shared memory flags (`--quantization`, `--offload`, `--compile`, `--diffvae-optimization`) work the same as on other pipelines; see [Optimization Tips](optimization.md). Defaults are no compile, no quant, no offload, and DiffVAE `chunked_eager`. CUDA-graph compile (`capture=true`, `reduce-overhead`, `max-autotune`) on single GPU needs `--offload cpu` or `disk` so stage rebuilds reuse the same GPU weight slots — that is not the static input pool. DFR hits several transformer shapes (half-res stage 1, full-res stage 2, temporal tiles). With `--compile capture=true`, each shape still gets its own CUDA graph, but `max_video_tokens` / `max_audio_tokens` can size **one** static input pool for all of them. Count the **full** stage-2 sequence: target tokens from the final `height`×`width` **plus** five keyframe planes **plus** the half-res IC-LoRA reference (text-only defaults: 38400 at 1024×1536, 204000 at 3840×2176; see [token budgets](optimization.md#compilation-torchcompile)).
+
+**Cost.** Stage 2 at `--spatial-upscalings 1` denoises the full output resolution. `--spatial-upscalings 2` keeps stage 2 at half res and finishes 4K in the tiled epilogue — use that if stage 2 OOMs at 4K. Each temporal round splits the canvas into `2**round` tiles and **reloads the transformer per tile**, so wall-clock grows much faster than the four Euler steps suggest. After denoising, DFR always **keyframe-decodes**; that is usually the VRAM cliff, not the denoise. `AUTO_TILING` sizes decode tiles for the keyframe path automatically — there is no decode-tile CLI flag. Install the `natten` extra for production DiffVAE decode (`uv sync --package ltx-core --extra natten`); without it the decoder falls back to Triton. On datacenter Blackwell, `--diffvae-optimization blackwell_dsl` is the fast decode path.
+
+Monolith (fat distilled checkpoint + Gemma directory):
 
 ```bash
 uv run python -m ltx_pipelines.dfr_pipeline \
-    --checkpoint-path         models/ltx-2.5/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors \
-    --distilled-lora          models/ltx-2.5/loras/ltx-2.5-22b-distilled-lora-450-bf16.safetensors \
-    --spatial-upsampler-path  models/ltx-2.5/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
-    --temporal-upsampler-path models/ltx-2.5/latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors \
-    --temporal-upsample-rounds 1 \
-    --num-frames 121 --output-path output.mp4 --prompt "..."
+    --distilled-checkpoint-path path/to/distilled-checkpoint.safetensors \
+    --gemma-root                path/to/gemma \
+    --detailing-lora            models/ltx-2.5/loras/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors \
+    --spatial-upsampler-path    models/ltx-2.5/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+    --width 3840 --height 2176 --num-frames 121 \
+    --output-path output.mp4 --prompt "..."
 ```
 
-**Note:** Requires a checkpoint that supports generated keyframe slots (LTX-2.5 and later) and a distilled LoRA.
+Split (Comfy-aligned files; omit `--gemma-root`). Same distilled transformer as DistilledPipeline. Add `--temporal-upsampler-path` and `--temporal-upscalings 1` or `2` for 48 / 96 fps:
 
-**Use when:** Detail fidelity matters more than wall-clock time, or you want a higher effective frame rate than the base model produces.
+```bash
+uv run python -m ltx_pipelines.dfr_pipeline \
+    --transformer-path        models/ltx-2.5/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors \
+    --text-encoder-path       models/ltx-2.5/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors \
+    --video-vae-path          models/ltx-2.5/vae/ltx-2.5-video-vae-bf16.safetensors \
+    --audio-vae-path          models/ltx-2.5/vae/ltx-2.5-audio-vae-bf16.safetensors \
+    --detailing-lora          models/ltx-2.5/loras/ltx-2.5-22b-ic-lora-pixel-spatial-upscaler-x2-1.0.safetensors \
+    --spatial-upsampler-path  models/ltx-2.5/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors \
+    --temporal-upsampler-path models/ltx-2.5/latent_upscale_models/ltx-2.5-latent-temporal-upscaler-x2-bf16-1.0.safetensors \
+    --temporal-upscalings 1 \
+    --width 3840 --height 2176 --num-frames 121 \
+    --output-path output.mp4 --prompt "..."
+```
+
+**Note:** Requires a distilled checkpoint that supports generated keyframe slots (LTX-2.5 and later). Do not pass the full (dev) transformer. Multi-GPU: `python -m ltx_pipelines.dfr_mgpu` with the same flags; both stages use sequence parallelism.
+
+**Use when:** You want production-quality output, quality over wall-clock time, or a higher effective frame rate than the base model produces.

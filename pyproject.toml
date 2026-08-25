@@ -6,10 +6,13 @@ ltx-kernels = { path = "packages/ltx-kernels", editable = true }
 [tool.uv]
 no-build-isolation-package = ["ltx-kernels"]
 # torch 2.13+cu132 pins nvidia-cudnn-cu13==9.20.0.48, which omits
-# libcudnn_engines_tensor_ir; the system/apt cuDNN is 9.21.1 and that soname
-# then resolves from /usr/lib, causing CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH.
-# Force a wheel that ships tensor_ir and matches the host cuDNN series.
-override-dependencies = ["nvidia-cudnn-cu13==9.21.1.3"]
+# libcudnn_engines_tensor_ir; the system/apt cuDNN then resolves that soname from
+# /usr/lib, causing CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH. A wheel *older* than the
+# cuDNN torch was built against additionally aborts the process -- not an exception --
+# with `Cannot load symbol cublasLtGetVersion` the first time torch selects its cuDNN
+# SDPA backend. 9.24.0.43 ships tensor_ir and matches torch 2.13 / cuDNN 9.24;
+# 9.25.0.15 is yanked. Linux-only: the wheel is CUDA and has no darwin build.
+override-dependencies = ["nvidia-cudnn-cu13==9.24.0.43; sys_platform == 'linux'"]
 
 [tool.uv.workspace]
 members = ["packages/*"]
@@ -28,6 +31,7 @@ dev = [
     "pre-commit>=4.3.0",
     "ruff>=0.14.3",
     "pytest~=9.0",
+    "pytest-xdist~=3.8",
     # Match torch's cu132 index (see packages/ltx-core pyproject): kernel builds must use
     # the venv nvcc, not a mismatched system toolkit (CI runners often ship CUDA 12.8).
     # `cccl` provides <nv/target> (pulled by cuda_fp16.h); `nvcc` alone is not enough.
@@ -86,7 +90,6 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 # CI gates: stand-alone CLIs whose whole job is printing a report / GitHub annotations.
-".github/actions/test-collection-completeness/check_test_collection.py" = ["T201"]
 ".github/actions/golden-pairing-gate/check_golden_pairing.py" = ["T201"]
 # Emits `export …` lines for eval by kernels-build.
 ".github/actions/kernels-build/export_cuda_home.py" = ["T201"]

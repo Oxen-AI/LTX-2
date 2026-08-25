@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import Any, Iterator, List, Tuple
 
 import torch
@@ -16,11 +17,13 @@ from ltx_core.model.transformer.timestep_embedding import PixArtAlphaCombinedTim
 from ltx_core.model.video_vae.attention import AttnBlock3D
 from ltx_core.model.video_vae.convolution import make_conv_nd
 from ltx_core.model.video_vae.enums import NormLayerType, PaddingModeType
+from ltx_core.model.video_vae.keyframes import DecodeKeyframes
 from ltx_core.model.video_vae.ops import PerChannelStatistics, unpatchify
 from ltx_core.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
 from ltx_core.model.video_vae.sampling import DepthToSpaceUpsample
 from ltx_core.model.video_vae.video_vae import (
     VideoDecoder,
+    iter_decoded_single_frames,
     map_spatial_slice,
     map_temporal_slice,
     to_mapping_operation,
@@ -488,11 +491,23 @@ class ConvVideoDecoder(nn.Module, Disposable, VideoDecoder):
         latent: torch.Tensor,
         tiling_config: TilingConfig | None = None,
         generator: torch.Generator | None = None,
+        *,
+        keyframes: DecodeKeyframes | None = None,
     ) -> Iterator[torch.Tensor]:
         """Decode a video latent tensor, yielding float chunks ``[f, h, w, c]`` in ``[0, 1]``.
         Subclasses (e.g. ``DistributedVideoDecoder``) may override this to
         control eagerness or distribution across ranks.
+        ``keyframes`` is accepted for signature parity with the diffusion decoder and ignored:
+        anchoring on keyframe planes is a diffusion-decode feature. Ignoring is deliberate --
+        raising would mean every caller has to branch on which VAE it was handed -- but it is
+        logged, because a silent drop looks exactly like a keyframe decode that did nothing.
         """
+        if keyframes is not None:
+            logger.warning(
+                "Conv video decoder ignores the %d keyframe plane(s) it was given; keyframe-anchored "
+                "decoding needs a diffusion VAE. Decoding without them.",
+                keyframes.num_planes,
+            )
 
         def to_rgb(frames: torch.Tensor) -> torch.Tensor:
             video = rearrange(frames[0], "c f h w -> f h w c")
@@ -504,6 +519,14 @@ class ConvVideoDecoder(nn.Module, Disposable, VideoDecoder):
         else:
             decoded = self(latent, generator=generator)
             yield to_rgb(decoded)
+
+    def decode_single_frames(
+        self,
+        latents: Sequence[torch.Tensor],
+        generator: torch.Generator | Sequence[torch.Generator | None] | None = None,
+    ) -> Iterator[torch.Tensor]:
+        """Decode each latent as its own one-frame clip, yielding one RGB tensor per latent."""
+        yield from iter_decoded_single_frames(self, latents, generator)
 
     def _accumulate_temporal_group_into_buffer(
         self,

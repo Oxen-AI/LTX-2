@@ -169,6 +169,8 @@ def window_origin_in_panel(query_pos, panel_origin, radius, kernel_shape, volume
     The panel bounds every query in the tile; this is the ``(kt, kh, kw)`` box *this*
     query attends to. Returned panel-relative because that is the form the per-key
     mask consumes.
+    NATTEN's inward shift. See :func:`window_bounds_in_panel` for the other rule and why
+    both exist.
     """
     q_t, q_h, q_w = query_pos
     panel_t0, panel_h0, panel_w0 = panel_origin
@@ -180,3 +182,30 @@ def window_origin_in_panel(query_pos, panel_origin, radius, kernel_shape, volume
         clamp_window_start(q_h - radius_h, kernel_h, vol_h) - panel_h0,
         clamp_window_start(q_w - radius_w, kernel_w, vol_w) - panel_w0,
     )
+
+
+@cute.jit
+def window_bounds_in_panel(query_pos, panel_origin, radius, kernel_shape, volume):
+    """One query's **clamp-and-mask** NA window, as half-open panel-relative bounds.
+    The other window rule, and the one the joint keyframe operator is defined on: iterate
+    the full configured kernel from ``q - radius`` and drop whatever falls outside the
+    volume, so a boundary query attends to *fewer* keys and its softmax renormalises over
+    them. NATTEN -- and therefore :func:`window_origin_in_panel` and every non-keyframe path
+    here -- instead slides the window inward so every query sees exactly ``k`` keys.
+    The two agree in the interior and genuinely differ at boundaries; at latent resolution
+    with a ``(3, 7, 7)`` kernel that is about half the volume, so it is not a rounding
+    detail. Which rule a call uses is a property of the operator, not of the hardware, hence
+    two helpers rather than a flag buried here.
+    Returns ``((lo_t, hi_t), (lo_h, hi_h), (lo_w, hi_w))``. Every bound is a subset of the
+    inward-shifted window's span, so a panel sized for that rule already covers this one.
+    """
+    bounds = []
+    for q, panel_0, radius_a, kernel_a, extent in zip(
+        query_pos, panel_origin, radius, kernel_shape, volume, strict=True
+    ):
+        start = q - radius_a
+        lo = start if start > 0 else cutlass.Int32(0)
+        end = start + kernel_a
+        hi = end if end < extent else extent
+        bounds.append((lo - panel_0, hi - panel_0))
+    return tuple(bounds)

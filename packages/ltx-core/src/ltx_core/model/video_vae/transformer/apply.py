@@ -37,6 +37,7 @@ from ltx_core.model.video_vae.transformer.dsl_kernels.block import DSLDiffusionN
 from ltx_core.model.video_vae.transformer.fallback_na import (
     EagerSdpaAttention,
     TritonNaAttention,
+    joint_na_attention,
     triton_na_available,
     warn_no_natten,
 )
@@ -56,24 +57,21 @@ def _block_cls_for(cfg: DiffVAEConfig) -> type[DiffusionNABlock]:
 
 
 def resolve_attention_for_host(cfg: DiffVAEConfig) -> DiffVAEConfig:
-    """Remap chunked NATTEN recipes to Triton/eager when natten is missing.
-    ``COMBINED`` (full-volume) compile requires natten — Dynamo + fallback NA is
-    not supported. Chunked modes remapped to fallback also disable ``torch.compile``
-    for now (fallback NA is an opaque custom_op, but the remap still keeps the
-    no-natten path on the eager chunked recipe).
+    """Remap NATTEN recipes to Triton/eager when natten is missing.
+    Both fallback backends are opaque ``custom_op``s, so Dynamo traces straight over them and
+    ``COMBINED`` keeps its compilation. Chunked modes remapped to fallback drop ``torch.compile``
+    instead: there it would only cover the attn+mlp region, which is exactly what
+    ``CHUNKED_COMPILE``'s higher memory coefficient pays for, so a no-natten host is better served
+    by the eager chunked recipe. Auto tiling reads this decision back through
+    :func:`~ltx_core.model.video_vae.diffusion_tiling.stage5_mem_coef`.
     """
     if cfg.attention is not NAttentionKind.NATTEN:
         return cfg
     if natten_available():
         return cfg
-    if cfg.block is DiffVAEBlockKind.COMBINED:
-        raise RuntimeError(
-            "diffvae_optimization=combined_compile requires natten "
-            "(full-volume NA + torch.compile). Install with: "
-            "uv sync --package ltx-core --extra natten "
-            "(or use chunked_eager / chunked_compile, which fall back to Triton/eager)."
-        )
     kind = NAttentionKind.TRITON if triton_na_available() else NAttentionKind.EAGER_SDPA
+    if cfg.block is DiffVAEBlockKind.COMBINED:
+        return replace(cfg, attention=kind, natten_backend=None)
     return replace(
         cfg,
         attention=kind,
@@ -100,6 +98,27 @@ def _set_attention_function(decoder: DiffusionVideoDecoder, attn_fn: object) -> 
         if isinstance(module, NeighborhoodAttention3D):
             module.attention_function = attn_fn  # type: ignore[assignment]
             module.natten_backend = None
+
+
+def _install_joint_attention(decoder: DiffusionVideoDecoder, cfg: DiffVAEConfig) -> None:
+    """Install the keyframe-aware backend on every NA module, for every mode.
+    This is the whole "natten only when installed **and** no keyframes" gate: it lives in
+    a slot of its own, so keyframe-less decode keeps whatever ``attention_function`` the
+    mode chose (NATTEN when installed) while keyframe decode always routes here -- NATTEN
+    cannot express a joint window. It also survives ``configure_natten_backend``-style
+    wholesale overwrites of ``attention_function``.
+    The CuTe DSL kernel *can* express it, and under ``BLACKWELL_DSL`` it is preferred, with
+    ``joint_na_attention()`` behind it for the calls it cannot serve -- a CPU module, a volume
+    under its halo panel, or a checkpoint loaded without the DSL SDOps.
+    """
+    joint = joint_na_attention()
+    if cfg.attention is NAttentionKind.BLACKWELL_DSL:
+        from ltx_core.model.video_vae.transformer.dsl_kernels import DSLJointAttention  # noqa: PLC0415
+
+        joint = DSLJointAttention(joint)
+    for module in decoder.modules():
+        if isinstance(module, NeighborhoodAttention3D):
+            module.joint_attention_function = joint  # type: ignore[assignment]
 
 
 def _install_attention(decoder: DiffusionVideoDecoder, cfg: DiffVAEConfig) -> None:
@@ -142,6 +161,7 @@ def apply_diffvae_config(
         configure_w_chunks(block, cfg.w_chunks)
 
     _install_attention(decoder, cfg)
+    _install_joint_attention(decoder, cfg)
 
     if cfg.compile_blocks:
         compile_diffusion_decoder(

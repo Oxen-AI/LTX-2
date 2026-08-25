@@ -82,24 +82,29 @@ Compiling the transformer blocks with `torch.compile` speeds up inference. It is
 | `--compile KEY=VALUE ...` | compile, overriding individual fields |
 
 ```bash
-# Defaults
+# Defaults (compile only; no CUDA graphs). Fine with --offload none.
 python -m ltx_pipelines.ti2vid_two_stages --compile --checkpoint-path=...
 
-# reduce-overhead / max-autotune / capture all need GPU-resident weights
-# (keeps_gpu_resident_weights -- SP/TDP + weight tracker, or streaming).
-python -m ltx_pipelines.ti2vid_two_stages --compile mode=reduce-overhead --checkpoint-path=...
-
-# Several overrides at once
+# CUDA-graph inductor modes: on single GPU add --offload cpu (or disk)
 python -m ltx_pipelines.ti2vid_two_stages \
-    --compile mode=max-autotune fullgraph=true dynamic=true --checkpoint-path=...
+    --compile mode=max-autotune fullgraph=true dynamic=true --checkpoint-path=... \
+    --offload cpu
 
-# Self-managed block-loop CUDA-graph capture
-python -m ltx_pipelines.ti2vid_two_stages --compile capture=true --checkpoint-path=...
+# Self-managed block-loop CUDA-graph capture (private static inputs per captured shape)
+python -m ltx_pipelines.distilled \
+    --compile capture=true --distilled-checkpoint-path=... \
+    --offload cpu
+
+# Same, with one shared static-input pool sized for this rank's largest shape
+python -m ltx_pipelines.distilled \
+    --compile capture=true max_video_tokens=24576 max_audio_tokens=128 \
+    --distilled-checkpoint-path=... \
+    --offload cpu
 ```
 
 | Field | Values | Default | Notes |
 | ----- | ------ | ------- | ----- |
-| `mode` | `none`, `reduce-overhead`, `max-autotune`, … | `none` | `reduce-overhead`/`max-autotune` enable CUDA graphs; require `keeps_gpu_resident_weights=True` or the stage raises |
+| `mode` | `none`, `reduce-overhead`, `max-autotune`, … | `none` | `reduce-overhead`/`max-autotune` enable PyTorch CUDA graphs. On single GPU they need `--offload cpu` or `disk` (see below); the SP/TDP runners already qualify |
 | `backend` | `inductor`, `eager`, … | `inductor` | |
 | `fullgraph` | `true`/`false` | `false` | |
 | `dynamic` | `auto`/`true`/`false` | `auto` | the seq dim is marked dynamic separately (see `seq_dim_dynamic`) |
@@ -107,7 +112,37 @@ python -m ltx_pipelines.ti2vid_two_stages --compile capture=true --checkpoint-pa
 | `dynamo_config` | JSON object or path to a `.json` | `{"inline_inbuilt_nn_modules": true, "cache_size_limit": 256}` | `torch._dynamo.config` overrides |
 | `seq_dim_dynamic` | `true`/`false` | `true` | mark the block's sequence dim dynamic so one artifact serves any token count; `false` recompiles per token count |
 | `recompile_perturbed_block` | `true`/`false` | `true` | `true` recompiles a separate block graph for the STG-perturbed pass; `false` attaches unconditional runtime masks so the block traces once (single graph) |
-| `capture` | `true`/`false` | `false` | per-block compile + one CUDA graph over the block loop (keyed by shape / perturbation signature). Requires `keeps_gpu_resident_weights=True`. Faster cold-start and smaller new-shape penalty than `mode=reduce-overhead` |
+| `capture` | `true`/`false` | `false` | per-block compile + one CUDA graph over the block loop (keyed by shape and perturbation signature). Faster cold-start than `mode=reduce-overhead`. Same single-GPU `--offload` requirement as those modes. Each replay copies activations into **static input buffers**, then runs the graph |
+| `max_video_tokens` | positive integer | `0` | `capture` only: size of the shared **video input** pool (latent tokens, not pixels). `0`: each captured shape keeps its own input buffers. Set to this rank's largest video token count so every shape copies into one pool |
+| `max_audio_tokens` | positive integer | `0` | same, for the audio-input pool. For audio+video jobs that share pools, set both |
+
+**CUDA-graph capture (`capture=true`).** `--compile` by itself compiles blocks and does not capture graphs. `mode=reduce-overhead` lets PyTorch graph the 48-block tree (slow cold start). `capture=true` compiles each block once, then captures **one** CUDA graph around the whole block loop per (input shape, perturbation signature). Distilled has no STG pass, so that is one graph per shape; CFG/STG pipelines can capture a second graph at the same shape. A replay copies the current video/audio `TransformerArgs` (activations, RoPE, masks) into **static input buffers** and runs that graph — the graph always reads the same input addresses.
+
+Capture freezes two kinds of GPU address. They are independent:
+
+**Weight storages (whether capture can run).** Default `--offload none` rebuilds each stage onto **new** GPU weight tensors and raises (`keeps_gpu_resident_weights`). On single GPU, `--offload cpu` or `--offload disk` selects the streaming builder, which reuses the same GPU weight slots across rebuilds. The SP/TDP multi-GPU runners already do this via the weight tracker. A model registry by itself does not: the CLI already uses one, and it still raises. `--offload` is not sizing activations.
+
+**Static input pool (`max_video_tokens` / `max_audio_tokens`).** These flags size the **input** buffers every capture copies into — not the weights. Leave both at `0` and each captured shape allocates its own input set (cost grows with the number of shapes: stage-1, stage-2, DFR tiles, …). Set them to this rank's **largest** token counts and every capture shares one pool sized for that max, so input-buffer VRAM is one shape, not the sum. Too small raises (the capture does not fit the pool). Too large only wastes VRAM. Multi-GPU: the count is what **this rank** denoises after the sequence split, overlap included. Perturbation `block_masks` always share one process-wide pool.
+
+A video token is one latent cell after the default 8×32×32 VAE (not a pixel). The formula is the **target** sequence:
+
+```text
+video_tokens = ((num_frames - 1) / 8 + 1) * (height / 32) * (width / 32)
+audio_tokens ≈ round((num_frames / frame_rate) * 25)
+```
+
+Conditioning **appends** tokens (generated-keyframe slots, IC-LoRA reference, image keyframes). Size the pool for the full transformer sequence, not the target alone.
+
+Use the **largest denoise** this rank sees (usually stage-2 / final `height`×`width`, not the half-res stage-1). Examples at 121 frames, 24 fps, **no extra conditioning** (DistilledPipeline defaults):
+
+| Output | Video tokens | Audio tokens |
+| --- | --- | --- |
+| 1024×1536 (pipeline default) | 16 × 32 × 48 = **24576** | ~126 |
+| 3840×2176 (4K) | 16 × 68 × 120 = **130560** | ~126 |
+
+Text-only DFR (`--spatial-upscalings 1`) always appends five full-res keyframe planes plus the half-res IC-LoRA reference, so stage 2 is **38400** at 1024×1536 and **204000** at 3840×2176. Image inputs and temporal tiles add more.
+
+Round audio up (128 is enough for a ~5 s clip). CFG batching repeats the batch dim; it does not change these sequence counts.
 
 **Controlling inductor / dynamo configs.** `inductor_config` and `dynamo_config` take either an inline JSON object or a path to a `.json` file, applied via `torch._inductor.config.patch(...)` / `torch._dynamo.config.patch(...)` around the compiled forward. They **replace the defaults wholesale - they do not merge**, so when overriding `dynamo_config` re-include any defaults you want to keep:
 
@@ -122,10 +157,12 @@ python -m ltx_pipelines.ti2vid_two_stages \
 
 ```python
 from ltx_core.model.transformer.compiling import CompilationConfig
+from ltx_pipelines.utils.types import OffloadMode
 
 pipeline = TI2VidTwoStagesPipeline(
     ...,
     compilation_config=CompilationConfig(mode="reduce-overhead"),
+    offload_mode=OffloadMode.CPU,  # required on single GPU for CUDA-graph modes
 )
 ```
 
@@ -152,6 +189,8 @@ By default, the video VAE comes from `--checkpoint-path`/`--distilled-checkpoint
 | **Triton** `na3d` | CUDA + working Triton (incl. [triton-windows](https://github.com/triton-lang/triton-windows)); natten missing | Compatibility fallback. |
 | **eager** tiled SDPA | Always | Slowest; last resort when Triton is unavailable. |
 
+**Keyframe-aware decode** (`decode_video(keyframes=)`) has its own ladder, because NATTEN cannot express a joint video+keyframe window: **CuTe DSL** (under `blackwell_dsl`) then **Triton** on CUDA tensors then **pure-torch** brick-batched SDPA, which is the backend macOS/MPS and Windows-without-an-extra get and costs roughly 4% against Triton end to end. No natten warning is emitted there - that ladder is not a degraded path, it is the only one.
+
 ```bash
 # Recommended for DiffVAE production decode on non-B200 GPUs
 uv sync --package ltx-core --extra natten
@@ -165,10 +204,27 @@ That `natten` extra pins `natten==0.21.7+torch2130cu132` with `torch==2.13.0` (c
 **Mode × backend rules:**
 
 - `blackwell_dsl` uses CuTe DSL NA + fused stage-5 (requires datacenter Blackwell + `uv sync --group kernels`). Independent of natten.
-- `combined_compile` **requires natten** (full-volume NA + `torch.compile`). Without it, apply raises.
-- `chunked_eager` / `chunked_compile` remapped to Triton/eager when natten is missing (compile is disabled on the fallback path). Triton/eager are for compatibility only.
+- `chunked_eager` / `chunked_compile` remap to Triton/eager when natten is missing, and `chunked_compile` also drops `torch.compile` there (it would only cover the attn+mlp region, which is what its extra memory coefficient pays for).
+- `combined_compile` remaps the same way but **keeps** its compilation: both fallbacks are opaque custom ops, so Dynamo traces over them. It no longer raises without natten.
 
-Pipeline `AUTO_TILING` resolves via `tiling_config_for_vae`: for a **Conv VAE** that is aspect-coupled long-side `768/64` spatial tiles plus temporal `80/24` (`TileSizeConfig.from_long_side`). For **DiffVAE**, recommended decode tiling enumerates legal per-axis tile **sizes** on the VAE grid (via the same `split_by_size` path decode uses) and emits a `TileSizeConfig` with independent `frames` / `height` / `width` `DimensionSizeConfig` values. Tile sizes are floored at ``2xOverlap`` so blend masks stay complementary. Stage-5 VRAM coef for `chunked_compile` is **7** with natten; with Triton/eager fallback it uses the `chunked_eager` coef (**5**).
+**Mode x keyframes grid.** The full resolved recipe, including what auto-tiling budgets for it:
+
+| | `chunked_eager` | `chunked_compile` | `combined_compile` | `blackwell_dsl` |
+| --- | --- | --- | --- | --- |
+| compiled region | - | `forward_attn_mlp` (no-keyframe pathway) | `forward_combined` + det stages (no-keyframe pathway) | det stages only |
+| block class | `ChunkedDiffusionNABlock` | `ChunkedDiffusionNABlock` | `CombinedDiffusionNABlock` | `DSLDiffusionNABlock` |
+| `na3d`, no keyframes | natten `cutlass-fna` > Triton > eager | natten (auto backend) > Triton > eager | natten (auto backend) > Triton > eager | `na_attention_dsl` |
+| stage-5 VRAM coefficient | 5 | 7 | 11 | 2.5 |
+| withheld reserve | 1 GiB | 2 GiB | 2 GiB | 2 GiB |
+| `joint_na3d`, with keyframes | Triton > pure-torch | Triton > pure-torch | Triton > pure-torch | `na_attention_joint_dsl` |
+| stage-5 VRAM coefficient | 5 | **5** | **15** | 2.5 |
+| withheld reserve | 1 GiB (2 on MATH SDPA) | 1 GiB (2 on MATH SDPA) | 1 GiB (2 on MATH SDPA) | 2 GiB |
+
+A keyframe decode is **not** compiled -- the compiled entry points are the keyframe-free ones -- so its diff blocks run eager whatever the mode asked for, and the budget follows that: `chunked_compile` drops to the `chunked_eager` coefficient, and `combined_compile` needs **15** rather than 11 because it holds several live full-volume intermediates where the compiled path holds one fused buffer. On a host whose joint attention falls back to torch's MATH SDPA kernel (no CUDA, e.g. MPS) the reserve grows by a GiB, since that kernel materializes its score block.
+
+Pipeline `AUTO_TILING` resolves via `tiling_config_for_vae`: for a **Conv VAE** that is aspect-coupled long-side `768/64` spatial tiles plus temporal `80/24` (`TileSizeConfig.from_long_side`). For **DiffVAE**, recommended decode tiling enumerates legal per-axis tile **sizes** on the VAE grid (via the same `split_by_size` path decode uses) and emits a `TileSizeConfig` with independent `frames` / `height` / `width` `DimensionSizeConfig` values. Tile sizes are floored at ``2xOverlap`` so blend masks stay complementary. Stage-5 coefficients and reserves come from the grid above; `tiling_config_for_vae(..., keyframes=True)` selects the keyframe column, and a `chunked_compile` remapped to the Triton/eager fallback uses the `chunked_eager` row.
+
+**DFR** always keyframe-decodes (`decode_video(keyframes=)`), so `AUTO_TILING` uses the **keyframe** VRAM column. At 4K with temporal rounds, decode is usually the memory cliff, not the denoise; there is no decode-tile CLI flag. `--spatial-upscalings 2` keeps stage-2 denoise at half resolution. Each temporal tile reloads the transformer. See [Running DFR](pipelines.md#running-dfr).
 
 **CLI:**
 
@@ -183,7 +239,7 @@ Pipeline `AUTO_TILING` resolves via `tiling_config_for_vae`: for a **Conv VAE** 
 | ---- | -------- |
 | `chunked_eager` | Deferred stage-4 inject (sequential upsample then `context_proj`), W-chunks=4, cutlass-fna (or Triton/eager fallback), no `torch.compile`. Lowest compile cost; lower peak VRAM. |
 | `chunked_compile` | Same deferred/chunked pathway + `torch.compile` on attn+mlp only when natten is present (det stages stay eager). Without natten: same as `chunked_eager` fallback path. |
-| `combined_compile` | Combined `context_and_x` buffer, full-volume attention, compile blocks + det stages. **Requires natten.** Fastest warm decode on non-B200; highest VRAM. |
+| `combined_compile` | Combined `context_and_x` buffer, full-volume attention, compile blocks + det stages. Fastest warm decode on non-B200; highest VRAM. |
 | `blackwell_dsl` | Deferred stage-4 + CuTe DSL NA / fused stage-5. Fastest on datacenter Blackwell (B200). Needs `uv sync --group kernels`. |
 
 **Relative performance** (order-of-magnitude; hardware varies - no absolute timings or VRAM figures):

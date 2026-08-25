@@ -12,6 +12,7 @@ from typing import List, Literal, Sequence, Tuple
 
 import torch
 
+from ltx_core.color.yuv import frames_per_yuv_gemm
 from ltx_core.model.video_vae.transformer.apply import resolve_attention_for_host
 from ltx_core.model.video_vae.transformer.config import DiffVAEMode, NAttentionKind
 from ltx_core.tiling import (
@@ -31,6 +32,8 @@ from ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors
 
 ResizeAxisMode = Literal["repeat_last", "symmetric"]
 
+_GIB: int = 1 << 30
+
 # Peak-activation heuristic (bytes):
 #   hard (resident for whole tiled decode):
 #     stage-4 input feature (stages 1-3 output): s4_txs4_hxs4_wxstage4_channelsxbf16
@@ -41,44 +44,164 @@ ResizeAxisMode = Literal["repeat_last", "symmetric"]
 #        matches decode: fp16 when features are bf16, else feature dtype)
 #     stage-5: stage5_tokens x stage5_channels x bf16 x coef
 # where stage5_tokens = F x (H/patch) x (W/patch) and coef folds NA working-set multiplicity.
-_MEM_COEF_BY_MODE: dict[DiffVAEMode, float] = {
-    DiffVAEMode.COMBINED_COMPILE: 11,
-    DiffVAEMode.CHUNKED_COMPILE: 7,  # natten backend; Triton/eager use CHUNKED_EAGER
-    DiffVAEMode.CHUNKED_EAGER: 5,
-    DiffVAEMode.BLACKWELL_DSL: 2.5,
+
+
+@dataclass(frozen=True, slots=True)
+class _StageFiveBudget:
+    """One mode's stage-5 multiplicity and withheld reserve, with and without keyframes."""
+
+    coef: float
+    coef_keyframes: float
+    reserve_bytes: int
+
+
+# Keyframe decode is *not* compiled: ``compile_diffusion_decoder`` wraps ``forward_attn_mlp`` /
+# ``forward_combined``, while the keyframe pathway runs ``*_with_keyframes``. So with keyframes the
+# diff blocks are eager whatever the mode asked for, and the budget follows the block shape rather
+# than the compile setting:
+#   - chunked: eager already, so keyframes change nothing (5) and CHUNKED_COMPILE's 7 -- which buys
+#     its extra headroom from Inductor fusing the attn+mlp region -- falls back to 5.
+#   - combined: keeps its combined ``context_and_x`` buffer and full-volume attention, but without
+#     the fusion it holds several live full-volume intermediates instead of one Inductor buffer,
+#     measured as 11 -> 15.
+#   - BLACKWELL_DSL: the CuTe kernel has its own joint entry point, so the fused path serves
+#     keyframes too and nothing changes.
+_BUDGET_BY_MODE: dict[DiffVAEMode, _StageFiveBudget] = {
+    DiffVAEMode.COMBINED_COMPILE: _StageFiveBudget(coef=11, coef_keyframes=15, reserve_bytes=2 * _GIB),
+    DiffVAEMode.CHUNKED_COMPILE: _StageFiveBudget(coef=7, coef_keyframes=5, reserve_bytes=2 * _GIB),
+    DiffVAEMode.CHUNKED_EAGER: _StageFiveBudget(coef=5, coef_keyframes=5, reserve_bytes=1 * _GIB),
+    DiffVAEMode.BLACKWELL_DSL: _StageFiveBudget(coef=2.5, coef_keyframes=2.5, reserve_bytes=2 * _GIB),
 }
 _DEFAULT_ELEMENT_SIZE: int = 2  # bf16 features → fp16 accumulator / bf16 stage-5
 _ACCUMULATOR_CHANNELS: int = 3  # RGB pixel blend buffer (decoder out_channels)
 _MIN_MODEL_BYTES_FLOOR: int = 1 << 30  # never assume a free DiffVAE weight footprint
-_BUDGET_SAFETY_BYTES_EAGER: int = 1 << 30
-_BUDGET_SAFETY_BYTES_COMPILED: int = 2 << 30
+_BUDGET_SAFETY_BYTES_EAGER: int = 1 * _GIB
+#: Keyframe decode runs eager blocks, so it takes the eager reserve -- unless the joint attention
+#: ends up on torch's MATH SDPA kernel, which materializes its score block and wants one more GiB.
+_BUDGET_SAFETY_BYTES_JOINT_MATERIALIZED: int = 2 * _GIB
 
 
-def stage5_mem_coef(mode: DiffVAEMode) -> float:
+def _falls_back_to_eager_na(mode: DiffVAEMode) -> bool:
+    """True when this host has no natten and the mode's NA remaps to Triton/eager.
+    For chunked modes that remap also switches ``compile_blocks`` off, so the peak is the eager
+    one; :func:`resolve_attention_for_host` is the single owner of that decision.
+    """
+    resolved = resolve_attention_for_host(mode.resolve())
+    return resolved.attention in (NAttentionKind.TRITON, NAttentionKind.EAGER_SDPA) and not resolved.compile_blocks
+
+
+def stage5_mem_coef(mode: DiffVAEMode, *, keyframes: bool = False) -> float:
     """Stage-5 working-set multiplicity for auto tiling, after host NA resolve.
-    ``CHUNKED_COMPILE``'s coef 7 assumes natten. When the host remaps chunked
-    modes to Triton/eager fallback, use the ``CHUNKED_EAGER`` coef (5) instead.
-    ``COMBINED_COMPILE`` requires natten and keeps coef 11.
+    Args:
+        mode: the decode preset.
+        keyframes: whether this decode carries a keyframe stream, which runs eager blocks.
     """
     try:
-        base = _MEM_COEF_BY_MODE[mode]
+        budget = _BUDGET_BY_MODE[mode]
     except KeyError as exc:
         raise ValueError(f"Unsupported DiffVAEMode for tiling budget: {mode!r}") from exc
-    resolved = resolve_attention_for_host(mode.resolve())
-    if resolved.attention in (NAttentionKind.TRITON, NAttentionKind.EAGER_SDPA):
-        return _MEM_COEF_BY_MODE[DiffVAEMode.CHUNKED_EAGER]
-    return base
+    if keyframes:
+        return budget.coef_keyframes
+    if _falls_back_to_eager_na(mode):
+        return _BUDGET_BY_MODE[DiffVAEMode.CHUNKED_EAGER].coef
+    return budget.coef
 
 
-def budget_safety_bytes(mode: DiffVAEMode) -> int:
-    """Extra bytes withheld from the recommend budget (eager 1 GiB, compiled 2 GiB)."""
-    if mode is DiffVAEMode.CHUNKED_EAGER:
+# Peak of the SDR encode sink, per emitted pixel, on top of the chunk itself (which the
+# accumulator term already covers). Measured at 11.50 B/px for bf16 RGB at 3840x2176.
+# Two peaks compete, and which one wins depends on whether ``rgb_to_yuv`` converts the
+# chunk in one GEMM or in write-back chunks (see ``color.yuv.frames_per_yuv_gemm``):
+#   one GEMM (chunk <= limit)   a full new YUV tensor, kept alive afterwards by the
+#                               ``y`` view into it
+#   write-back (chunk > limit)  YUV overwrites the RGB storage the accumulator already
+#                               charges, so only a GEMM-sized temporary is new
+# On top of that, both paths allocate ``uv_full`` (2 ch, freed before the pack), the
+# pooled 4:2:0 ``uv`` (0.5 ch), and then in ``pack_i420`` a concatenated float plane
+# (1.5 ch) plus its uint8 copy (1.5 B/px, which does not scale with dtype).
+# Halves are carried doubled so the arithmetic stays integral.
+_CONVERT_PEAK_UV_CHANNELS_X2 = 5  # uv_full (2) + pooled uv (0.5)
+_PACK_PEAK_UV_CHANNELS_X2 = 4  # pooled uv (0.5) + packed float (1.5)
+_PACK_PEAK_UINT8_BYTES_X2 = 3  # 1.5 B/px
+
+
+def max_emitted_frames(*, num_frames: int, tile_frames: int, overlap_frames: int) -> int:
+    """Longest chunk the tiled decode yields, in pixel frames.
+    ``_decode_groups_with_keyframes`` yields only a group's *exclusive* span -- one
+    stride -- and keeps the trailing overlap as a stub for the next group. Only the
+    final group yields its whole buffer. Charging ``tile_frames`` for every chunk
+    therefore roughly doubles the estimate on long clips, which blocks layouts that
+    would have fit. ``+1`` covers the causal shift, which moves each group after the
+    first back by one frame.
+    """
+    if tile_frames >= num_frames:
+        return num_frames
+    stride = tile_frames - overlap_frames
+    if stride <= 0:
+        return tile_frames
+    n_tiles = 1 + -(-(num_frames - tile_frames) // stride)
+    last_group = num_frames - (n_tiles - 1) * stride
+    return min(tile_frames, max(stride, last_group + 1))
+
+
+def emit_convert_bytes(
+    *,
+    tile_frames: int,
+    height: int,
+    width: int,
+    out_channels: int,
+    element_size: int,
+) -> int:
+    """Downstream bytes a yielded chunk costs while the encoder consumes it.
+    The decode budget alone is not enough to size a tile: whatever ``_emit`` yields is
+    handed straight to the video encoder, and that peak overlaps the decode because the
+    decoder is a generator -- it stays suspended holding stage-4 features and the
+    accumulator while the consumer converts the chunk it just yielded. A layout that
+    decodes comfortably can therefore still die in the encoder, and because the
+    recommender spends spare VRAM on *larger* temporal tiles, more free memory used to
+    make that failure more likely rather than less.
+    ``out_channels`` is the width of the intermediate **YUV** tensor, not a second copy
+    of the emitted RGB: the chunk itself is charged by the accumulator term. On the
+    write-back path YUV lands in that same RGB storage, so it is not charged here at all
+    and only the GEMM temporary is.
+    """
+    frames = int(tile_frames)
+    gemm_frames = min(frames, frames_per_yuv_gemm(height, width))
+    # Write-back reuses the RGB storage, so no full YUV tensor survives into the pack.
+    resident_yuv_frames = frames if gemm_frames == frames else 0
+    yuv_channels_x2 = 2 * int(out_channels)
+
+    convert_peak_x2 = element_size * (yuv_channels_x2 * gemm_frames + _CONVERT_PEAK_UV_CHANNELS_X2 * frames)
+    pack_peak_x2 = (
+        element_size * (yuv_channels_x2 * resident_yuv_frames + _PACK_PEAK_UV_CHANNELS_X2 * frames)
+        + _PACK_PEAK_UINT8_BYTES_X2 * frames
+    )
+
+    return int(height) * int(width) * max(convert_peak_x2, pack_peak_x2) // 2
+
+
+def budget_safety_bytes(
+    mode: DiffVAEMode,
+    *,
+    keyframes: bool = False,
+    joint_sdpa_materializes: bool = False,
+) -> int:
+    """Extra bytes withheld from the recommend budget.
+    Args:
+        mode: the decode preset.
+        keyframes: whether this decode carries a keyframe stream.
+        joint_sdpa_materializes: whether the joint attention will run on torch's MATH SDPA kernel
+            (see ``fallback_na.joint_eager.sdpa_materializes_scores``). Ignored without keyframes,
+            and irrelevant when a fused joint kernel serves the decode.
+    """
+    try:
+        budget = _BUDGET_BY_MODE[mode]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported DiffVAEMode for tiling budget: {mode!r}") from exc
+    if keyframes and mode is not DiffVAEMode.BLACKWELL_DSL:
+        return _BUDGET_SAFETY_BYTES_JOINT_MATERIALIZED if joint_sdpa_materializes else _BUDGET_SAFETY_BYTES_EAGER
+    if _falls_back_to_eager_na(mode):
         return _BUDGET_SAFETY_BYTES_EAGER
-    # Chunked compile that remaps to fallback NA is effectively eager for peak VRAM.
-    resolved = resolve_attention_for_host(mode.resolve())
-    if resolved.attention in (NAttentionKind.TRITON, NAttentionKind.EAGER_SDPA):
-        return _BUDGET_SAFETY_BYTES_EAGER
-    return _BUDGET_SAFETY_BYTES_COMPILED
+    return budget.reserve_bytes
 
 
 def accumulator_element_size(feature_dtype: torch.dtype) -> int:
@@ -153,6 +276,8 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
     element_size: int = _DEFAULT_ELEMENT_SIZE,
     natten_trailing_pad_latent_frames: int = 0,
     out_channels: int = _ACCUMULATOR_CHANNELS,
+    keyframes: bool = False,
+    joint_sdpa_materializes: bool = False,
 ) -> TileSizeConfig:
     """Pick DiffVAE decode tiling from stage-4/5 halos and free VRAM.
     Always enables both spatial and temporal tiling (temporal-only full-frame slabs
@@ -164,8 +289,8 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
          counts from :func:`~ltx_core.tiling.split_by_size` (same as decode).
       2. Drop triples whose peak-bytes estimate exceeds ``usable`` bytes
          (``free - max(model, 1 GiB) - safety - stage4_feature``; safety is
-         1 GiB eager / 2 GiB compiled). Stage-4 input features stay resident
-         for the whole tiled decode.
+         1 GiB eager / 2 GiB compiled, see :func:`budget_safety_bytes`).
+         Stage-4 input features stay resident for the whole tiled decode.
       3. Among feasible triples, pick minimal :func:`volumetric_overlap_waste`.
     Peak-bytes estimate::
         stage4_feature_bytes(...)                         # hard, full volume
@@ -177,7 +302,13 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
     RGBx``element_size`` by default. ``element_size`` is the activation width:
     production bf16 features use fp16 accumulators (2), matching
     :func:`accumulator_element_size`. Stage-5 uses the same element size x
-    ``stage5_channels`` x ``coef`` (11 / 7 / 5 / 2.5 by mode).
+    ``stage5_channels`` x ``coef``, which :func:`stage5_mem_coef` reads off the
+    mode and ``keyframes`` (11 / 7 / 5 / 2.5 by mode; 15 / 5 / 5 / 2.5 with a
+    keyframe stream, which runs eager blocks).
+    Args beyond the geometry:
+        keyframes: this decode carries a keyframe stream (joint attention, eager blocks).
+        joint_sdpa_materializes: the joint attention will run on torch's MATH SDPA kernel;
+            costs one more GiB of reserve. See :func:`budget_safety_bytes`.
     """
     if height < 1 or width < 1 or num_frames < 1:
         raise ValueError(f"height/width/num_frames must be >= 1, got {height}x{width}x{num_frames}")
@@ -213,7 +344,7 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
     )
 
     model_cost = max(int(model_bytes), _MIN_MODEL_BYTES_FLOOR)
-    coef = stage5_mem_coef(mode)
+    coef = stage5_mem_coef(mode, keyframes=keyframes)
     s4_feat_bytes = stage4_feature_bytes(
         height=height,
         width=width,
@@ -223,7 +354,8 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
         element_size=element_size,
         natten_trailing_pad_latent_frames=natten_trailing_pad_latent_frames,
     )
-    usable = max(0, int(free_bytes) - model_cost - budget_safety_bytes(mode) - s4_feat_bytes)
+    reserve = budget_safety_bytes(mode, keyframes=keyframes, joint_sdpa_materializes=joint_sdpa_materializes)
+    usable = max(0, int(free_bytes) - model_cost - reserve - s4_feat_bytes)
     s5_bytes_per_token = max(1.0, float(stage5_channels) * float(element_size) * coef)
     acc_bytes_per_pixel = int(out_channels) * int(element_size)
 
@@ -237,9 +369,17 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
         # Current group buffer + still-live emit/stub during temporal handoff.
         acc_frames = 2 * int(tile_t)
         acc_bytes = acc_frames * int(height) * int(width) * acc_bytes_per_pixel
-        if acc_bytes >= usable:
+        # The consumer converts each yielded chunk while this decode is suspended.
+        downstream_bytes = emit_convert_bytes(
+            tile_frames=max_emitted_frames(num_frames=num_frames, tile_frames=tile_t, overlap_frames=overlap_t),
+            height=height,
+            width=width,
+            out_channels=out_channels,
+            element_size=element_size,
+        )
+        if acc_bytes + downstream_bytes >= usable:
             continue
-        s5_budget_bytes = usable - acc_bytes
+        s5_budget_bytes = usable - acc_bytes - downstream_bytes
         max_s5_tokens = int(s5_budget_bytes // s5_bytes_per_token)
         for tile_h, n_h in h_cands:
             for tile_w, n_w in w_cands:
@@ -263,9 +403,10 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
             "Cannot fit a DiffVAE decode tile under the memory budget: "
             f"min tile ~{min_t_px}f x {min_h_px}x{min_w_px}px "
             f"(overlaps T={overlap_t}, HW={overlap_hw}), "
-            f"mode={mode.value}, coef={coef}, stage5_channels={stage5_channels}, "
+            f"mode={mode.value}, keyframes={keyframes}, coef={coef}, stage5_channels={stage5_channels}, "
             f"stage4_feature_bytes={s4_feat_bytes}, usable_bytes={usable}. "
-            "Reduce resolution or free GPU memory."
+            "Reduce resolution, reduce num_frames (stage-4 features and the per-chunk "
+            "encode buffers both scale with it), or free GPU memory."
         )
 
     scored.sort()
