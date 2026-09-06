@@ -27,6 +27,12 @@ class GemmaTextEncoder(torch.nn.Module):
         self.tokenizer = tokenizer
         self.processor = processor
         self._dtype = dtype
+        # The configurators build the inner model by calling its class rather than
+        # from_pretrained, which is what would otherwise have left it in eval mode, so it
+        # arrives with nn.Module's default training=True. Gemma3 reads that flag: in
+        # training mode its mask builder demands a token_type_ids that a text encoder has
+        # no reason to pass, and raises instead of encoding. Nothing here is ever trained.
+        self.eval()
 
     def encode(
         self,
