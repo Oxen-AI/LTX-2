@@ -117,9 +117,9 @@ class TrainingStrategy(ABC):
 
     def compute_loss_components(
         self,
-        video_pred: Tensor,
-        audio_pred: Tensor | None,
-        inputs: ModelInputs,
+        video_pred: Tensor,  # noqa: ARG002 - default hook; subclasses use these
+        audio_pred: Tensor | None,  # noqa: ARG002
+        inputs: ModelInputs,  # noqa: ARG002
     ) -> tuple[Tensor, Tensor] | None:
         """Optional per-modality loss breakdown for logging, [B,] each.
 
