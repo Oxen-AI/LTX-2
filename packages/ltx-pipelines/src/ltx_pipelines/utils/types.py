@@ -1,16 +1,47 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import torch
 
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.conditioning import ConditioningItem
 from ltx_core.model.transformer import X0Model
-from ltx_core.types import LatentState
+from ltx_core.model.video_vae import TilingConfig
+from ltx_core.model.video_vae.keyframes import DecodeKeyframes
+from ltx_core.types import Audio, LatentState
 from ltx_pipelines.utils.constants import VIDEO_LATENT_CHANNELS, VIDEO_SCALE_FACTORS
+
+
+class PipelineOutput(NamedTuple):
+    """Return type of every video pipeline ``__call__``.
+    A ``NamedTuple`` rather than a bare tuple so adding fields fails loudly at any
+    call site that unpacks a fixed arity. Prefer attribute access
+    (``result.video``, ``result.audio``, ...) over positional unpack.
+    Trailing extras are optional:
+    * ``keyframes`` -- filled only when the run produced generated slots already at
+      **final** output resolution. ``keyframes.pixel_frame_indices`` stay on that
+      pixel grid. Half-res stage-1 slots are not a substitute: if the pipeline never
+      upscaled them to the final canvas, this field is ``None``.
+    * ``video_latent`` -- the final video latent ``video`` was decoded from, when the
+      pipeline retains it for keyframe-aware re-decode. ``None`` when not retained.
+    """
+
+    video: Iterator[torch.Tensor]
+    audio: Audio
+    num_frames: int
+    tiling_config: TilingConfig | None
+    #: Generated keyframe slots already at **final** output resolution, with
+    #: ``pixel_frame_indices`` on that pixel grid. ``None`` when the run produced none, or
+    #: when slots exist only at a coarser scale the pipeline never upscaled.
+    keyframes: DecodeKeyframes | None
+    #: The final video latent ``video`` was decoded from, when retained. Re-decoding through
+    #: ``decode_video(keyframes=)`` needs this together with ``keyframes``; re-encoding decoded
+    #: pixels would not reproduce it. ``None`` when the pipeline does not keep the latent.
+    video_latent: torch.Tensor | None
 
 
 class PipelineComponents:
@@ -101,13 +132,29 @@ class ModalitySpec:
     Carries everything needed to build the initial noised latent state
     and run the denoising loop for a single modality (video or audio).
     Tools are created by ``DiffusionStage`` from pixel-space dimensions.
+    ``frozen=True`` zeros the denoise mask and marks the resulting ``LatentState``
+    so ``Modality.sigma`` is forced to 0 (not only per-token timesteps).
     """
 
-    context: torch.Tensor
+    context: torch.Tensor | None = None
     conditionings: list[ConditioningItem] = field(default_factory=list)
     noise_scale: float = 1.0
     frozen: bool = False
     initial_latent: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class AutoDuration:
+    """Request auto-predicted duration, clamped to ``[min_seconds, max_seconds]``.
+    The predicted duration is converted to a frame count snapped to the VAE's causal
+    temporal grid (``8k + 1``). Defaults: 1s and 20s.
+    """
+
+    min_seconds: float = 1.0
+    max_seconds: float = 20.0
+
+
+DEFAULT_AUTO_DURATION = AutoDuration()
 
 
 class OffloadMode(Enum):

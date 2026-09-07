@@ -1,5 +1,5 @@
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NamedTuple
 
 import torch
@@ -71,7 +71,26 @@ def _bf16_fuse(
 bf16_fuse_rule = FuseRule(aggregation_dtype=torch.bfloat16, fuse_fn=_bf16_fuse)
 
 
-def _get_device() -> torch.device:
+def device_fuse_rule(target_device: torch.device, base_rule: FuseRule) -> FuseRule:
+    """Return the fuse rule to use when fusing onto *target_device*.
+    On MPS, swap the rule's aggregation dtype to fp32: the LoRA ``B@A`` then runs
+    on the GPU (far faster than fusing on CPU) and fp32 sidesteps the bf16-on-MPS
+    numerical unreliability that would otherwise force the slow CPU path. The
+    rule's ``fuse_fn`` still casts the fused result back to the weight dtype.
+    CUDA/CPU keep *base_rule* unchanged.
+    """
+    if target_device.type == "mps":
+        return replace(base_rule, aggregation_dtype=torch.float32)
+    return base_rule
+
+
+def _fusion_device(target_device: torch.device) -> torch.device:
+    """Device to run the fusion on: the target's own accelerator (CUDA/MPS), else
+    CUDA when present (accelerating a CPU-resident fuse), else CPU. The caller
+    moves the fused result back to the weight's device afterwards.
+    """
+    if target_device.type in ("cuda", "mps"):
+        return target_device
     if torch.cuda.is_available():
         return torch.device("cuda", torch.cuda.current_device())
     return torch.device("cpu")
@@ -110,21 +129,22 @@ def fuse_lora_weights(
     used for fusion; caller is responsible for moving them to their final
     destination.
     """
-    fusion_device = _get_device()
+    rule = device_fuse_rule(model_sd.device, fuse_rule)
+    fusion_device = _fusion_device(model_sd.device)
     for key in _affected_weight_keys(lora_sd_and_strengths):
         original_weight = model_sd.sd.get(key)
         if original_weight is None:
             continue
 
-        products = _products_for_sd_key(lora_sd_and_strengths, key, fuse_rule.aggregation_dtype, fusion_device)
-        deltas = aggregate_lora_products(products, fuse_rule.aggregation_dtype)
+        products = _products_for_sd_key(lora_sd_and_strengths, key, rule.aggregation_dtype, fusion_device)
+        deltas = aggregate_lora_products(products, rule.aggregation_dtype)
         if deltas is None:
             continue
 
         original_device = original_weight.device
         weight = original_weight.to(device=fusion_device)
 
-        fused = fuse_rule(key, weight, deltas, model_sd)
+        fused = rule(key, weight, deltas, model_sd)
 
         for k, v in fused.items():
             yield k, v.to(device=original_device) if preserve_input_device else v
@@ -135,14 +155,19 @@ def apply_loras(
     lora_sd_and_strengths: list[LoraStateDictWithStrength],
     fuse_rule: FuseRule = bf16_fuse_rule,
     destination_sd: StateDict | None = None,
+    preserve_input_device: bool = True,
 ) -> StateDict:
     """Fuse LoRAs into ``model_sd`` and place the results in ``destination_sd``.
     When ``destination_sd`` is provided, the fused tensors are placed directly into it.
+    When omitted, a fresh SD is allocated; untouched keys may alias ``model_sd``.
+    Pass ``preserve_input_device=False`` to leave fused tensors on the fusion device (e.g. when
+    ``model_sd`` is a CPU-retained clean cache and the caller will H2D untouched keys later).
     """
     fused_iter = fuse_lora_weights(
         model_sd,
         lora_sd_and_strengths,
         fuse_rule=fuse_rule,
+        preserve_input_device=preserve_input_device,
     )
     if destination_sd is not None:
         for key, fused in fused_iter:
@@ -150,7 +175,8 @@ def apply_loras(
         return destination_sd
 
     fused = dict(fused_iter)
-    sd = {k: (fused[k] if k in fused else v.clone()) for k, v in model_sd.sd.items()}
+    # Untouched keys may alias ``model_sd`` (e.g. pinned retained cache); do not clone them.
+    sd = {k: fused.get(k, v) for k, v in model_sd.sd.items()}
     return StateDict(sd, model_sd.device, model_sd.size, model_sd.dtype)
 
 

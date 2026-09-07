@@ -8,14 +8,27 @@ primitives are required.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from functools import partial
 
 import torch
 
 from ltx_core.model.transformer.modality import Modality
-from ltx_core.tiling import Tile, TileCountConfig, create_tiles, identity_mapping_operation, split_by_count
+from ltx_core.tiling import (
+    DimensionTilingConfig,
+    SplitOperation,
+    Tile,
+    TileCountConfig,
+    create_tiles,
+    identity_mapping_operation,
+    split_at_seams,
+)
 from ltx_core.tools import VideoLatentTools
 from ltx_core.types import VideoLatentShape
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -35,12 +48,43 @@ class TilingContext:
     there are no conditioning tokens."""
 
 
+def seam_split(
+    seams: Sequence[int],
+    latent_frames: int,
+    frames: DimensionTilingConfig,
+) -> SplitOperation | None:
+    """A temporal split cut on ``seams``, or ``None`` when they cannot carry one.
+    ``seams`` are interior latent-frame indices supplied by the caller. A boundary there needs no
+    blending: the overlap is denoised for context and dropped (:func:`~ltx_core.tiling.split_at_seams`).
+    Leftover segments go to the leading tiles. Missing or non-interior seams fall back to the
+    requested overlap split, which blends.
+    """
+    if frames.num_tiles < 2:
+        return None
+    interior = sorted({cell for cell in seams if 0 < cell < latent_frames - 1})
+    if not interior:
+        if seams:
+            logger.info(
+                "Temporal tiling: seams %s are not interior to %d latent frames; keeping blended tiles",
+                list(seams),
+                latent_frames,
+            )
+        return None
+    boundaries = [0, *interior, latent_frames - 1]
+    logger.info("Temporal tiling: %d tiles cut on seams %s", frames.num_tiles, boundaries)
+    return split_at_seams(boundaries, frames.num_tiles, overlap=frames.overlap)
+
+
 class VideoModalityTilingHelper:
     """Stateless helper that tiles and blends video :class:`Modality` sequences.
     Constructed once with a :class:`TileCountConfig` and
     :class:`VideoLatentTools`.  Tiles are computed at construction and
     available via the :attr:`tiles` property.  Use :meth:`tile_modality`
     and :meth:`blend` with any tile from that list.
+    Passing ``seams`` (interior latent-frame indices) lets a temporal split land on those
+    cells instead of blended overlaps (:func:`seam_split`); leftover segments go to the
+    leading tiles. Missing or non-interior seams keep the blended split. A regular keyframe
+    belongs in that list only at strength 0; generated keyframe slots never do.
     Usage::
         helper = VideoModalityTilingHelper(tiling, video_tools)
         for tile in helper.tiles:
@@ -49,18 +93,24 @@ class VideoModalityTilingHelper:
             helper.blend(result, tile, ctx, output=output)
     """
 
-    def __init__(self, tiling: TileCountConfig, video_tools: VideoLatentTools) -> None:
+    def __init__(
+        self,
+        tiling: TileCountConfig,
+        video_tools: VideoLatentTools,
+        seams: Sequence[int] = (),
+    ) -> None:
         self._patchifier = video_tools.patchifier
         self._latent_shape = video_tools.target_shape
         self._num_generated_tokens = self._patchifier.get_token_count(self._latent_shape)
+        frames, height, width = tiling.to_splitters(video_tools.scale_factors, causal_temporal=False)
+        frames_mapper = identity_mapping_operation
+        seam_op = seam_split(seams, self._latent_shape.frames, tiling.frames)
+        if seam_op is not None:
+            frames, frames_mapper = seam_op, partial(identity_mapping_operation, rectangular=True)
         self._tiles = create_tiles(
             torch.Size([self._latent_shape.frames, self._latent_shape.height, self._latent_shape.width]),
-            splitters=[
-                split_by_count(tiling.frames.num_tiles, tiling.frames.overlap),
-                split_by_count(tiling.height.num_tiles, tiling.height.overlap),
-                split_by_count(tiling.width.num_tiles, tiling.width.overlap),
-            ],
-            mappers=[identity_mapping_operation] * 3,
+            splitters=[frames, height, width],
+            mappers=[frames_mapper, identity_mapping_operation, identity_mapping_operation],
         )
 
     @property
@@ -93,7 +143,7 @@ class VideoModalityTilingHelper:
             keep_per_tile_cond = self._all_tiles_cond_keep(modality)  # (num_tiles, num_cond) bool
             tile_idx = next((i for i, t in enumerate(self._tiles) if t.in_coords == tile.in_coords), None)
             if tile_idx is None:
-                raise ValueError(
+                raise RuntimeError(
                     f"Tile with in_coords={tile.in_coords} is not in this helper's tile set; "
                     f"pass a tile obtained from `helper.tiles`."
                 )
@@ -109,6 +159,13 @@ class VideoModalityTilingHelper:
         if modality.attention_mask is not None:
             tile_attention_mask = modality.attention_mask[:, keep_indices, :][:, :, keep_indices]
 
+        # Sliced, not recomputed: the marker must survive `normalize_positions`, which shifts every
+        # tile's generated tokens to start at zero and so destroys the "temporal start == 0" and
+        # "temporal extent == 1" signals the mask could otherwise be derived from.
+        tile_keyframes_mask = None
+        if modality.keyframes_mask is not None:
+            tile_keyframes_mask = modality.keyframes_mask[:, keep_indices]
+
         positions = modality.positions[:, :, keep_indices, :]
         if normalize_positions:
             num_tile_gen = self._tile_generated_token_count(tile)
@@ -122,6 +179,7 @@ class VideoModalityTilingHelper:
             timesteps=modality.timesteps[:, keep_indices],
             positions=positions,
             attention_mask=tile_attention_mask,
+            keyframes_mask=tile_keyframes_mask,
         )
 
         return tiled, TilingContext(
@@ -164,7 +222,7 @@ class VideoModalityTilingHelper:
 
         if output is not None:
             if output.shape != expected_shape:
-                raise ValueError(f"Expected output shape {expected_shape}, got {output.shape}")
+                raise RuntimeError(f"Expected output shape {expected_shape}, got {output.shape}")
             result = output
         else:
             result = torch.zeros(*expected_shape, device=tile_to_blend.device, dtype=tile_to_blend.dtype)

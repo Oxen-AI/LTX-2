@@ -12,10 +12,10 @@ ModelType = TypeVar("ModelType", covariant=True, bound=torch.nn.Module)  # noqa:
 
 
 class ModelConfigurator(Protocol[ModelType]):
-    """Protocol for model loader classes that instantiates models from a configuration dictionary."""
+    """Protocol for model loader classes that instantiates models from checkpoint metadata."""
 
     @classmethod
-    def from_config(cls, config: dict) -> ModelType: ...
+    def from_metadata(cls, metadata: dict) -> ModelType: ...
 
 
 class LTXModelProtocol(Protocol):
@@ -24,16 +24,21 @@ class LTXModelProtocol(Protocol):
     so protocol-typed values stay callable via ``model(...)``.
     """
 
+    @property
+    def num_blocks(self) -> int:
+        """Number of transformer blocks, delegated through any wrappers to the ``LTXModel``."""
+        ...
+
     def forward(
         self,
         video: Modality | None,
         audio: Modality | None,
-        perturbations: BatchedPerturbationConfig,
+        perturbations: BatchedPerturbationConfig | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]: ...
 
     def __call__(
         self,
         video: Modality | None,
         audio: Modality | None,
-        perturbations: BatchedPerturbationConfig,
+        perturbations: BatchedPerturbationConfig | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]: ...
