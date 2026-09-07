@@ -38,10 +38,10 @@ class SafetensorsStateDictLoader(StateDictLoader):
                 expected_name = name if sd_ops is None else sd_ops.apply_to_key(name)
                 if expected_name is None:
                     continue
-                tensor = tensor.to(device=device, non_blocking=True)
-                key_value_pairs = ((expected_name, tensor),)
+                moved = tensor.to(device=device, non_blocking=True)
+                key_value_pairs = ((expected_name, moved),)
                 if sd_ops is not None:
-                    key_value_pairs = sd_ops.apply_to_key_value(expected_name, tensor)
+                    key_value_pairs = sd_ops.apply_to_key_value(expected_name, moved)
                 for key, value in key_value_pairs:
                     size += value.nbytes
                     dtype.add(value.dtype)
