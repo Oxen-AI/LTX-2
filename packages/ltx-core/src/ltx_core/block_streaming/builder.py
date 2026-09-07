@@ -17,6 +17,7 @@ from ltx_core.block_streaming.disk import DiskBlockReader, DiskTensorReader, Lor
 from ltx_core.block_streaming.pool import BufferPool
 from ltx_core.block_streaming.provider import WeightsProvider
 from ltx_core.block_streaming.source import DiskWeightSource, PinnedBlock, PinnedWeightSource, WeightSource
+from ltx_core.block_streaming.stream_sync import create_stream_sync
 from ltx_core.block_streaming.utils import (
     carve_buffer,
     derive_layout,
@@ -25,8 +26,9 @@ from ltx_core.block_streaming.utils import (
     resolve_attr,
 )
 from ltx_core.block_streaming.wrapper import BlockStreamingWrapper
+from ltx_core.devices import synchronize_device
 from ltx_core.loader.fuse_loras import FuseRule, bf16_fuse_rule, fuse_lora_weights
-from ltx_core.loader.helpers import create_meta_model, load_state_dict, read_model_config
+from ltx_core.loader.helpers import create_meta_model, load_state_dict, read_model_config, read_model_metadata
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import (
     LoraPathStrengthAndSDOps,
@@ -36,7 +38,7 @@ from ltx_core.loader.primitives import (
     StateDictLoader,
     TensorLayout,
 )
-from ltx_core.loader.registry import DummyRegistry, Registry
+from ltx_core.loader.registry import ModelRegistry, Registry
 from ltx_core.loader.sd_ops import SDOps
 from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 from ltx_core.model.model_protocol import ModelConfigurator, ModelType
@@ -72,9 +74,14 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             ``"transformer_blocks"``).
         blocks_prefix: State-dict key prefix for block weights
             (e.g. ``"transformer_blocks"``).
+        cpu_slots_count: Default number of pinned CPU buffer slots used by
+            :meth:`build` when it is not given an explicit ``cpu_slots_count``.
+            ``None`` = RAM streaming (all blocks pinned); a small value (e.g.
+            ``DISK_CPU_SLOTS``) selects disk streaming. Lets a builder fully
+            encode its offload behaviour so callers need not re-specify it.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         model_class_configurator: type[ModelConfigurator[ModelType]],
         model_path: str | tuple[str, ...],
@@ -86,6 +93,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         fuse_rule: FuseRule = bf16_fuse_rule,
         blocks_attr: str = "",
         blocks_prefix: str = "",
+        cpu_slots_count: int | None = None,
     ) -> None:
         # Read-only: typed with the covariant ModelType, so it must not be a mutable attribute.
         self._model_class_configurator: Final = model_class_configurator
@@ -94,10 +102,11 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         self._module_ops = module_ops
         self._loras = loras
         self._model_loader = model_loader if model_loader is not None else SafetensorsModelStateDictLoader()
-        self._registry = registry if registry is not None else DummyRegistry()
+        self._registry = registry if registry is not None else ModelRegistry(cache_models=True, cache_weights=False)
         self._fuse_rule = fuse_rule
         self._blocks_attr = blocks_attr
         self._blocks_prefix = blocks_prefix
+        self._cpu_slots_count = cpu_slots_count
 
     @property
     def model_class_configurator(self) -> type[ModelConfigurator[ModelType]]:
@@ -105,6 +114,10 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
 
     @property
     def model_path(self) -> str | tuple[str, ...]:
+        return self._model_path
+
+    @property
+    def checkpoint(self) -> str | tuple[str, ...]:
         return self._model_path
 
     @property
@@ -139,6 +152,15 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
     def blocks_prefix(self) -> str:
         return self._blocks_prefix
 
+    @property
+    def cpu_slots_count(self) -> int | None:
+        return self._cpu_slots_count
+
+    @property
+    def keeps_gpu_resident_weights(self) -> bool:
+        # Block weights live in fixed GPU/CPU slots that are reused across builds.
+        return True
+
     def with_sd_ops(self, sd_ops: SDOps | None) -> Self:
         clone = copy.copy(self)
         clone._model_sd_ops = sd_ops
@@ -172,9 +194,13 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         """Read model configuration from the checkpoint metadata."""
         return read_model_config(self.model_path, self.model_loader)
 
-    def meta_model(self, config: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:
+    def model_metadata(self) -> dict:
+        """Read the full checkpoint metadata (including sibling keys beyond ``config``)."""
+        return read_model_metadata(self.model_path, self.model_loader)
+
+    def meta_model(self, metadata: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:
         """Create a model on the meta device and apply module operations."""
-        return create_meta_model(self.model_class_configurator, config, module_ops)
+        return create_meta_model(self.model_class_configurator, metadata, module_ops)
 
     def build(
         self,
@@ -188,8 +214,10 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         Args:
             device: GPU device for compute. ``None`` defaults to ``cuda``.
             dtype: Weight dtype (e.g. ``torch.bfloat16``). Required.
-            cpu_slots_count: Number of pinned CPU buffer slots.
-                ``None`` = RAM streaming (all blocks pre-loaded with LoRA fusion).
+            cpu_slots_count: Number of pinned CPU buffer slots. ``None`` falls
+                back to the builder's configured ``cpu_slots_count``, and if that
+                is also ``None``, to RAM streaming (all blocks pre-loaded with
+                LoRA fusion).
             gpu_slots_count: Number of GPU buffer slots.
                 ``None`` = ``_DEFAULT_GPU_SLOTS`` (2).
         """
@@ -199,8 +227,8 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             raise ValueError("StreamingModelBuilder.build requires an explicit dtype")
         device = device if device is not None else torch.device("cuda")
 
-        config = read_model_config(self.model_path, self.model_loader)
-        meta_model: nn.Module = create_meta_model(self.model_class_configurator, config, self.module_ops)
+        metadata = self.model_metadata()
+        meta_model: nn.Module = create_meta_model(self.model_class_configurator, metadata, self.module_ops)
         meta_model.eval()
 
         blocks = resolve_attr(meta_model, self.blocks_attr)
@@ -216,6 +244,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
                 f"missing indices {missing}, unexpected indices {extra}"
             )
 
+        cpu_slots_count = cpu_slots_count if cpu_slots_count is not None else self._cpu_slots_count
         cpu_slots_count = cpu_slots_count if cpu_slots_count is not None else len(blocks)
         gpu_slots_count = gpu_slots_count if gpu_slots_count is not None else _DEFAULT_GPU_SLOTS
 
@@ -234,16 +263,11 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
 
         self._load_non_block_weights(meta_model, non_block_keys, device, dtype, non_block_loras)
 
-        copy_stream = torch.cuda.Stream(device=device)
-        gpu_pool = BufferPool(
-            source.slot_nbytes,
-            gpu_slots_count,
-            device,
-            reuse_barrier=lambda event: copy_stream.wait_event(event),
-        )
+        sync = create_stream_sync(device)
+        gpu_pool = BufferPool(source.slot_nbytes, gpu_slots_count, device, reuse_barrier=sync.reuse_barrier)
         provider = WeightsProvider(
             gpu_pool,
-            copy_stream,
+            sync,
             device,
             source,
             lora_sources,
@@ -327,7 +351,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             block_sd.sd[key] = None
             should_sync = True
         if should_sync:
-            torch.cuda.synchronize()
+            synchronize_device()
 
         # Fill remaining pinned keys from the source state dict.
         for key, view in fill_views.items():

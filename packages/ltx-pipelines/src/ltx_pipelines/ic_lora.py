@@ -1,16 +1,17 @@
 import logging
-from collections.abc import Iterator
 
 import torch
 
+from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.conditioning import ConditioningItem
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
 from ltx_core.model.transformer.compiling import CompilationConfig
-from ltx_core.model.video_vae import TilingConfig, VideoEncoder, get_video_chunks_number
+from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, VideoEncoder, get_video_chunks_number
+from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.types import Audio, VideoPixelShape
+from ltx_core.types import VideoPixelShape
 from ltx_pipelines.iclora_utils import (
     append_ic_lora_reference_video_conditionings,
     read_lora_reference_downscale_factor,
@@ -21,7 +22,7 @@ from ltx_pipelines.utils.args import (
     VideoConditioningAction,
     VideoMaskConditioningAction,
     default_2_stage_distilled_arg_parser,
-    detect_checkpoint_path,
+    resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
     AudioDecoder,
@@ -34,12 +35,25 @@ from ltx_pipelines.utils.blocks import (
 from ltx_pipelines.utils.constants import (
     DISTILLED_SIGMAS,
     STAGE_2_DISTILLED_SIGMAS,
-    detect_params,
 )
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
-from ltx_pipelines.utils.helpers import assert_resolution, combined_image_conditionings, get_device
-from ltx_pipelines.utils.media_io import decode_video_by_frame, encode_video, video_preprocess
-from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
+from ltx_pipelines.utils.helpers import (
+    assert_resolution,
+    combined_image_conditionings,
+    ensure_tiling_config,
+    get_device,
+    tiling_scale_factors_for_vae,
+)
+from ltx_pipelines.utils.media_io import (
+    HDRColorSpace,
+    decode_video_by_frame,
+    encode_video,
+    resolve_hdr_color_space,
+    vae_dtype_for_hdr,
+    video_preprocess,
+)
+from ltx_pipelines.utils.model_paths import ModelPaths
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, PipelineOutput
 
 
 class ICLoraPipeline:
@@ -53,32 +67,41 @@ class ICLoraPipeline:
     Both stages use distilled models for efficiency.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
-        distilled_checkpoint_path: str,
+        model_paths: ModelPaths,
         spatial_upsampler_path: str,
-        gemma_root: str,
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
-    ):
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
+        prompt_enhancer_gemma_root: str | None = None,
+        diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
+    ) -> None:
         self.device = device or get_device()
         self.dtype = torch.bfloat16
 
         self.prompt_encoder = PromptEncoder(
-            distilled_checkpoint_path,
-            gemma_root,
+            model_paths,
             self.dtype,
             self.device,
             registry=registry,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
+            prompt_enhancer_gemma_root=prompt_enhancer_gemma_root,
         )
-        self.image_conditioner = ImageConditioner(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
-        self.stage_1 = DiffusionStage(
-            distilled_checkpoint_path,
+        self.image_conditioner = ImageConditioner(
+            model_paths.video_vae(),
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
+        self.stage_1 = DiffusionStage.from_checkpoint(
+            model_paths.transformer(),
             self.dtype,
             self.device,
             loras=tuple(loras),
@@ -86,9 +109,10 @@ class ICLoraPipeline:
             registry=registry,
             compilation_config=compilation_config,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.stage_2 = DiffusionStage(
-            distilled_checkpoint_path,
+        self.stage_2 = DiffusionStage.from_checkpoint(
+            model_paths.transformer(),
             self.dtype,
             self.device,
             loras=(),
@@ -96,12 +120,31 @@ class ICLoraPipeline:
             registry=registry,
             compilation_config=compilation_config,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         self.upsampler = VideoUpsampler(
-            distilled_checkpoint_path, spatial_upsampler_path, self.dtype, self.device, registry=registry
+            model_paths.video_vae(),
+            spatial_upsampler_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.video_decoder = VideoDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
-        self.audio_decoder = AudioDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
+        self.video_decoder = VideoDecoder(
+            model_paths.video_vae(),
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+            diffvae_optimization=diffvae_optimization,
+        )
+        self.audio_decoder = AudioDecoder(
+            model_paths.audio_vae(),
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
 
         # Read reference scale factors from LoRA metadata.
         # IC-LoRAs trained with scaled reference videos store these factors
@@ -139,13 +182,16 @@ class ICLoraPipeline:
         images: list[ImageConditioningInput],
         video_conditioning: list[tuple[str, float]],
         enhance_prompt: bool = False,
-        tiling_config: TilingConfig | None = None,
+        enhance_static_cache: bool = False,
+        vae_dtype: torch.dtype | None = None,
+        tiling_config: TilingConfig | AutoTiling | None = AUTO_TILING,
         conditioning_attention_strength: float = 1.0,
         skip_stage_2: bool = False,
         conditioning_attention_mask: torch.Tensor | None = None,
         stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
-    ) -> tuple[Iterator[torch.Tensor], Audio]:
+        color_space: HDRColorSpace | None = None,
+    ) -> PipelineOutput:
         """
         Generate video with IC-LoRA conditioning.
         Args:
@@ -176,8 +222,9 @@ class ICLoraPipeline:
                 When None (default): scalar conditioning_attention_strength is used
                 directly.
         Returns:
-            Tuple of (video_iterator, audio_tensor).
+            PipelineOutput with decoded video and audio. ``keyframes`` is ``None``.
         """
+        images = self.image_conditioner.resolve_crf(images)
         assert_resolution(height=height, width=width, is_two_stage=True)
         if not (0.0 <= conditioning_attention_strength <= 1.0):
             raise ValueError(
@@ -186,14 +233,26 @@ class ICLoraPipeline:
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
+        if vae_dtype is None:
+            vae_dtype = self.dtype
 
         (ctx_p,) = self.prompt_encoder(
             [prompt],
             enhance_first_prompt=enhance_prompt,
+            enhance_static_cache=enhance_static_cache,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
-            enhance_prompt_seed=seed,
         )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
+
+        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
+        tiling_config = ensure_tiling_config(
+            tiling_config,
+            scale_factors=scale_factors,
+            vae_checkpoint_path=self.video_decoder.checkpoint_path,
+            video_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate),
+            diffvae_optimization=self.video_decoder.diffvae_optimization,
+            device=self.device,
+        )
 
         # Stage 1: Initial low resolution video generation.
         stage_1_output_shape = VideoPixelShape(
@@ -215,6 +274,7 @@ class ICLoraPipeline:
                 num_frames=num_frames,
                 conditioning_attention_strength=conditioning_attention_strength,
                 conditioning_attention_mask=conditioning_attention_mask,
+                color_space=color_space,
             )
         )
 
@@ -240,9 +300,9 @@ class ICLoraPipeline:
         if skip_stage_2:
             # Skip Stage 2: Decode directly from Stage 1 output at half resolution
             logging.info("[IC-LoRA] Skipping Stage 2 (--skip-stage-2 enabled)")
-            decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
+            decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
             decoded_audio = self.audio_decoder(audio_state.latent)
-            return decoded_video, decoded_audio
+            return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config, None, video_state.latent)
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
         upscaled_video_latent = self.upsampler(video_state.latent[:1])
@@ -257,6 +317,7 @@ class ICLoraPipeline:
                 video_encoder=enc,
                 dtype=self.dtype,
                 device=self.device,
+                color_space=color_space,
             )
         )
 
@@ -281,9 +342,9 @@ class ICLoraPipeline:
             ),
         )
 
-        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
+        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
         decoded_audio = self.audio_decoder(audio_state.latent)
-        return decoded_video, decoded_audio
+        return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config, None, video_state.latent)
 
     def _create_conditionings(
         self,
@@ -295,6 +356,7 @@ class ICLoraPipeline:
         video_encoder: VideoEncoder,
         conditioning_attention_strength: float = 1.0,
         conditioning_attention_mask: torch.Tensor | None = None,
+        color_space: HDRColorSpace | None = None,
     ) -> list[ConditioningItem]:
         """
         Create conditioning items for video generation.
@@ -317,6 +379,7 @@ class ICLoraPipeline:
             video_encoder=video_encoder,
             dtype=self.dtype,
             device=self.device,
+            color_space=color_space,
         )
 
         append_ic_lora_reference_video_conditionings(
@@ -333,6 +396,7 @@ class ICLoraPipeline:
             conditioning_attention_strength=conditioning_attention_strength,
             conditioning_attention_mask=conditioning_attention_mask,
             tiling_config=None,
+            color_space=color_space,
         )
 
         if video_conditioning:
@@ -344,8 +408,7 @@ class ICLoraPipeline:
 @torch.inference_mode()
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    checkpoint_path = detect_checkpoint_path(distilled=True)
-    params = detect_params(checkpoint_path)
+    params = resolve_cli_params(distilled=True)
     parser = default_2_stage_distilled_arg_parser(params=params)
     parser.add_argument(
         "--video-conditioning",
@@ -353,6 +416,10 @@ def main() -> None:
         nargs=2,
         metavar=("PATH", "STRENGTH"),
         required=True,
+        help=(
+            "IC-LoRA reference: video file (SDR) or directory of scene-linear *.exr frames (HDR), "
+            "plus strength. Example: --video-conditioning ref.mp4 1.0  or  --video-conditioning exr_dir/ 1.0"
+        ),
     )
     parser.add_argument(
         "--conditioning-attention-mask",
@@ -394,17 +461,22 @@ def main() -> None:
         )
 
     pipeline = ICLoraPipeline(
-        distilled_checkpoint_path=args.distilled_checkpoint_path,
+        model_paths=args.model_paths,
         spatial_upsampler_path=args.spatial_upsampler_path,
-        gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
         compilation_config=args.compile,
         offload_mode=args.offload_mode,
+        prompt_enhancer_gemma_root=args.prompt_enhancer_gemma_root,
+        diffvae_optimization=args.diffvae_optimization,
     )
-    tiling_config = TilingConfig.default()
-    video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
-    video, audio = pipeline(
+    hdr = resolve_hdr_color_space(
+        images=args.images,
+        video_paths=[path for path, _ in args.video_conditioning],
+        hdr=args.hdr,
+    )
+    vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
+    result = pipeline(
         prompt=args.prompt,
         seed=args.seed,
         height=args.height,
@@ -413,18 +485,22 @@ def main() -> None:
         frame_rate=args.frame_rate,
         images=args.images,
         video_conditioning=args.video_conditioning,
-        tiling_config=tiling_config,
+        enhance_prompt=args.enhance_prompt,
+        enhance_static_cache=args.enhance_static_cache,
+        vae_dtype=vae_dtype,
+        color_space=hdr,
+        tiling_config=AUTO_TILING,
         conditioning_attention_strength=conditioning_attention_strength,
         skip_stage_2=args.skip_stage_2,
         conditioning_attention_mask=conditioning_attention_mask,
     )
-
     encode_video(
-        video=video,
+        video=result.video,
         fps=args.frame_rate,
-        audio=audio,
+        audio=result.audio,
         output_path=args.output_path,
-        video_chunks_number=video_chunks_number,
+        video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
+        color_space=hdr,
     )
 
 
