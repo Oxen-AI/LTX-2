@@ -1,29 +1,13 @@
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 import torch
 
 from ltx_core.model.transformer.adaln import adaln_embedding_coefficient
-from ltx_core.model.transformer.attention import (
-    Attention,
-    AttentionCallable,
-    AttentionFunction,
-    AttentionOps,
-    MaskedAttentionCallable,
-    MaskedAttentionFunction,
-)
+from ltx_core.model.transformer.attention import Attention, AttentionCallable, AttentionOps
 from ltx_core.model.transformer.feed_forward import FeedForward
-from ltx_core.model.transformer.ops import (
-    AdaZeroCallable,
-    GatedAttentionCallable,
-    PostSACallable,
-    PreAttentionCallable,
-    PytorchAdaZeroFunction,
-    PytorchGatedAttention,
-    PytorchPostSAFunction,
-    PytorchPreAttention,
-)
 from ltx_core.model.transformer.rope import LTXRopeType
-from ltx_core.model.transformer.transformer_args import TransformerArgs
+from ltx_core.model.transformer.transformer_args import AdaLNTimestepEmbedding, TransformerArgs
+from ltx_core.utils import rms_norm
 
 
 @dataclass
@@ -37,53 +21,6 @@ class TransformerConfig:
     ff_bias: bool = True
 
 
-@dataclass(frozen=True)
-class TransformerOpsConfig:
-    """Pluggable ops for :class:`BasicAVTransformerBlock`.
-    Use :meth:`from_functions` to construct from enum values or partial overrides
-    without spelling out a full :class:`AttentionOps`.
-    """
-
-    attention_ops: AttentionOps = field(default_factory=AttentionOps)
-    ada_zero_function: AdaZeroCallable = field(default_factory=PytorchAdaZeroFunction)
-    post_sa_function: PostSACallable = field(default_factory=PytorchPostSAFunction)
-
-    @classmethod
-    def from_functions(
-        cls,
-        attention: AttentionFunction | AttentionCallable = AttentionFunction.AUTOMATIC,
-        masked_attention: MaskedAttentionFunction | MaskedAttentionCallable = MaskedAttentionFunction.AUTOMATIC,
-        preattention: PreAttentionCallable | None = None,
-        gated_attention: GatedAttentionCallable | None = None,
-        ada_zero: AdaZeroCallable | None = None,
-        post_sa: PostSACallable | None = None,
-    ) -> "TransformerOpsConfig":
-        """Build a config from individual functions or enums. Each *None* slot
-        falls back to the standard PyTorch implementation."""
-        attention_callable = attention.to_callable() if isinstance(attention, AttentionFunction) else attention
-        masked_callable = (
-            masked_attention.to_callable()
-            if isinstance(masked_attention, MaskedAttentionFunction)
-            else masked_attention
-        )
-        attention_ops = AttentionOps(
-            attention_function=attention_callable,
-            masked_attention_function=masked_callable,
-            preattention_function=preattention if preattention is not None else PytorchPreAttention(),
-            gated_attention_function=(gated_attention if gated_attention is not None else PytorchGatedAttention()),
-        )
-        return cls(
-            attention_ops=attention_ops,
-            ada_zero_function=ada_zero if ada_zero is not None else PytorchAdaZeroFunction(),
-            post_sa_function=post_sa if post_sa is not None else PytorchPostSAFunction(),
-        )
-
-
-# Frozen, so safe to share as a default argument across callers that want the
-# stock PyTorch ops without explicit construction.
-DEFAULT_TRANSFORMER_OPS = TransformerOpsConfig()
-
-
 class BasicAVTransformerBlock(torch.nn.Module):
     def __init__(
         self,
@@ -91,14 +28,12 @@ class BasicAVTransformerBlock(torch.nn.Module):
         audio: TransformerConfig | None = None,
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
         norm_eps: float = 1e-6,
-        ops: TransformerOpsConfig | None = None,
+        attention_ops: AttentionOps | None = None,
     ):
         super().__init__()
 
-        if ops is None:
-            ops = TransformerOpsConfig()
-        self.ada_zero_function = ops.ada_zero_function
-        self.post_sa_function = ops.post_sa_function
+        if attention_ops is None:
+            attention_ops = AttentionOps()
         if video is not None:
             self.attn1 = Attention(
                 query_dim=video.dim,
@@ -107,7 +42,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 context_dim=None,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
-                ops=ops.attention_ops,
+                ops=attention_ops,
                 apply_gated_attention=video.apply_gated_attention,
             )
             self.attn2 = Attention(
@@ -117,7 +52,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 dim_head=video.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
-                ops=ops.attention_ops,
+                ops=attention_ops,
                 apply_gated_attention=video.apply_gated_attention,
             )
             self.ff = FeedForward(video.dim, dim_out=video.dim, bias=video.ff_bias)
@@ -132,7 +67,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 context_dim=None,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
-                ops=ops.attention_ops,
+                ops=attention_ops,
                 apply_gated_attention=audio.apply_gated_attention,
             )
             self.audio_attn2 = Attention(
@@ -142,7 +77,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 dim_head=audio.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
-                ops=ops.attention_ops,
+                ops=attention_ops,
                 apply_gated_attention=audio.apply_gated_attention,
             )
             self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim, bias=audio.ff_bias)
@@ -158,7 +93,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 dim_head=audio.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
-                ops=ops.attention_ops,
+                ops=attention_ops,
                 apply_gated_attention=video.apply_gated_attention,
             )
 
@@ -170,7 +105,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 dim_head=audio.d_head,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
-                ops=ops.attention_ops,
+                ops=attention_ops,
                 apply_gated_attention=audio.apply_gated_attention,
             )
 
@@ -189,31 +124,45 @@ class BasicAVTransformerBlock(torch.nn.Module):
         self.norm_eps = norm_eps
 
     def get_ada_values(
-        self, scale_shift_table: torch.Tensor, batch_size: int, timestep: torch.Tensor, indices: slice
+        self,
+        scale_shift_table: torch.Tensor,
+        batch_size: int,
+        timestep_embedding: AdaLNTimestepEmbedding,
+        indices: slice,
+        modulation: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         num_ada_params = scale_shift_table.shape[0]
-
-        ada_values = (
-            scale_shift_table[indices].unsqueeze(0).unsqueeze(0).to(device=timestep.device, dtype=timestep.dtype)
-            + timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[:, :, indices, :]
+        hidden_dim = scale_shift_table.shape[1]
+        modulation = timestep_embedding.modulation if modulation is None else modulation
+        modulation = modulation.reshape(batch_size, -1, num_ada_params, hidden_dim)[:, :, indices, :]
+        modulation = timestep_embedding.gather(modulation)
+        return (
+            scale_shift_table[indices].unsqueeze(0).unsqueeze(0).to(device=modulation.device, dtype=modulation.dtype)
+            + modulation
         ).unbind(dim=2)
-        return ada_values
 
     def get_av_ca_ada_values(
         self,
         scale_shift_table: torch.Tensor,
         batch_size: int,
+        timestep_embedding: AdaLNTimestepEmbedding,
         scale_shift_timestep: torch.Tensor,
         gate_timestep: torch.Tensor,
         scale_shift_indices: slice,
         num_scale_shift_values: int = 4,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         scale_shift_ada_values = self.get_ada_values(
-            scale_shift_table[:num_scale_shift_values, :], batch_size, scale_shift_timestep, scale_shift_indices
+            scale_shift_table[:num_scale_shift_values, :],
+            batch_size,
+            timestep_embedding,
+            scale_shift_indices,
+            scale_shift_timestep,
         )
-        gate_ada_values = self.get_ada_values(
-            scale_shift_table[num_scale_shift_values:, :], batch_size, gate_timestep, slice(None, None)
+        gate_table = scale_shift_table[num_scale_shift_values:, :].to(
+            device=gate_timestep.device, dtype=gate_timestep.dtype
         )
+        gate_modulation = gate_timestep.reshape(batch_size, -1, 1, gate_table.shape[-1])
+        gate_ada_values = (gate_table[None, None] + gate_modulation).unbind(dim=2)
 
         scale, shift = (t.squeeze(2) for t in scale_shift_ada_values)
         (gate,) = (t.squeeze(2) for t in gate_ada_values)
@@ -227,17 +176,20 @@ class BasicAVTransformerBlock(torch.nn.Module):
         attn: AttentionCallable,
         scale_shift_table: torch.Tensor,
         prompt_scale_shift_table: torch.Tensor | None,
-        timestep: torch.Tensor,
+        timestep_embedding: AdaLNTimestepEmbedding,
         prompt_timestep: torch.Tensor | None,
         context_mask: torch.Tensor | None,
         cross_attention_adaln: bool = False,
     ) -> torch.Tensor:
         """Apply text cross-attention, with optional AdaLN modulation.
-        ``x_normed`` is the RMS-normalized self-attention output produced by
-        ``post_sa_function`` -- this method does not normalize again.
+        ``x_normed`` is the RMS-normalized post-self-attention output (produced by
+        the PostSA composite); this method does not normalize again.
         """
         if cross_attention_adaln:
-            shift_q, scale_q, gate = self.get_ada_values(scale_shift_table, x_normed.shape[0], timestep, slice(6, 9))
+            shift_q, scale_q = self.get_ada_values(
+                scale_shift_table, x_normed.shape[0], timestep_embedding, slice(6, 8)
+            )
+            (gate,) = self.get_ada_values(scale_shift_table, x_normed.shape[0], timestep_embedding, slice(8, 9))
             return apply_cross_attention_adaln(
                 x_normed,
                 context,
@@ -270,9 +222,9 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         if run_vx:
             vshift_msa, vscale_msa, vgate_msa = self.get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3)
+                self.scale_shift_table, vx.shape[0], video.timestep_embedding, slice(0, 3)
             )
-            norm_vx = self.ada_zero_function(vx, self.norm_eps, vscale_msa, vshift_msa)
+            norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_msa) + vshift_msa
             del vshift_msa, vscale_msa
 
             vx_msa_out = self.attn1(
@@ -282,7 +234,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 perturbation_mask=video.self_attn_perturbation_mask,
                 all_perturbed=video.self_attn_all_perturbed,
             )
-            vx, vx_normed = self.post_sa_function(vx, vx_msa_out, None, self.norm_eps, vgate_msa)
+            vx = vx + vx_msa_out * vgate_msa
+            vx_normed = rms_norm(vx, eps=self.norm_eps)
             del vgate_msa, norm_vx, vx_msa_out
             vx = vx + self._apply_text_cross_attention(
                 vx_normed,
@@ -290,7 +243,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 self.attn2,
                 self.scale_shift_table,
                 getattr(self, "prompt_scale_shift_table", None),
-                video.timesteps,
+                video.timestep_embedding,
                 video.prompt_timestep,
                 video.context_mask,
                 cross_attention_adaln=self.cross_attention_adaln,
@@ -299,10 +252,10 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         if run_ax:
             ashift_msa, ascale_msa, agate_msa = self.get_ada_values(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(0, 3)
+                self.audio_scale_shift_table, ax.shape[0], audio.timestep_embedding, slice(0, 3)
             )
 
-            norm_ax = self.ada_zero_function(ax, self.norm_eps, ascale_msa, ashift_msa)
+            norm_ax = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_msa) + ashift_msa
             del ashift_msa, ascale_msa
             ax_msa_out = self.audio_attn1(
                 norm_ax,
@@ -311,7 +264,8 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 perturbation_mask=audio.self_attn_perturbation_mask,
                 all_perturbed=audio.self_attn_all_perturbed,
             )
-            ax, ax_normed = self.post_sa_function(ax, ax_msa_out, None, self.norm_eps, agate_msa)
+            ax = ax + ax_msa_out * agate_msa
+            ax_normed = rms_norm(ax, eps=self.norm_eps)
             del agate_msa, norm_ax, ax_msa_out
             ax = ax + self._apply_text_cross_attention(
                 ax_normed,
@@ -319,7 +273,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 self.audio_attn2,
                 self.audio_scale_shift_table,
                 getattr(self, "audio_prompt_scale_shift_table", None),
-                audio.timesteps,
+                audio.timestep_embedding,
                 audio.prompt_timestep,
                 audio.context_mask,
                 cross_attention_adaln=self.cross_attention_adaln,
@@ -336,21 +290,23 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 scale_ca_video_a2v, shift_ca_video_a2v, gate_out_a2v = self.get_av_ca_ada_values(
                     self.scale_shift_table_a2v_ca_video,
                     vx.shape[0],
+                    video.timestep_embedding,
                     video.cross_scale_shift_timestep,
                     video.cross_gate_timestep,
                     slice(0, 2),
                 )
-                a2v_vx_scaled = self.ada_zero_function(vx_pre_av, self.norm_eps, scale_ca_video_a2v, shift_ca_video_a2v)
+                a2v_vx_scaled = rms_norm(vx_pre_av, eps=self.norm_eps) * (1 + scale_ca_video_a2v) + shift_ca_video_a2v
                 del scale_ca_video_a2v, shift_ca_video_a2v
 
                 scale_ca_audio_a2v, shift_ca_audio_a2v, _ = self.get_av_ca_ada_values(
                     self.scale_shift_table_a2v_ca_audio,
                     ax.shape[0],
+                    audio.timestep_embedding,
                     audio.cross_scale_shift_timestep,
                     audio.cross_gate_timestep,
                     slice(0, 2),
                 )
-                a2v_ax_scaled = self.ada_zero_function(ax_pre_av, self.norm_eps, scale_ca_audio_a2v, shift_ca_audio_a2v)
+                a2v_ax_scaled = rms_norm(ax_pre_av, eps=self.norm_eps) * (1 + scale_ca_audio_a2v) + shift_ca_audio_a2v
                 del scale_ca_audio_a2v, shift_ca_audio_a2v
                 vx = vx + (
                     self.audio_to_video_attn(
@@ -368,20 +324,22 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 scale_ca_audio_v2a, shift_ca_audio_v2a, gate_out_v2a = self.get_av_ca_ada_values(
                     self.scale_shift_table_a2v_ca_audio,
                     ax.shape[0],
+                    audio.timestep_embedding,
                     audio.cross_scale_shift_timestep,
                     audio.cross_gate_timestep,
                     slice(2, 4),
                 )
-                v2a_ax_scaled = self.ada_zero_function(ax_pre_av, self.norm_eps, scale_ca_audio_v2a, shift_ca_audio_v2a)
+                v2a_ax_scaled = rms_norm(ax_pre_av, eps=self.norm_eps) * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
                 del scale_ca_audio_v2a, shift_ca_audio_v2a
                 scale_ca_video_v2a, shift_ca_video_v2a, _ = self.get_av_ca_ada_values(
                     self.scale_shift_table_a2v_ca_video,
                     vx.shape[0],
+                    video.timestep_embedding,
                     video.cross_scale_shift_timestep,
                     video.cross_gate_timestep,
                     slice(2, 4),
                 )
-                v2a_vx_scaled = self.ada_zero_function(vx_pre_av, self.norm_eps, scale_ca_video_v2a, shift_ca_video_v2a)
+                v2a_vx_scaled = rms_norm(vx_pre_av, eps=self.norm_eps) * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
                 del scale_ca_video_v2a, shift_ca_video_v2a
                 ax = ax + (
                     self.video_to_audio_attn(
@@ -398,18 +356,18 @@ class BasicAVTransformerBlock(torch.nn.Module):
 
         if run_vx:
             vshift_mlp, vscale_mlp, vgate_mlp = self.get_ada_values(
-                self.scale_shift_table, vx.shape[0], video.timesteps, slice(3, 6)
+                self.scale_shift_table, vx.shape[0], video.timestep_embedding, slice(3, 6)
             )
-            vx_scaled = self.ada_zero_function(vx, self.norm_eps, vscale_mlp, vshift_mlp)
+            vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + vscale_mlp) + vshift_mlp
             vx = vx + self.ff(vx_scaled) * vgate_mlp
 
             del vshift_mlp, vscale_mlp, vgate_mlp, vx_scaled
 
         if run_ax:
             ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
-                self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(3, 6)
+                self.audio_scale_shift_table, ax.shape[0], audio.timestep_embedding, slice(3, 6)
             )
-            ax_scaled = self.ada_zero_function(ax, self.norm_eps, ascale_mlp, ashift_mlp)
+            ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
             ax = ax + self.audio_ff(ax_scaled) * agate_mlp
 
             del ashift_mlp, ascale_mlp, agate_mlp, ax_scaled
@@ -429,9 +387,8 @@ def apply_cross_attention_adaln(
     context_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply query/key AdaLN modulation then cross-attention.
-    ``x_normed`` is already RMS-normalized by ``post_sa_function``; this only
-    applies the affine (scale/shift) modulation, so the normalization is not
-    repeated here.
+    ``x_normed`` is already RMS-normalized by the PostSA composite; this only
+    applies the affine (scale/shift) modulation, so normalization is not repeated.
     """
     batch_size = x_normed.shape[0]
     # K/V modulation. With the prompt-side AdaLN MLP disabled (use_prompt_adaln_single=False),

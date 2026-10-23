@@ -43,6 +43,7 @@ See [Installation & Usage](docs/installation.md) for full setup, CLI modules, an
 | [Available Pipelines](docs/pipelines.md) | Full reference for all 12 pipelines, including [Running DFR](docs/pipelines.md#running-dfr) |
 | [Conditioning Types](docs/conditioning.md) | Image and video conditioning methods |
 | [HDR Support](docs/hdr.md) | Native EXR/`--hdr` colour spaces, I/O, and examples |
+| [VideoSeal marking](docs/marking.md) | Opt-in post-hoc VideoSeal / AudioSeal (`--marker-root-path`) |
 | [Multimodal Guidance](docs/multimodal-guidance.md) | CFG / STG / modality guidance parameters and tuning |
 | [Optimization Tips](docs/optimization.md) | FP8 quantization, `torch.compile`, gradient estimation |
 | [Multi-GPU Inference](docs/multigpu/README.md) | Run a single generation across GPUs for latency (SP, TDP, distributed VAE, distributed Gemma) |

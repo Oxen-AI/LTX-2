@@ -9,6 +9,9 @@ import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
+# Bytes of projection output per chunk of LinearPixelShuffleUpsample's eager forward.
+_SHUFFLE_CHUNK_BYTES: int = 1 << 30
+
 
 class ChannelLinear(nn.Linear):
     """``nn.Linear`` exposing ``in_channels``/``out_channels`` for config introspection."""
@@ -47,17 +50,40 @@ class LinearPixelShuffleUpsample(nn.Module):
         frame of its own to drop, since the one duplicate frame in the full
         (untiled) tensor belongs solely to the origin chunk.
         """
-        x = self.proj(x)
-        x = rearrange(
-            x,
-            "b t h w (c p1 p2 p3) -> b (t p1) (h p2) (w p3) c",
-            p1=self.stride[0],
-            p2=self.stride[1],
-            p3=self.stride[2],
-        )
+        if torch.compiler.is_compiling():
+            x = self.proj(x)
+            x = rearrange(
+                x,
+                "b t h w (c p1 p2 p3) -> b (t p1) (h p2) (w p3) c",
+                p1=self.stride[0],
+                p2=self.stride[1],
+                p3=self.stride[2],
+            )
+        else:
+            x = self._proj_shuffle(x)
         if self.stride[0] == 2 and drop_leading_frame:
             x = x[:, 1:, :, :, :]
         return x
+
+    def _proj_shuffle(self, x: torch.Tensor) -> torch.Tensor:
+        """``rearrange(proj(x), "b t h w (c p1 p2 p3) -> b (t p1) (h p2) (w p3) c")``, chunked over ``t``.
+        A per-row Linear plus a permutation, so the chunked result is the one-shot result; one output
+        volume is live plus at most ``_SHUFFLE_CHUNK_BYTES`` of projection.
+        """
+        b, t, h, w, _ = x.shape
+        p1, p2, p3 = self.stride
+        c = self.out_channels
+        out = torch.empty((b, t * p1, h * p2, w * p3, c), device=x.device, dtype=x.dtype)
+        # (b, t, p1, h, p2, w, p3, c): the output with every shuffled axis split back out.
+        out_split = out.view(b, t, p1, h, p2, w, p3, c)
+        frame_bytes = b * h * w * self.proj_out_channels * x.element_size()
+        chunk = max(1, min(t, _SHUFFLE_CHUNK_BYTES // max(frame_bytes, 1)))
+        for t0 in range(0, t, chunk):
+            t1 = min(t, t0 + chunk)
+            y = self.proj(x[:, t0:t1])
+            y = y.view(b, t1 - t0, h, w, c, p1, p2, p3).permute(0, 1, 5, 2, 6, 3, 7, 4)
+            out_split[:, t0:t1].copy_(y)
+        return out
 
 
 class AdaLNZero(nn.Module):

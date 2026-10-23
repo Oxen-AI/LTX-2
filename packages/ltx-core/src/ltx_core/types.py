@@ -3,6 +3,8 @@ from typing import NamedTuple
 
 import torch
 
+from ltx_core.devices import upload_from_host
+
 
 class VideoPixelShape(NamedTuple):
     """
@@ -201,6 +203,24 @@ class AudioLatentShape(NamedTuple):
 
 
 @dataclass(frozen=True)
+class HostDeviceTensorPair:
+    """A tensor together with its host mirror."""
+
+    host_tensor: torch.Tensor
+    device_tensor: torch.Tensor
+
+    @classmethod
+    def on_device(cls, tensor: torch.Tensor, device: torch.device) -> "HostDeviceTensorPair":
+        """``tensor``'s host mirror and a copy on ``device``.
+        Reads the device back only when ``tensor`` lives there; a host tensor is uploaded without
+        waiting for the device.
+        """
+        host = tensor.cpu()
+        device_tensor = tensor if tensor.device == device else upload_from_host(host, device)
+        return cls(host_tensor=host, device_tensor=device_tensor)
+
+
+@dataclass(frozen=True)
 class Audio:
     """
     Container for decoded audio samples and metadata.
@@ -248,6 +268,42 @@ class GeneratedKeyframeLayout:
 
 
 @dataclass(frozen=True)
+class DenoiseMask:
+    """A per-token denoising mask and the table of its distinct values.
+    Conditioning builds ``tensor`` on the host, editing it in place or replacing it, with
+    ``values`` unset. ``compact`` tabulates the distinct values there, where ``torch.unique`` needs
+    no device synchronization, and moves both to the device; the denoising loop only sees the
+    compacted form, and nothing may edit ``tensor`` after it. ``values`` must hold exactly the
+    values present: a missing one silently modulates its tokens with a neighbouring value's
+    conditioning, and an extra one changes the shape the modulation is projected at.
+    ``zero_index`` is the position of ``0.0`` in ``values``, recorded on the host by ``compact``
+    (``None`` when no token is fully conditioned), so padding can reuse that entry.
+    """
+
+    tensor: torch.Tensor
+    values: torch.Tensor | None = None
+    zero_index: int | None = None
+
+    def compact(self, device: torch.device) -> "DenoiseMask":
+        """Tabulate the distinct mask values on the host and move mask and table to ``device``."""
+        if self.tensor.device.type != "cpu":
+            raise ValueError(f"denoise mask must be built on the host, got {self.tensor.device}")
+        values = torch.unique(self.tensor, sorted=True)
+        zeros = (values == 0).nonzero()
+        zero_index = int(zeros[0, 0]) if zeros.numel() else None
+        return DenoiseMask(upload_from_host(self.tensor, device), upload_from_host(values, device), zero_index)
+
+    def with_same_values(self, tensor: torch.Tensor) -> "DenoiseMask":
+        """Replace the tensor with a reordering or batch repeat of the same token values."""
+        return DenoiseMask(tensor, self.values, self.zero_index)
+
+    def clone(self) -> "DenoiseMask":
+        return DenoiseMask(
+            self.tensor.clone(), self.values.clone() if self.values is not None else None, self.zero_index
+        )
+
+
+@dataclass(frozen=True)
 class LatentState:
     """
     State of latents during the diffusion denoising process.
@@ -277,7 +333,7 @@ class LatentState:
     """
 
     latent: torch.Tensor
-    denoise_mask: torch.Tensor
+    denoise_mask: DenoiseMask
     positions: torch.Tensor
     clean_latent: torch.Tensor
     attention_mask: torch.Tensor | None = None

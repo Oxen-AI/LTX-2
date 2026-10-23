@@ -8,6 +8,25 @@ from torch.nn import functional as F
 from ltx_core.model.video_vae.enums import PaddingModeType
 
 
+def memory_format_of(t: torch.Tensor, prefer_channels_last_3d: bool = False) -> torch.memory_format:
+    """Pick the memory format for a workspace allocation.
+    When ``prefer_channels_last_3d`` is True and ``t`` is 5D, return
+    ``channels_last_3d`` regardless of ``t``'s current strides -- the
+    workspace's ``.copy_(t)`` will transcribe the data into the new layout.
+    This is needed because intermediate tensors inside the memory-efficient decoder (after
+    ``rearrange`` + slice + residual add in ``_upsample_forward_efficient``)
+    are not NHWC-contiguous, so an auto-detect helper would silently fall
+    back to NCHW for every workspace after the first upsample.
+    Otherwise fall back to inspecting ``t``: ``channels_last_3d`` if ``t``
+    already uses it, else contiguous.
+    """
+    if prefer_channels_last_3d and t.dim() == 5:
+        return torch.channels_last_3d
+    if t.dim() == 5 and t.is_contiguous(memory_format=torch.channels_last_3d):
+        return torch.channels_last_3d
+    return torch.contiguous_format
+
+
 def make_conv_nd(  # noqa: PLR0913
     dims: Union[int, Tuple[int, int]],
     in_channels: int,
@@ -302,15 +321,23 @@ class CausalConv3d(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
-        if causal:
-            first_frame_pad = x[:, :, :1, :, :].repeat((1, 1, self.time_kernel_size - 1, 1, 1))
-            x = torch.concatenate((first_frame_pad, x), dim=2)
-        else:
-            first_frame_pad = x[:, :, :1, :, :].repeat((1, 1, (self.time_kernel_size - 1) // 2, 1, 1))
-            last_frame_pad = x[:, :, -1:, :, :].repeat((1, 1, (self.time_kernel_size - 1) // 2, 1, 1))
-            x = torch.concatenate((first_frame_pad, x, last_frame_pad), dim=2)
-        x = self.conv(x)
-        return x
+        front = self.time_kernel_size - 1 if causal else (self.time_kernel_size - 1) // 2
+        back = 0 if causal else front
+        if front == 0 and back == 0:
+            return self.conv(x)
+        # Edge frames are replicated into one buffer laid out like ``x``, so channels-last
+        # activations reach the conv without a layout round trip.
+        frames = x.shape[2]
+        padded = torch.empty(
+            (*x.shape[:2], front + frames + back, *x.shape[3:]),
+            dtype=x.dtype,
+            device=x.device,
+            memory_format=memory_format_of(x),
+        )
+        padded[:, :, front : front + frames] = x
+        padded[:, :, :front] = x[:, :, :1]
+        padded[:, :, front + frames :] = x[:, :, -1:]
+        return self.conv(padded)
 
     @property
     def weight(self) -> torch.Tensor:

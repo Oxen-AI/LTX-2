@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from ltx_core.model.video_vae.transformer.blocks import DiffusionNABlock
@@ -9,6 +11,9 @@ from ltx_core.model.video_vae.transformer.combined.attn import full as residual_
 from ltx_core.model.video_vae.transformer.combined.attn import full_with_keyframes as residual_attn_with_keyframes
 from ltx_core.model.video_vae.transformer.combined.context import combined as inject_context
 from ltx_core.model.video_vae.transformer.combined.mlp import residual_mlp
+
+if TYPE_CHECKING:
+    from ltx_core.model.video_vae.keyframes import KeyframePlanes
 
 
 class CombinedDiffusionNABlock(DiffusionNABlock):
@@ -19,8 +24,7 @@ class CombinedDiffusionNABlock(DiffusionNABlock):
         context_and_x: torch.Tensor,
         keyframe_context_and_x: torch.Tensor,
         modulation: tuple[torch.Tensor, ...],
-        keyframe_times: torch.Tensor,
-        keyframe_valid: torch.Tensor,
+        keyframe_planes: KeyframePlanes,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Dual-stream block; returns the two updated x halves (not the concat buffers).
         Each stream gets its own ``context_proj(context)`` injection from its own
@@ -39,12 +43,11 @@ class CombinedDiffusionNABlock(DiffusionNABlock):
             self.norm1,
             scale_msa,
             shift_msa,
-            keyframe_times,
-            keyframe_valid,
+            keyframe_planes,
         )
         x = residual_mlp(x, self.mlp, self.norm2, scale_mlp, shift_mlp, self.mlp.tile)
         keyframe_x = residual_mlp(keyframe_x, self.mlp, self.norm2, scale_mlp, shift_mlp, self.mlp.tile)
-        return x, keyframe_x * keyframe_valid[None, :, None, None, None]
+        return x, keyframe_x * keyframe_planes.valid.device_tensor[None, :, None, None, None]
 
     def forward_combined(
         self,

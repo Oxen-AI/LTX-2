@@ -228,6 +228,28 @@ if _TRITON_AVAILABLE:
         )
 
 
+@dataclass(frozen=True)
+class _GateUpLaunch:
+    """Launch config of the fused gate+up kernel.
+    Every config accumulates each output in the same K order, so all are bit-identical.
+    """
+
+    blocks: tuple[int, int, int]  # (BLOCK_M, BLOCK_N, BLOCK_K)
+    num_warps: int
+    num_stages: int
+
+
+def _gate_up_launch(device: torch.device) -> _GateUpLaunch:
+    """Fused gate+up kernel launch config for ``device``'s architecture."""
+    major, _ = torch.cuda.get_device_capability(device)
+    if major == 10:
+        # Datacenter Blackwell. Swept at the DiffVAE det-stage MLP shapes (dim 512..2048,
+        # 16k-row tiles) on sm_100.
+        return _GateUpLaunch(blocks=(256, 128, 64), num_warps=8, num_stages=3)
+    # Triton's default warps and stages.
+    return _GateUpLaunch(blocks=(64, 64, 32), num_warps=4, num_stages=3)
+
+
 _DUAL_GATE_UP_DIM_MIN: Final[int] = 256
 _DUAL_GATE_UP_DIM_MAX: Final[int] = 2048
 
@@ -270,7 +292,8 @@ def _fused_gate_up_swiglu_triton(
         )
     m, k = x.shape
     n = w_gate.shape[0]
-    block_m, block_n, block_k = 64, 64, 32
+    launch = _gate_up_launch(x.device)
+    block_m, block_n, block_k = launch.blocks
     grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
     with torch.cuda.device(x.device):
         _fused_gate_up_swiglu_kernel[grid](
@@ -292,6 +315,8 @@ def _fused_gate_up_swiglu_triton(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_K=block_k,
+            num_warps=launch.num_warps,
+            num_stages=launch.num_stages,
         )
 
 
@@ -462,12 +487,22 @@ def swiglu_tiled(
     return _swiglu_tiled_op(x, w_gate, w_up, w_down, tile_size, num_tiles, bool(use_triton))
 
 
-def plain_mlp(x: torch.Tensor, mlp: nn.Module, norm: nn.RMSNorm, tile: SwiGLUTileSpec) -> torch.Tensor:
-    """Det ``NABlock``: ``x + swiglu_tiled(norm(x))`` (no AdaLN)."""
+def plain_mlp(x: torch.Tensor, mlp: nn.Module, norm: nn.Module, tile: SwiGLUTileSpec) -> torch.Tensor:
+    """Det ``NABlock``: ``x + swiglu_tiled(norm(x))`` (no AdaLN); ``norm`` is the block's
+    :class:`~ltx_core.model.video_vae.transformer.det_rms_norm.DetRMSNorm`."""
     y = norm(x)
     if y.numel() == 0:
         return x
     return x + swiglu_tiled(y, mlp.w_gate.weight, mlp.w_up.weight, mlp.w_down.weight, tile)
+
+
+def plain_mlp_accumulate(x: torch.Tensor, mlp: nn.Module, norm: nn.Module, tile: SwiGLUTileSpec) -> torch.Tensor:
+    """:func:`plain_mlp` with the residual added into the MLP's own fresh output: same values (addition
+    commutes exactly), one volume fewer live."""
+    y = norm(x)
+    if y.numel() == 0:
+        return x
+    return swiglu_tiled(y, mlp.w_gate.weight, mlp.w_up.weight, mlp.w_down.weight, tile).add_(x)
 
 
 class SwiGLU(nn.Module):

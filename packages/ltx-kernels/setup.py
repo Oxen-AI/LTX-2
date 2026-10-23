@@ -261,6 +261,7 @@ if __name__ == "__main__":
                 "csrc/all2all/all2all.cpp",
                 "csrc/all2all/cuda/all2all_heads.cu",
                 "csrc/all2all/cuda/allgather.cu",
+                "csrc/all2all/cuda/fused_send.cu",
             ],
             library_dirs=cuda_link_dirs,
             extra_compile_args={"cxx": all2all_args, "nvcc": ["-O3"]},
@@ -281,7 +282,7 @@ if __name__ == "__main__":
                 "csrc/ops/rms_norm_split_rope.cpp",
                 "csrc/ops/rms_norm_split_rope_cuda.cu",
             ],
-            include_dirs=[str(ROOT / "csrc/ops/include"), *_nvidia_include_dirs()],
+            include_dirs=[str(ROOT / "csrc/ops/include"), str(ROOT / "csrc/include"), *_nvidia_include_dirs()],
             library_dirs=cuda_link_dirs,
             extra_compile_args={
                 "cxx": ["-O3", "-std=c++17"],

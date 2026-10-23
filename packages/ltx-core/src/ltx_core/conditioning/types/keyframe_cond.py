@@ -4,7 +4,7 @@ from ltx_core.components.patchifiers import get_pixel_coords
 from ltx_core.conditioning.item import ConditioningItem
 from ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
 from ltx_core.tools import VideoLatentTools
-from ltx_core.types import LatentState, VideoLatentShape
+from ltx_core.types import DenoiseMask, LatentState, VideoLatentShape
 
 
 class VideoConditionByKeyframeIndex(ConditioningItem):
@@ -61,7 +61,7 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
         denoise_mask = torch.full(
             size=(*tokens.shape[:2], 1),
             fill_value=1.0 - self.strength,
-            device=self.keyframes.device,
+            device="cpu",
             dtype=self.keyframes.dtype,
         )
 
@@ -77,7 +77,7 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
 
         return LatentState(
             latent=torch.cat([latent_state.latent, torch.zeros_like(tokens)], dim=1),
-            denoise_mask=torch.cat([latent_state.denoise_mask, denoise_mask], dim=1),
+            denoise_mask=DenoiseMask(torch.cat([latent_state.denoise_mask.tensor, denoise_mask], dim=1)),
             positions=torch.cat([latent_state.positions, positions], dim=2),
             clean_latent=torch.cat([latent_state.clean_latent, tokens], dim=1),
             attention_mask=new_attention_mask,

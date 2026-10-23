@@ -12,6 +12,7 @@ void rms_norm_split_rope_cuda(
     void* sin_freqs,
     void* cos_freqs,
     void* weights,
+    float eps,
     int b,
     int s,
     int n,
@@ -27,6 +28,7 @@ at::Tensor rms_norm_split_rope(
     at::Tensor &sin_freqs,
     at::Tensor &cos_freqs,
     at::Tensor &weights,
+    double eps,
     bool out_fp8
 ) {
     TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16, "Input must be BFloat16");
@@ -50,14 +52,21 @@ at::Tensor rms_norm_split_rope(
     int d = h / n;
 
     
+    // The kernel walks x row-major from one base pointer, so it must be contiguous.
+    if (!x.is_contiguous()) { x = x.contiguous(); }
+
     // Require a contiguous innermost (d/2) dim for the vectorized int4 freq load,
     // but keep the outer (b, n, s) strides: apply_split_rotary_emb hands us a
     // swapaxes view (logical [b, n, s, d/2], physical [b, s, n, d/2]) whose inner
     // stride is already 1, so this never copies it. The strides are forwarded to
     // the kernel so the read is correct regardless of the physical layout.
-    if (x.stride(-1) != 1) { x = x.contiguous(); }
     if (cos_freqs.stride(-1) != 1) { cos_freqs = cos_freqs.contiguous(); }
     if (sin_freqs.stride(-1) != 1) { sin_freqs = sin_freqs.contiguous(); }
+
+    // A table shared across the batch is expanded rather than copied: the kernel
+    // indexes it by batch through the forwarded stride, which expand sets to 0.
+    if (cos_freqs.size(0) == 1 && b > 1) { cos_freqs = cos_freqs.expand({b, n, cos_freqs.size(2), cos_freqs.size(3)}); }
+    if (sin_freqs.size(0) == 1 && b > 1) { sin_freqs = sin_freqs.expand({b, n, sin_freqs.size(2), sin_freqs.size(3)}); }
 
     long cos_sb = cos_freqs.stride(0), cos_sn = cos_freqs.stride(1), cos_ss = cos_freqs.stride(2);
     long sin_sb = sin_freqs.stride(0), sin_sn = sin_freqs.stride(1), sin_ss = sin_freqs.stride(2);
@@ -81,6 +90,7 @@ at::Tensor rms_norm_split_rope(
             sin_freqs.data_ptr(),
             cos_freqs.data_ptr(),
             weights.data_ptr(),  // weights (optional, not used yet)
+            (float)eps,
             b,
             s,
             n,
@@ -96,6 +106,7 @@ at::Tensor rms_norm_split_rope(
             sin_freqs.data_ptr(),
             cos_freqs.data_ptr(),
             weights.data_ptr(),  // weights (optional, not used yet)
+            (float)eps,
             b,
             s,
             n,

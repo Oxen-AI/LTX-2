@@ -1,30 +1,32 @@
 """Shared IC-LoRA helpers: LoRA metadata, mask downsampling, reference-video conditioning.
-Used by ``ic_lora`` and ``dubit`` (video reference path only). Dub-It audio helpers live in ``dubit.py``.
+Used by ``ic_lora`` and ``dubit``.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 
 import torch
 from einops import rearrange
 from safetensors import safe_open
 
+from ltx_core.components.patchifiers import AudioPatchifier
 from ltx_core.conditioning import (
     ConditioningItem,
     ConditioningItemAttentionStrengthWrapper,
     VideoConditionByReferenceLatent,
 )
 from ltx_core.model.video_vae import TilingConfig, VideoEncoder
-from ltx_core.types import VideoLatentShape
+from ltx_core.types import AudioLatentShape, SpatioTemporalScaleFactors, VideoLatentShape
 from ltx_pipelines.utils.media_io import (
     ResizeMode,
     decode_video_by_frame,
     is_exr_dir,
-    load_exr_folder_conditioning_hdr,
+    load_exr_as_hdr_conditioning,
     video_preprocess,
 )
-from ltx_pipelines.utils.media_io.color_config import HDRColorSpace
+from ltx_pipelines.utils.media_io.color_config import EXRColorSpace
 
 
 def read_lora_reference_downscale_factor(lora_path: str) -> int:
@@ -90,13 +92,28 @@ def temporal_subsample(video: torch.Tensor, temporal_scale_factor: int) -> torch
     return video[:, :, indices]
 
 
-def append_ic_lora_reference_video_conditionings(  # noqa: PLR0913
+def _reference_prefix_latent_frames(
+    prefix_pixel_frames: int, temporal_scale_factor: int, video_scale_factors: SpatioTemporalScaleFactors
+) -> int:
+    """Number of leading reference latents whose target-time span touches ``prefix_pixel_frames``."""
+    if prefix_pixel_frames < 0:
+        raise ValueError(f"prefix_pixel_frames must be >= 0, got {prefix_pixel_frames}")
+    if temporal_scale_factor <= 0:
+        raise ValueError(f"temporal_scale_factor must be > 0, got {temporal_scale_factor}")
+    if prefix_pixel_frames == 0:
+        return 0
+    target_temporal_stride = video_scale_factors.time * temporal_scale_factor
+    return 1 + (prefix_pixel_frames + target_temporal_stride - 2) // target_temporal_stride
+
+
+def append_ic_lora_reference_video_conditionings(  # noqa: PLR0912, PLR0913
     conditionings: list[ConditioningItem],
     video_conditioning: list[tuple[str, float]],
     *,
     height: int,
     width: int,
     num_frames: int,
+    starting_frame: int = 0,
     video_encoder: VideoEncoder,
     dtype: torch.dtype,
     device: torch.device,
@@ -105,9 +122,15 @@ def append_ic_lora_reference_video_conditionings(  # noqa: PLR0913
     conditioning_attention_strength: float,
     conditioning_attention_mask: torch.Tensor | None,
     tiling_config: TilingConfig | None = None,
-    color_space: HDRColorSpace | None = None,
+    color_space: EXRColorSpace | None = None,
+    frames: Iterator[torch.Tensor] | None = None,
+    reference_prefix_frames: int = 0,
 ) -> None:
-    """Append :class:`VideoConditionByReferenceLatent` items for each reference path."""
+    """Append reference items, excluding tokens that touch an already-carried prefix.
+    The full pixel window is encoded so the causal VAE receives the same temporal
+    context and grid as the target chunk. Prefix removal happens only after encoding;
+    retained tokens keep their original temporal-grid indices through ``first_latent_frame``.
+    """
     scale = reference_downscale_factor
     if scale != 1 and (height % scale != 0 or width % scale != 0):
         raise ValueError(
@@ -124,13 +147,14 @@ def append_ic_lora_reference_video_conditionings(  # noqa: PLR0913
                 )
             video = torch.cat(
                 list(
-                    load_exr_folder_conditioning_hdr(
-                        exr_dir=video_path,
-                        height=ref_height,
-                        width=ref_width,
+                    load_exr_as_hdr_conditioning(
+                        video_path,
+                        ref_height,
+                        ref_width,
+                        dtype,
+                        device,
                         frame_cap=num_frames,
-                        dtype=dtype,
-                        device=device,
+                        frame_start=starting_frame,
                         color_space=color_space,
                         resize_mode=ResizeMode.REFLECT_PAD,
                     )
@@ -138,7 +162,13 @@ def append_ic_lora_reference_video_conditionings(  # noqa: PLR0913
                 dim=2,
             )
         else:
-            frame_gen = decode_video_by_frame(path=video_path, frame_cap=num_frames, device=device)
+            frame_gen = (
+                frames
+                if frames is not None
+                else decode_video_by_frame(
+                    path=video_path, starting_frame=starting_frame, frame_cap=num_frames, device=device
+                )
+            )
             video = video_preprocess(frame_gen, ref_height, ref_width, dtype, device)
         if reference_temporal_scale_factor > 1:
             video = temporal_subsample(video, reference_temporal_scale_factor)
@@ -146,13 +176,39 @@ def append_ic_lora_reference_video_conditionings(  # noqa: PLR0913
             encoded_video = video_encoder.tiled_encode(video, tiling_config)
         else:
             encoded_video = video_encoder(video)
-        reference_video_shape = VideoLatentShape.from_torch_shape(encoded_video.shape)
+        full_reference_shape = VideoLatentShape.from_torch_shape(encoded_video.shape)
 
         if conditioning_attention_mask is not None:
             latent_mask = downsample_mask_video_to_latent(
                 mask=conditioning_attention_mask,
-                target_latent_shape=reference_video_shape,
+                target_latent_shape=full_reference_shape,
             )
+        else:
+            latent_mask = None
+
+        first_latent_frame = _reference_prefix_latent_frames(
+            reference_prefix_frames,
+            reference_temporal_scale_factor,
+            video_encoder.video_scale_factors,
+        )
+        if first_latent_frame >= full_reference_shape.frames:
+            raise ValueError(
+                f"reference_prefix_frames ({reference_prefix_frames}) removes the entire reference "
+                f"window ({full_reference_shape.frames} latent frames)"
+            )
+        if first_latent_frame:
+            encoded_video = encoded_video[:, :, first_latent_frame:]
+            if latent_mask is not None:
+                latent_mask = rearrange(
+                    latent_mask,
+                    "b (f h w) -> b f h w",
+                    f=full_reference_shape.frames,
+                    h=full_reference_shape.height,
+                    w=full_reference_shape.width,
+                )[:, first_latent_frame:]
+                latent_mask = rearrange(latent_mask, "b f h w -> b (f h w)")
+
+        if latent_mask is not None:
             attn_mask = latent_mask * conditioning_attention_strength
         elif conditioning_attention_strength < 1.0:
             attn_mask = conditioning_attention_strength
@@ -164,7 +220,30 @@ def append_ic_lora_reference_video_conditionings(  # noqa: PLR0913
             downscale_factor=scale,
             temporal_scale_factor=reference_temporal_scale_factor,
             strength=strength,
+            first_latent_frame=first_latent_frame,
         )
         if attn_mask is not None:
             cond = ConditioningItemAttentionStrengthWrapper(cond, attention_mask=attn_mask)
         conditionings.append(cond)
+
+
+def patchify_audio_reference_latent(
+    vae_latents: torch.Tensor,
+    *,
+    negative_positions: bool,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Patchify audio VAE latents and build RoPE positions (optional negative shift for reference)."""
+    patchifier = AudioPatchifier(patch_size=1)
+    patchified = patchifier.patchify(vae_latents)
+    b, c, _t, mel_bins = vae_latents.shape
+    seq_len = patchified.shape[1]
+    latent_coords = patchifier.get_patch_grid_bounds(
+        output_shape=AudioLatentShape(batch=b, channels=c, frames=seq_len, mel_bins=mel_bins),
+        device=device,
+    )
+    positions = latent_coords.to(dtype=torch.float32)
+    if negative_positions:
+        aud_dur = positions[:, :, -1, 1].max().item()
+        positions = positions - aud_dur - 0.04
+    return patchified, positions

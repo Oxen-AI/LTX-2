@@ -218,10 +218,9 @@ uv run python scripts/decode_latents.py /path/to/latents/dir /path/to/output \
 For inference with trained LoRAs, use the [`ltx-pipelines`](../../ltx-pipelines/) package which provides
 production-ready pipelines:
 
-- **Text/Image-to-Video**: `TI2VidOneStagePipeline`, `TI2VidTwoStagesPipeline`
+- **Text/Image-to-Video and keyframe interpolation**: `TI2VidOneStagePipeline`, `TI2VidTwoStagesPipeline`
 - **Distilled (fast) inference**: `DistilledPipeline`
 - **IC-LoRA video-to-video**: `ICLoraPipeline`
-- **Keyframe interpolation**: `KeyframeInterpolationPipeline`
 
 All pipelines support loading custom LoRAs trained with this trainer.
 

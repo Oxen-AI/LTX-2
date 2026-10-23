@@ -5,15 +5,21 @@ Does not share a residual body with ``chunked`` — only the NA module weights.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 
+from ltx_core.model.video_vae.ops import apply_rms_norm_uint32_safe
 from ltx_core.model.video_vae.transformer.attention import NeighborhoodAttention3D
 from ltx_core.model.video_vae.transformer.rope_math import (
     h_positions,
     rot_abs_axis_impl,
     t_positions,
 )
+
+if TYPE_CHECKING:
+    from ltx_core.model.video_vae.keyframes import KeyframePlanes
 
 # Transparent path: innermost per-axis rotation is a nested compile region.
 _rot_abs_axis = torch.compiler.nested_compile_region(rot_abs_axis_impl)
@@ -93,8 +99,8 @@ def _qkv_nested_rope(
     its (possibly fractional) plane times there.
     """
     q, k, v = attn.project_qkv(x)
-    q = attn.q_norm(q) * attn.scale
-    k = attn.k_norm(k)
+    q = apply_rms_norm_uint32_safe(attn.q_norm, q) * attn.scale
+    k = apply_rms_norm_uint32_safe(attn.k_norm, k)
     inv_freqs = (
         attn.rope_inv_t.to(device=x.device),
         attn.rope_inv_h.to(device=x.device),
@@ -127,12 +133,11 @@ def full_with_keyframes(
     norm: nn.RMSNorm,
     scale: torch.Tensor,
     shift: torch.Tensor,
-    keyframe_times: torch.Tensor,
-    keyframe_valid: torch.Tensor,
+    keyframe_planes: KeyframePlanes,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dual-stream AdaLN residual attention: one joint softmax, shared weights.
-    Plain tensors rather than a ``KeyframeStream`` here: this is the stage-5 hot path, and
-    rebuilding a dataclass per block inside a compiled region buys nothing.
+    The planes' metadata rather than a ``KeyframeStream`` here: this is the stage-5 hot path,
+    and rebuilding a dataclass per block inside a compiled region buys nothing.
     Both streams take the *same* ``scale``/``shift``. Upstream computes a separate keyframe
     modulation, but the two are identical unless per-frame timestep conditioning supplies a
     conditioning mask, which we deliberately do not implement yet.
@@ -147,11 +152,11 @@ def full_with_keyframes(
     batch, t, h, w, _ = x.shape
     planes = keyframe_x.shape[1]
 
-    y = norm(x) * (1.0 + scale) + shift
-    keyframe_y = norm(keyframe_x) * (1.0 + scale) + shift
+    y = apply_rms_norm_uint32_safe(norm, x) * (1.0 + scale) + shift
+    keyframe_y = apply_rms_norm_uint32_safe(norm, keyframe_x) * (1.0 + scale) + shift
 
     q, k, v = _qkv_nested_rope(attn, y)
-    keyframe_q, keyframe_k, keyframe_v = _qkv_nested_rope(attn, keyframe_y, keyframe_times)
+    keyframe_q, keyframe_k, keyframe_v = _qkv_nested_rope(attn, keyframe_y, keyframe_planes.times.device_tensor)
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     keyframe_q = keyframe_q.contiguous()
     keyframe_k = keyframe_k.contiguous()
@@ -165,8 +170,7 @@ def full_with_keyframes(
         keyframe_q,
         keyframe_k,
         keyframe_v,
-        keyframe_times,
-        keyframe_valid,
+        keyframe_planes,
     )
     x = x + attn.proj(out.reshape(batch, t, h, w, attn.dim))
     keyframe_x = keyframe_x + attn.proj(keyframe_out.reshape(batch, planes, h, w, attn.dim))
@@ -181,7 +185,7 @@ def full(
     shift: torch.Tensor,
 ) -> torch.Tensor:
     """``x + NA(modulate(norm(x)))`` with nested full-volume abs-RoPE."""
-    y = norm(x) * (1.0 + scale) + shift
+    y = apply_rms_norm_uint32_safe(norm, x) * (1.0 + scale) + shift
     batch, t, h, w, _ = y.shape
     kt, kh, kw = attn.kernel_size
     if t < kt or h < kh or w < kw:

@@ -1,3 +1,5 @@
+import dataclasses
+import functools
 from pathlib import Path
 
 import safetensors
@@ -261,6 +263,82 @@ def _fp8_cast_fuse(
 
 
 fp8_cast_fuse_rule = FuseRule(aggregation_dtype=torch.bfloat16, fuse_fn=_fp8_cast_fuse)
+
+
+E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+# fp8 x fp8 GEMMs (torch._scaled_mm) need compute capability 8.9+ (Ada, Hopper, Blackwell).
+_FP8_GEMM_MIN_CAPABILITY = (8, 9)
+
+
+def supports_fp8_gemm(device: torch.device) -> bool:
+    """Whether *device* runs the e4m3 x e4m3 GEMMs of :class:`Fp8RowwiseLinear`."""
+    return device.type == "cuda" and torch.cuda.get_device_capability(device) >= _FP8_GEMM_MIN_CAPABILITY
+
+
+class Fp8RowwiseLinear(Fp8CastLinear):
+    """:class:`Fp8CastLinear` that multiplies long activations in e4m3 instead of upcasting the weight.
+    A bf16 input of at least ``_min_rows`` rows on a device with fp8 GEMMs (:func:`supports_fp8_gemm`)
+    is rounded to e4m3 with one scale per row (the row's absolute maximum maps to the e4m3 maximum)
+    and multiplied with the stored e4m3 weight at scale 1 through ``torch._scaled_mm`` (unit scales,
+    fp32 accumulation, bf16 product); the row scales and the bias are then applied in fp32. Other
+    inputs, including any on a device without fp8 GEMMs, take the upcast path. Lossy:
+    the activations keep e4m3's 3 mantissa bits. The cast is plain tensor ops so a compile
+    backend can fuse it into the kernel producing the activation.
+    """
+
+    _min_rows: int
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:  # noqa: A002, type: ignore[override]
+        in_features = input.shape[-1]
+        rows = input.numel() // in_features
+        if (
+            rows < self._min_rows
+            or input.dtype != torch.bfloat16
+            or not supports_fp8_gemm(input.device)
+            or self._with_stochastic_rounding
+        ):
+            return super().forward(input)
+        x = input.reshape(rows, in_features)
+        amax = x.abs().amax(dim=-1, keepdim=True).float()
+        row_scale = torch.where(amax > 0, amax / E4M3_MAX, torch.ones_like(amax))
+        x8 = (x.float() / row_scale).to(torch.float8_e4m3fn)
+        # Unit (tensor-wise) scales select the cuBLASLt fp8 GEMM; per-row scales would select a slower CUTLASS
+        # kernel with per-launch host setup. The row scale and the bias are applied to the bf16 product as plain
+        # tensor ops, which a compile backend fuses into the kernel consuming this Linear's output.
+        unit = torch.ones((), device=input.device, dtype=torch.float32)
+        out = torch._scaled_mm(
+            x8, self.weight.t(), scale_a=unit, scale_b=unit, out_dtype=torch.bfloat16, use_fast_accum=False
+        )
+        out = out.float() * row_scale
+        if self.bias is not None:
+            out = out + self.bias.float()
+        return out.to(torch.bfloat16).view(*input.shape[:-1], self.out_features)
+
+
+def _amend_forward_with_rowwise_fp8_gemm(model: torch.nn.Module, min_rows: int) -> torch.nn.Module:
+    """Retype every :class:`Fp8CastLinear` of *model* to :class:`Fp8RowwiseLinear`."""
+    for m in model.modules():
+        if type(m) is Fp8CastLinear:
+            m.__class__ = Fp8RowwiseLinear
+            m._min_rows = min_rows
+    return model
+
+
+def with_rowwise_fp8_gemm(policy: QuantizationPolicy, min_rows: int = 8192) -> QuantizationPolicy:
+    """*policy* (an fp8-cast policy) with its Linears' long inputs multiplied in e4m3 (:class:`Fp8RowwiseLinear`).
+    Weights and their loading are unchanged, so a stage on this policy shares its weights with one
+    on *policy*. Only for devices where :func:`supports_fp8_gemm` holds. ``min_rows`` is the per-rank
+    activation row count from which the e4m3 GEMM is taken: the video token sequences of long passes,
+    not the audio or text-context projections.
+    """
+    if policy.fuse_rule is not fp8_cast_fuse_rule:
+        raise ValueError("with_rowwise_fp8_gemm needs an fp8-cast policy (weights stored in e4m3)")
+    op = ModuleOps(
+        name=f"fp8_rowwise_gemm_from_{min_rows}_rows",
+        matcher=lambda model: isinstance(model, LTXModel),
+        mutator=functools.partial(_amend_forward_with_rowwise_fp8_gemm, min_rows=min_rows),
+    )
+    return dataclasses.replace(policy, module_ops=(*policy.module_ops, op))
 
 
 # Raw safetensors storage prefix shared by every diffusion-transformer

@@ -2,13 +2,13 @@
 
 Native **`--hdr`** support: pass EXR stills / EXR-frame folders into the standard generation and editing pipelines. Decode writes half-float EXR frames plus a BT.2020/HLG master.
 
-For the separate video-to-video HDR IC-LoRA path (LogC3 inverse decode), see [HDRICLoraPipeline](pipelines.md#9-hdriclorapipeline).
+For the separate video-to-video HDR IC-LoRA path (ACEScct SDR→HDR, optional DFR-style seam keyframes), see [HDRICLoraPipeline](pipelines.md#9-hdriclorapipeline).
 
 ## Native HDR (`--hdr`)
 
 ### Colour spaces
 
-CLI flag: `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}` (enum [`HDRColorSpace`](../src/ltx_pipelines/utils/media_io/color_config.py)).
+CLI flag: `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}` (enum [`EXRColorSpace`](../src/ltx_pipelines/utils/media_io/color_config.py)).
 
 | Value | Source meaning | Load behaviour |
 | ----- | -------------- | -------------- |
@@ -76,16 +76,16 @@ uv run python -m ltx_pipelines.retake \
 ### Python API
 
 ```python
-from ltx_pipelines.utils.media_io import HDRColorSpace, encode_video, resolve_hdr_color_space, vae_dtype_for_hdr
+from ltx_pipelines.utils.media_io import EXRColorSpace, encode_video, resolve_hdr_color_space, vae_dtype_for_hdr
 
-hdr = resolve_hdr_color_space(images=images, video_paths=[], hdr=HDRColorSpace.SRGB_LINEAR)
+hdr = resolve_hdr_color_space(images=images, video_paths=[], hdr=EXRColorSpace.SRGB_LINEAR)
 vae_dtype = vae_dtype_for_hdr(hdr, default=torch.bfloat16)
 
 # After pipeline decode (iterator of [F,H,W,C] chunks):
 encode_video(video_chunks, fps, audio, output_path, num_chunks, color_space=hdr)
 ```
 
-Pipelines that accept image / video conditioning expose an optional `color_space: HDRColorSpace | None` on `__call__` (wired from CLI `--hdr`).
+Pipelines that accept image / video conditioning expose an optional `color_space: EXRColorSpace | None` on `__call__` (wired from CLI `--hdr`).
 
 ## Constraints (summary)
 
@@ -94,3 +94,4 @@ Pipelines that accept image / video conditioning expose an optional `color_space
 - Retake: `--frame-rate` required for EXR folders, forbidden for video files.
 - Dub-It: no `--hdr`; reference must be an SDR video file (not EXR).
 - DiffVAE / NATTEN: HDR decode still uses the configured VAE; install the `natten` extra when using a diffusion video VAE (same as SDR).
+- Keyframe-aware decode (the IC-LoRA path's default; disable with `--no-keyframes`) needs a VAE whose `decoder.type_emb` is non-zero. A checkpoint without it loads and decodes fine — zeros are synthesized — but the keyframe stream becomes a silent no-op. See [HDRICLoraPipeline](pipelines.md#9-hdriclorapipeline).

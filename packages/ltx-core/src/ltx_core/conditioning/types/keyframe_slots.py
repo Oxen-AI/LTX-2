@@ -21,7 +21,7 @@ from ltx_core.components.patchifiers import get_pixel_coords
 from ltx_core.conditioning.item import ConditioningItem
 from ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
 from ltx_core.tools import VideoLatentTools
-from ltx_core.types import GeneratedKeyframeLayout, LatentState
+from ltx_core.types import DenoiseMask, GeneratedKeyframeLayout, LatentState
 
 
 class VideoGeneratedKeyframeSlots(ConditioningItem):
@@ -116,7 +116,7 @@ class VideoGeneratedKeyframeSlots(ConditioningItem):
                 dim=1,
             )
         # denoise_mask 1 => the noiser lerps slot latent toward noise (clean_latent is ignored).
-        denoise_mask = torch.ones(batch_size, num_new_tokens, 1, device=device, dtype=latent_state.denoise_mask.dtype)
+        denoise_mask = torch.ones(batch_size, num_new_tokens, 1, dtype=latent_state.denoise_mask.tensor.dtype)
 
         keyframes_mask = extend_keyframes_mask(latent_state, num_new_tokens, marked=True)
 
@@ -135,7 +135,7 @@ class VideoGeneratedKeyframeSlots(ConditioningItem):
 
         return LatentState(
             latent=torch.cat([latent_state.latent, slot_tokens], dim=1),
-            denoise_mask=torch.cat([latent_state.denoise_mask, denoise_mask], dim=1),
+            denoise_mask=DenoiseMask(torch.cat([latent_state.denoise_mask.tensor, denoise_mask], dim=1)),
             positions=torch.cat([latent_state.positions, positions], dim=2),
             clean_latent=torch.cat([latent_state.clean_latent, torch.zeros_like(slot_tokens)], dim=1),
             attention_mask=new_attention_mask,

@@ -98,6 +98,11 @@ class ModelBuilderProtocol(BuilderProtocol[BuiltType], Protocol[BuiltType]):
         ...
 
     @property
+    def builds_per_shape(self) -> bool:
+        """Whether a built model serves only the latent shape it was built for (tiled data parallel)."""
+        ...
+
+    @property
     def model_sd_ops(self) -> SDOps | None: ...
 
     @property

@@ -10,7 +10,7 @@ from ltx_core.model.common.normalization import PixelNorm
 from ltx_core.model.disposable import Disposable
 from ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
 from ltx_core.model.video_vae.attention import AttnBlock3D
-from ltx_core.model.video_vae.convolution import make_conv_nd
+from ltx_core.model.video_vae.convolution import make_conv_nd, memory_format_of
 from ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
 from ltx_core.model.video_vae.keyframes import DecodeKeyframes
 from ltx_core.model.video_vae.ops import PerChannelStatistics, patchify
@@ -291,6 +291,9 @@ class VideoEncoder(nn.Module, Disposable):
         # This reduces H,W by patch_size and increases channels, making convolutions more efficient
         # Example: (B, 3, F, 512, 512) -> (B, 48, F, 128, 128) with patch_size=4
         sample = patchify(sample, patch_size_hw=self.patch_size, patch_size_t=1)
+        # Activations follow the weights' layout: channels-last weights (CHANNELS_LAST_3D_WEIGHTS)
+        # keep the whole encoder on NHWC conv kernels.
+        sample = sample.contiguous(memory_format=memory_format_of(self.conv_in.weight))
         sample = self.conv_in(sample)
 
         for down_block in self.down_blocks:
@@ -335,7 +338,7 @@ class VideoEncoder(nn.Module, Disposable):
 
         # Split into means and logvar, then normalize means
         means, _ = torch.chunk(sample, 2, dim=1)
-        return self.per_channel_statistics.normalize(means)
+        return self.per_channel_statistics.normalize(means).contiguous()
 
     def tiled_encode(
         self,
@@ -481,10 +484,11 @@ def prepare_tiles_for_encoding(
     return tiles
 
 
-def _clip_generators(
+def clip_generators(
     count: int,
     generator: torch.Generator | Sequence[torch.Generator | None] | None,
 ) -> Sequence[torch.Generator | None]:
+    """One generator per clip: broadcast a single generator (or ``None``), or check a sequence."""
     if generator is None:
         return (None,) * count
     if isinstance(generator, torch.Generator):
@@ -492,6 +496,19 @@ def _clip_generators(
     if len(generator) != count:
         raise ValueError(f"decode_single_frames got {count} latents and {len(generator)} generators")
     return generator
+
+
+def validate_single_frame_latents(latents: Sequence[torch.Tensor]) -> None:
+    """Raise unless every entry is a ``(B, C, 1, H, W)`` single-frame latent.
+    Checked over the whole list before any of it is decoded, so a decode that splits the list
+    across ranks raises on every rank instead of only on the one that owns the bad plane -- a
+    lone raiser leaves the rest of the group waiting on a collective that never comes.
+    """
+    for index, latent in enumerate(latents):
+        if latent.ndim != 5 or latent.shape[2] != 1:
+            raise ValueError(
+                f"decode_single_frames expects (B, C, 1, H, W) latents, got {tuple(latent.shape)} at index {index}"
+            )
 
 
 def iter_decoded_single_frames(
@@ -503,12 +520,9 @@ def iter_decoded_single_frames(
     Dist must pass the inner SGPU decoder, not itself: ``decode_video`` on Dist splits the
     volume and workers return an empty iterator.
     """
-    gens = _clip_generators(len(latents), generator)
+    gens = clip_generators(len(latents), generator)
+    validate_single_frame_latents(latents)
     for index, (latent, gen) in enumerate(zip(latents, gens, strict=True)):
-        if latent.ndim != 5 or latent.shape[2] != 1:
-            raise ValueError(
-                f"decode_single_frames expects (B, C, 1, H, W) latents, got {tuple(latent.shape)} at index {index}"
-            )
         chunks = list(decoder.decode_video(latent, tiling_config=None, generator=gen))
         if not chunks:
             raise RuntimeError(f"Decoder returned no pixels for single-frame latent {index}")
@@ -531,6 +545,7 @@ class VideoDecoder(Protocol):
         generator: torch.Generator | None = None,
         *,
         keyframes: "DecodeKeyframes | None" = None,
+        **kwargs: object,
     ) -> Iterator[torch.Tensor]:
         """Decode a video latent tensor, yielding float chunks ``[f, h, w, c]`` in ``[0, 1]``.
         ``keyframes`` anchors the decode on already-encoded single-frame planes. It is a hint,
@@ -546,7 +561,8 @@ class VideoDecoder(Protocol):
     ) -> Iterator[torch.Tensor]:
         """Decode each latent as its own one-frame clip, yielding one RGB tensor per latent.
         A causal VAE cannot decode stacked independent planes without bleeding neighbours.
-        Dist implementations decode locally on every rank; they do not split or gather.
+        Dist implementations split the list across their ranks and gather the pixels back, so
+        every rank still receives every frame, in the order the latents were given.
         """
         ...
 

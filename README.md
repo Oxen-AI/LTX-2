@@ -139,14 +139,13 @@ See **[LTX-2.3 models](MODELS-LTX-2.3.md)** for the full list.
 
 * **[DistilledPipeline](packages/ltx-pipelines/src/ltx_pipelines/distilled.py)** - Fastest text/image-to-video (starting point)
 * **[DFRPipeline](packages/ltx-pipelines/src/ltx_pipelines/dfr_pipeline.py)** - Production-quality text/image-to-video (slower, more VRAM): same distilled transformer, generated keyframes, spatial detailing, optional 2x/4x fps. How to run: [DFR in Quick Start](#dfr-production-quality) and [Running DFR](packages/ltx-pipelines/docs/pipelines.md#running-dfr)
-* **[TI2VidTwoStagesPipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages.py)** - Guided two-stage text/image-to-video with CFG/STG and 2x upsampling
+* **[TI2VidTwoStagesPipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages.py)** - Guided two-stage text/image-to-video and keyframe interpolation with CFG/STG and 2x upsampling
 * **[TI2VidTwoStagesHQPipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages_hq.py)** - Same guided two-stage flow with the res_2s sampler (fewer steps)
 * **[TI2VidOneStagePipeline](packages/ltx-pipelines/src/ltx_pipelines/ti2vid_one_stage.py)** - Single-stage generation for quick prototyping
 * **[ICLoraPipeline](packages/ltx-pipelines/src/ltx_pipelines/ic_lora.py)** - Video-to-video and image-to-video transformations (uses distilled model.)
-* **[KeyframeInterpolationPipeline](packages/ltx-pipelines/src/ltx_pipelines/keyframe_interpolation.py)** - Interpolate between keyframe images
 * **[A2VidPipelineTwoStage](packages/ltx-pipelines/src/ltx_pipelines/a2vid_two_stage.py)** - Audio-to-video generation conditioned on an input audio file
 * **[RetakePipeline](packages/ltx-pipelines/src/ltx_pipelines/retake.py)** - Regenerate a specific time region of an existing video
-* **[HDRICLoraPipeline](packages/ltx-pipelines/src/ltx_pipelines/hdr_ic_lora.py)** - Video-to-video with HDR IC-LoRA output (linear float via LogC3 inverse decode, suitable for EXR export and tonemapping)
+* **[HDRICLoraPipeline](packages/ltx-pipelines/src/ltx_pipelines/hdr_ic_lora.py)** - Video-to-video SDR→HDR with an HDR IC-LoRA, writing a BT.2020/HLG master plus an ACEScct EXR sequence for EXR export and grading
 * **[DubItPipeline](packages/ltx-pipelines/src/ltx_pipelines/dubit.py)** - Dub-It: rephrasing while matching speaker identity and lip movements (distilled model, single IC-LoRA, two stages).
 * **Native HDR / EXR** — standard pipelines accept EXR stills and EXR-frame folders with `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}` and write half EXR frames plus a BT.2020/HLG master. See [HDR Support](packages/ltx-pipelines/docs/hdr.md).
 

@@ -1,19 +1,21 @@
+from __future__ import annotations
+
 import logging
 from collections.abc import Sequence
+from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import torch
 
 from ltx_core.components.noisers import Noiser
 from ltx_core.conditioning import (
     ConditioningItem,
-    VideoConditionByKeyframeIndex,
-    VideoConditionByLatentIndex,
     VideoGeneratedKeyframeSlots,
 )
 from ltx_core.devices import activation_budget_bytes, cleanup_accelerator_memory, get_preferred_device
 from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 from ltx_core.model.audio_vae import encode_audio
-from ltx_core.model.transformer import Modality
+from ltx_core.model.transformer import Modality, TokenTimesteps
 from ltx_core.model.video_vae import AutoTiling, TileSizeConfig, TilingConfig, VideoEncoder
 from ltx_core.model.video_vae.diffusion_tiling import recommended_decode_tiling_config
 from ltx_core.model.video_vae.keyframes import DecodeKeyframes
@@ -36,7 +38,6 @@ from ltx_core.types import (
     VideoLatentShape,
     VideoPixelShape,
 )
-from ltx_pipelines.utils.args import ImageConditioningInput
 from ltx_pipelines.utils.media_io import (
     ResizeMode,
     decode_audio_from_file,
@@ -44,12 +45,15 @@ from ltx_pipelines.utils.media_io import (
     decode_video_from_file,
     get_videostream_fps,
     is_exr_dir,
-    load_exr_folder_conditioning_hdr,
-    load_image_and_preprocess,
+    load_exr_as_hdr_conditioning,
     resize_aspect_ratio_preserving,
     video_preprocess,
 )
-from ltx_pipelines.utils.media_io.color_config import HDRColorSpace
+from ltx_pipelines.utils.media_io.color_config import EXRColorSpace
+from ltx_pipelines.utils.types import LoadedImageConditioning
+
+if TYPE_CHECKING:
+    from ltx_pipelines.utils.blocks import DiffusionStage
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,70 @@ def get_device() -> torch.device:
 
 def cleanup_memory() -> None:
     cleanup_accelerator_memory()
+
+
+def create_initial_video_latent(
+    *,
+    width: int,
+    height: int,
+    frames: int,
+    fps: float,
+    device: torch.device,
+    dtype: torch.dtype,
+    scale_factors: SpatioTemporalScaleFactors,
+) -> torch.Tensor:
+    """Allocate a zero video latent from pixel ``width`` / ``height`` / ``frames``."""
+    pixel_shape = VideoPixelShape(batch=1, frames=frames, height=height, width=width, fps=fps)
+    shape = VideoLatentShape.from_pixel_shape(pixel_shape, scale_factors=scale_factors)
+    return torch.zeros(*shape.to_torch_shape(), device=device, dtype=dtype)
+
+
+def create_initial_audio_latent(
+    video_latent: torch.Tensor,
+    *,
+    fps: float,
+    video_scale_factors: SpatioTemporalScaleFactors,
+) -> torch.Tensor:
+    """Allocate a zero audio latent whose duration matches ``video_latent``.
+    ``video_scale_factors`` are the video VAE's spatiotemporal factors (audio has none of
+    its own). Pass the same value used to size ``video_latent``.
+    """
+    video_shape = VideoLatentShape.from_torch_shape(video_latent.shape)
+    audio_shape = AudioLatentShape.from_duration(
+        batch=video_shape.batch,
+        duration=float(video_shape.upscale(video_scale_factors).frames) / float(fps),
+    )
+    return torch.zeros(
+        *audio_shape.to_torch_shape(),
+        device=video_latent.device,
+        dtype=video_latent.dtype,
+    )
+
+
+def create_initial_av_latents(
+    *,
+    width: int,
+    height: int,
+    frames: int,
+    fps: float,
+    device: torch.device,
+    dtype: torch.dtype,
+    video_scale_factors: SpatioTemporalScaleFactors,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Allocate matching zero video and audio latents.
+    ``video_scale_factors`` are the video VAE's spatiotemporal factors. Audio duration
+    follows the video canvas those factors produce.
+    """
+    video_latent = create_initial_video_latent(
+        width=width,
+        height=height,
+        frames=frames,
+        fps=fps,
+        device=device,
+        dtype=dtype,
+        scale_factors=video_scale_factors,
+    )
+    return video_latent, create_initial_audio_latent(video_latent, fps=fps, video_scale_factors=video_scale_factors)
 
 
 # Historical Conv VAE ``TilingConfig.default()`` spatial long-side + temporal chunk
@@ -184,7 +252,7 @@ def video_latent_from_file(
     start_time: float = 0.0,
     max_duration: float | None = None,
     tiling_config: TilingConfig | None = None,
-    color_space: HDRColorSpace | None = None,
+    color_space: EXRColorSpace | None = None,
 ) -> torch.Tensor | None:
     """Load video from a file or EXR-frame folder, and encode to latents.
     Args:
@@ -217,13 +285,13 @@ def video_latent_from_file(
         frame_cap = max(1, round(max_duration * fps))
         frames = torch.cat(
             list(
-                load_exr_folder_conditioning_hdr(
-                    exr_dir=file_path,
-                    height=output_shape.height,
-                    width=output_shape.width,
+                load_exr_as_hdr_conditioning(
+                    file_path,
+                    output_shape.height,
+                    output_shape.width,
+                    dtype,
+                    device,
                     frame_cap=frame_cap,
-                    dtype=dtype,
-                    device=device,
                     color_space=color_space,
                     resize_mode=ResizeMode.CENTER_CROP,
                     frame_start=frame_start,
@@ -282,102 +350,16 @@ def audio_latent_from_file(
     return _conform_latent_length(latents, required_latent_frames)
 
 
-def combined_image_conditionings(
-    images: list[ImageConditioningInput],
+def image_conditionings(
+    images: Sequence[LoadedImageConditioning],
     height: int,
     width: int,
     video_encoder: VideoEncoder,
     dtype: torch.dtype,
     device: torch.device,
-    color_space: HDRColorSpace | None = None,
 ) -> list[ConditioningItem]:
-    """Create a list of conditionings by replacing the latent at the first frame with the encoded image if present
-    and using other encoded images as the keyframe conditionings."""
-    conditionings = []
-    for img in images:
-        image = load_image_and_preprocess(
-            image_path=img.path,
-            height=height,
-            width=width,
-            dtype=dtype,
-            device=device,
-            crf=img.crf,
-            color_space=color_space,
-        )
-        encoded_image = video_encoder(image)
-        if img.frame_idx == 0:
-            conditioning = VideoConditionByLatentIndex(
-                latent=encoded_image,
-                strength=img.strength,
-                latent_idx=0,
-            )
-        else:
-            conditioning = VideoConditionByKeyframeIndex(
-                keyframes=encoded_image,
-                strength=img.strength,
-                frame_idx=img.frame_idx,
-            )
-        conditionings.append(conditioning)
-    return conditionings
-
-
-def image_conditionings_by_replacing_latent(
-    images: list[ImageConditioningInput],
-    height: int,
-    width: int,
-    video_encoder: VideoEncoder,
-    dtype: torch.dtype,
-    device: torch.device,
-    color_space: HDRColorSpace | None = None,
-) -> list[ConditioningItem]:
-    conditionings = []
-    for img in images:
-        image = load_image_and_preprocess(
-            image_path=img.path,
-            height=height,
-            width=width,
-            dtype=dtype,
-            device=device,
-            crf=img.crf,
-            color_space=color_space,
-        )
-        encoded_image = video_encoder(image)
-        conditionings.append(
-            VideoConditionByLatentIndex(
-                latent=encoded_image,
-                strength=img.strength,
-                latent_idx=img.frame_idx,
-            )
-        )
-
-    return conditionings
-
-
-def image_conditionings_by_adding_guiding_latent(
-    images: list[ImageConditioningInput],
-    height: int,
-    width: int,
-    video_encoder: VideoEncoder,
-    dtype: torch.dtype,
-    device: torch.device,
-    color_space: HDRColorSpace | None = None,
-) -> list[ConditioningItem]:
-    conditionings = []
-    for img in images:
-        image = load_image_and_preprocess(
-            image_path=img.path,
-            height=height,
-            width=width,
-            dtype=dtype,
-            device=device,
-            crf=img.crf,
-            color_space=color_space,
-        )
-        encoded_image = video_encoder(image)
-        conditionings.append(
-            VideoConditionByKeyframeIndex(keyframes=encoded_image, frame_idx=img.frame_idx, strength=img.strength)
-        )
-    return conditionings
+    """Encode loaded stills at ``height`` x ``width`` into conditioning items using each ``binding``."""
+    return [img.to_item(video_encoder(img.still.tensor(height, width, dtype, device))) for img in images]
 
 
 def evenly_spaced_keyframe_positions(num_keyframes: int, num_frames: int) -> list[int]:
@@ -392,6 +374,34 @@ def evenly_spaced_keyframe_positions(num_keyframes: int, num_frames: int) -> lis
             f"num_keyframes={num_keyframes}, num_frames={num_frames}"
         )
     return torch.linspace(0, num_frames - 1, num_keyframes + 2).round().to(torch.int64).tolist()[1:-1]
+
+
+def assert_stage_supports_generated_keyframes(stage: DiffusionStage) -> None:
+    """Raise unless ``stage``'s checkpoint declares the keyframe absolute-position embedding."""
+    if stage.supports_generated_keyframes:
+        return
+    raise ValueError(
+        f"Generated keyframe slots were requested, but the checkpoint at "
+        f"{stage._transformer_builder.checkpoint} does not set 'use_keyframes_abs_pos_embedding' "
+        f"in its transformer config, so it has no keyframe absolute-position embedding. Use a "
+        f"generated-keyframe checkpoint or drop the keyframe request."
+    )
+
+
+def assert_generated_keyframes_request(
+    decode_with_keyframes: bool,
+    generated_keyframes: int | Sequence[int],
+    stage: DiffusionStage,
+) -> None:
+    """Validate generated-keyframe and keyframe-decode requests before building models."""
+    if has_generated_keyframes(generated_keyframes):
+        assert_stage_supports_generated_keyframes(stage)
+        return
+    if decode_with_keyframes:
+        raise ValueError(
+            "decode_with_keyframes requires generated keyframe slots; pass "
+            "generated_keyframes > 0 or an explicit position list."
+        )
 
 
 def has_generated_keyframes(generated_keyframes: int | Sequence[int]) -> bool:
@@ -476,9 +486,8 @@ def create_noised_state(
     """
     state = tools.create_initial_state(device, dtype, initial_latent)
     state = state_with_conditionings(state, conditionings, tools)
-    state = noiser(state, noise_scale)
-
-    return state
+    state = replace(state, denoise_mask=state.denoise_mask.compact(device))
+    return noiser(state, noise_scale)
 
 
 def state_with_conditionings(
@@ -514,11 +523,18 @@ def modality_from_latent_state(
     """
     if state.frozen:
         sigma = torch.zeros_like(sigma)
+    values = state.denoise_mask.values
+    timesteps = timesteps_from_mask(values.reshape(1, -1), sigma)
+    # Clamped because a mask value above the table's last entry would otherwise index one
+    # past it, and that read happens inside a captured CUDA graph.
+    timestep_indices = torch.searchsorted(
+        values, state.denoise_mask.tensor.reshape(state.latent.shape[0], -1), out_int32=True
+    ).clamp_(max=values.numel() - 1)
     return Modality(
         enabled=enabled,
         latent=state.latent,
         sigma=sigma,
-        timesteps=timesteps_from_mask(state.denoise_mask, sigma),
+        timesteps=TokenTimesteps(timesteps, timestep_indices, state.denoise_mask.zero_index),
         positions=state.positions,
         context=context,
         context_mask=None,

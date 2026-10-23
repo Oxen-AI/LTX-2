@@ -2,22 +2,23 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 
+from ltx_core.model.video_vae import decode_workspace
 from ltx_core.model.video_vae.transformer.layers import ChannelLinear
 
-
-def _out_slack_rows() -> int:
-    from ltx_kernels.vae import OUT_SLACK_ROWS  # noqa: PLC0415
-
-    return int(OUT_SLACK_ROWS)
+if TYPE_CHECKING:
+    from ltx_core.model.video_vae.keyframes import KeyframePlanes
 
 
 def alloc_block_volume(shape: tuple[int, ...], *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """A ``(1,T,H,W,C)`` tensor whose storage carries the fused kernel's lane slack."""
+    """A ``(1,T,H,W,C)`` tensor whose storage carries the fused kernel's lane slack, leased from the active
+    decode workspace until its tile ends (``torch.empty`` style without one)."""
     _, t, h, w, c = shape
-    rows = torch.empty((t * h * w + _out_slack_rows(), c), device=device, dtype=dtype)
+    rows = decode_workspace.volume((t * h * w + decode_workspace.out_slack_rows(), c), device=device, dtype=dtype)
     return rows[: t * h * w].view(1, t, h, w, c)
 
 
@@ -38,7 +39,7 @@ def _recyclable_rows(volume: torch.Tensor) -> torch.Tensor | None:
         return None
     channels = volume.shape[-1]
     n_rows = volume.numel() // channels
-    want = n_rows + _out_slack_rows()
+    want = n_rows + decode_workspace.out_slack_rows()
     have = volume.untyped_storage().nbytes() // (volume.element_size() * channels)
     if not volume.is_contiguous() or have < want:
         return None
@@ -91,8 +92,7 @@ class DSLDiffusionBlockChain(nn.ModuleList):
         keyframe_x: torch.Tensor,
         keyframe_stage4_feat: torch.Tensor,
         modulation: tuple[torch.Tensor, ...],
-        keyframe_times: torch.Tensor,
-        keyframe_valid: torch.Tensor,
+        keyframe_planes: KeyframePlanes,
         *,
         drop_leading_frame: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -112,8 +112,7 @@ class DSLDiffusionBlockChain(nn.ModuleList):
                 keyframe_x,
                 keyframe_stage4_feat,
                 modulation,
-                keyframe_times,
-                keyframe_valid,
+                keyframe_planes,
                 drop_leading_frame=drop_leading_frame,
                 out=spare,
                 out_keyframes=keyframe_spare,

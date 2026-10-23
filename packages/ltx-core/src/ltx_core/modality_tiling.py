@@ -1,7 +1,6 @@
 """Video modality tiling helpers.
-Provides :class:`VideoModalityTilingHelper` — a stateless helper that
-tiles and blends video :class:`Modality` token sequences by
-spatial/temporal region.  Tile geometry is represented by the existing
+Provides :class:`VideoModalityTilingHelper`, which tiles and blends video
+:class:`Modality` token sequences by spatial/temporal region.  Tile geometry is represented by the existing
 :class:`Tile` NamedTuple from :mod:`ltx_core.tiling`; no distributed
 primitives are required.
 """
@@ -9,18 +8,20 @@ primitives are required.
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field, replace
 from functools import partial
 
 import torch
 
+from ltx_core.devices import upload_from_host
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.tiling import (
     DimensionTilingConfig,
     SplitOperation,
     Tile,
     TileCountConfig,
+    TileSizeConfig,
     create_tiles,
     identity_mapping_operation,
     split_at_seams,
@@ -29,6 +30,22 @@ from ltx_core.tools import VideoLatentTools
 from ltx_core.types import VideoLatentShape
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _TilePlan:
+    """One tile's token layout for one positions tensor; device tables reused at every step.
+    The layout is fixed once planned; only the per-``(dtype, device)`` weight caches fill in lazily.
+    """
+
+    keep_indices: torch.Tensor
+    gen_indices: torch.Tensor
+    cond_indices: torch.Tensor | None
+    num_tile_gen: int
+    cond_blend_weights: torch.Tensor | None
+    positions: torch.Tensor
+    blend_weights: dict[tuple[torch.dtype, torch.device], torch.Tensor] = field(default_factory=dict)
+    cond_weights: dict[tuple[torch.dtype, torch.device], torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -46,6 +63,7 @@ class TilingContext:
     """``(num_kept_cond,)`` — weight for each kept conditioning token,
     equal to ``1 / num_tiles_that_keep_this_token``.  ``None`` when
     there are no conditioning tokens."""
+    plan: _TilePlan
 
 
 def seam_split(
@@ -76,11 +94,17 @@ def seam_split(
 
 
 class VideoModalityTilingHelper:
-    """Stateless helper that tiles and blends video :class:`Modality` sequences.
+    """Tiles and blends video :class:`Modality` sequences.
     Constructed once with a :class:`TileCountConfig` and
     :class:`VideoLatentTools`.  Tiles are computed at construction and
     available via the :attr:`tiles` property.  Use :meth:`tile_modality`
     and :meth:`blend` with any tile from that list.
+    Every tile's token layout depends only on ``modality.positions``. The first
+    :meth:`tile_modality` call for a positions tensor plans all tiles at once (its
+    host syncs drain the GPU queue a single time, before the sequence's first
+    forward) and later calls with the same tensor -- a denoising loop carries it
+    unchanged across steps -- read those plans. The helper holds the tensor while
+    its plans are live, so the identity check cannot see a recycled object.
     Passing ``seams`` (interior latent-frame indices) lets a temporal split land on those
     cells instead of blended overlaps (:func:`seam_split`); leftover segments go to the
     leading tiles. Missing or non-interior seams keep the blended split. A regular keyframe
@@ -95,7 +119,7 @@ class VideoModalityTilingHelper:
 
     def __init__(
         self,
-        tiling: TileCountConfig,
+        tiling: TileCountConfig | TileSizeConfig,
         video_tools: VideoLatentTools,
         seams: Sequence[int] = (),
     ) -> None:
@@ -104,7 +128,11 @@ class VideoModalityTilingHelper:
         self._num_generated_tokens = self._patchifier.get_token_count(self._latent_shape)
         frames, height, width = tiling.to_splitters(video_tools.scale_factors, causal_temporal=False)
         frames_mapper = identity_mapping_operation
-        seam_op = seam_split(seams, self._latent_shape.frames, tiling.frames)
+        if seams and not isinstance(tiling, TileCountConfig):
+            raise ValueError("Known temporal seams require count-based tiling")
+        seam_op = (
+            seam_split(seams, self._latent_shape.frames, tiling.frames) if isinstance(tiling, TileCountConfig) else None
+        )
         if seam_op is not None:
             frames, frames_mapper = seam_op, partial(identity_mapping_operation, rectangular=True)
         self._tiles = create_tiles(
@@ -112,6 +140,9 @@ class VideoModalityTilingHelper:
             splitters=[frames, height, width],
             mappers=[frames_mapper, identity_mapping_operation, identity_mapping_operation],
         )
+        self._plan_positions: torch.Tensor | None = None
+        self._plan_num_total = -1
+        self._plans: dict[tuple[int, bool], _TilePlan] = {}
 
     @property
     def tiles(self) -> list[Tile]:
@@ -134,26 +165,8 @@ class VideoModalityTilingHelper:
             A ``(tiled_modality, context)`` tuple.  Pass *context* to
             :meth:`blend` together with the model output.
         """
-        device = modality.positions.device
-        gen_indices = self._generated_token_indices(tile, device=device)
-        num_total = modality.latent.shape[1]
-
-        cond_blend_weights: torch.Tensor | None = None
-        if num_total > self._num_generated_tokens:
-            keep_per_tile_cond = self._all_tiles_cond_keep(modality)  # (num_tiles, num_cond) bool
-            tile_idx = next((i for i, t in enumerate(self._tiles) if t.in_coords == tile.in_coords), None)
-            if tile_idx is None:
-                raise RuntimeError(
-                    f"Tile with in_coords={tile.in_coords} is not in this helper's tile set; "
-                    f"pass a tile obtained from `helper.tiles`."
-                )
-            my_cond_keep = keep_per_tile_cond[tile_idx]
-            cond_indices = self._num_generated_tokens + my_cond_keep.nonzero(as_tuple=False).squeeze(1)
-            keep_indices = torch.cat([gen_indices, cond_indices])
-            total_keepers = keep_per_tile_cond.sum(dim=0).float()  # (num_cond,)
-            cond_blend_weights = 1.0 / total_keepers[my_cond_keep]
-        else:
-            keep_indices = gen_indices
+        plan = self._plan(modality, tile, normalize_positions=normalize_positions)
+        keep_indices = plan.keep_indices
 
         tile_attention_mask = None
         if modality.attention_mask is not None:
@@ -166,24 +179,20 @@ class VideoModalityTilingHelper:
         if modality.keyframes_mask is not None:
             tile_keyframes_mask = modality.keyframes_mask[:, keep_indices]
 
-        positions = modality.positions[:, :, keep_indices, :]
-        if normalize_positions:
-            num_tile_gen = self._tile_generated_token_count(tile)
-            gen_pos = positions[:, :, :num_tile_gen, :]  # (B, 3, num_tile_gen, 2)
-            offset = gen_pos[..., 0].amin(dim=2, keepdim=True).unsqueeze(-1)  # (B, 3, 1, 1)
-            positions = positions - offset
-
         tiled = replace(
             modality,
             latent=modality.latent[:, keep_indices, :],
-            timesteps=modality.timesteps[:, keep_indices],
-            positions=positions,
+            timesteps=modality.timesteps.select_tokens(keep_indices),
+            positions=plan.positions,
             attention_mask=tile_attention_mask,
             keyframes_mask=tile_keyframes_mask,
         )
 
         return tiled, TilingContext(
-            keep_indices=keep_indices, num_total_tokens=num_total, cond_blend_weights=cond_blend_weights
+            keep_indices=keep_indices,
+            num_total_tokens=modality.latent.shape[1],
+            cond_blend_weights=plan.cond_blend_weights,
+            plan=plan,
         )
 
     # -- blend -------------------------------------------------------------
@@ -213,10 +222,8 @@ class VideoModalityTilingHelper:
             The output tensor with the blended tile added at the correct
             positions.
         """
+        plan = context.plan
         batch, _, dim = tile_to_blend.shape
-        num_tile_gen = self._tile_generated_token_count(tile)
-        gen_indices = self._generated_token_indices(tile, device=tile_to_blend.device)
-
         num_total_tokens = context.num_total_tokens
         expected_shape = (batch, num_total_tokens, dim)
 
@@ -227,22 +234,88 @@ class VideoModalityTilingHelper:
         else:
             result = torch.zeros(*expected_shape, device=tile_to_blend.device, dtype=tile_to_blend.dtype)
 
-        # Blend mask is (tile_F, tile_H, tile_W) — one weight per token in row-major order.
-        blend_weights = tile.blend_mask.reshape(-1).to(device=tile_to_blend.device, dtype=tile_to_blend.dtype)
-        tile_gen = tile_to_blend[:, :num_tile_gen, :] * blend_weights[None, :, None]
-
-        result[:, gen_indices, :] += tile_gen
+        # Blend mask is (tile_F, tile_H, tile_W) — one weight per token in row-major order. The dense mask is
+        # built on the host only when the plan has no copy on this device and dtype yet.
+        blend_weights = _device_weights(plan.blend_weights, lambda: tile.blend_mask.reshape(-1), tile_to_blend)
+        result[:, plan.gen_indices, :] += tile_to_blend[:, : plan.num_tile_gen, :] * blend_weights[None, :, None]
 
         # Scatter kept conditioning tokens, weighted by 1/N where N is
         # the number of tiles that keep each token (so they sum to 1).
-        if num_total_tokens > self._num_generated_tokens and context.cond_blend_weights is not None:
-            cond_indices = context.keep_indices[context.keep_indices >= self._num_generated_tokens]
-            weights = context.cond_blend_weights.to(device=tile_to_blend.device, dtype=tile_to_blend.dtype)
-            result[:, cond_indices, :] += tile_to_blend[:, num_tile_gen:, :] * weights[None, :, None]
+        if num_total_tokens > self._num_generated_tokens and plan.cond_blend_weights is not None:
+            cond_blend_weights = plan.cond_blend_weights
+            weights = _device_weights(plan.cond_weights, lambda: cond_blend_weights, tile_to_blend)
+            result[:, plan.cond_indices, :] += tile_to_blend[:, plan.num_tile_gen :, :] * weights[None, :, None]
 
         return result
 
     # -- private -----------------------------------------------------------
+
+    def _plan(self, modality: Modality, tile: Tile, *, normalize_positions: bool) -> _TilePlan:
+        """*tile*'s plan for this sequence; a new positions tensor or token count plans every tile again."""
+        num_total = modality.latent.shape[1]
+        if modality.positions is not self._plan_positions or num_total != self._plan_num_total:
+            self._plan_positions = modality.positions
+            self._plan_num_total = num_total
+            self._plans = {}
+        tile_idx = next((i for i, t in enumerate(self._tiles) if t.in_coords == tile.in_coords), None)
+        if tile_idx is None:
+            raise RuntimeError(
+                f"Tile with in_coords={tile.in_coords} is not in this helper's tile set; "
+                f"pass a tile obtained from `helper.tiles`."
+            )
+        key = (tile_idx, normalize_positions)
+        if key not in self._plans:
+            # The one host read of a plan build: how many conditioning tokens each tile keeps is data dependent.
+            keep_per_tile_cond = None
+            cond_keepers = None
+            if num_total > self._num_generated_tokens:
+                keep_per_tile_cond = self._all_tiles_cond_keep(modality).cpu()
+                cond_keepers = keep_per_tile_cond.sum(dim=0).float()  # (num_cond,)
+            for idx, t in enumerate(self._tiles):
+                cond_keep = keep_per_tile_cond[idx] if keep_per_tile_cond is not None else None
+                self._plans[(idx, normalize_positions)] = self._build_plan(
+                    modality, t, normalize_positions, cond_keep, cond_keepers
+                )
+        return self._plans[key]
+
+    def _build_plan(
+        self,
+        modality: Modality,
+        tile: Tile,
+        normalize_positions: bool,
+        cond_keep: torch.Tensor | None,
+        cond_keepers: torch.Tensor | None,
+    ) -> _TilePlan:
+        """*tile*'s plan. ``cond_keep`` is the tile's ``(num_cond,)`` keep row, ``cond_keepers`` how many tiles
+        keep each conditioning token; both host tensors, ``None`` without conditioning tokens."""
+        device = modality.positions.device
+        gen_indices = self._generated_token_indices(tile, device=device)
+        cond_indices = None
+        cond_blend_weights = None
+        if cond_keep is not None and cond_keepers is not None:
+            # The keep row is on the host: the indices and weights are derived there and uploaded
+            # through pinned memory, so no step of the plan waits on the device.
+            host_cond_indices = self._num_generated_tokens + cond_keep.nonzero(as_tuple=False).squeeze(1)
+            cond_indices = upload_from_host(host_cond_indices, device)
+            keep_indices = torch.cat([gen_indices, cond_indices])
+            cond_blend_weights = 1.0 / cond_keepers[cond_keep]
+        else:
+            keep_indices = gen_indices
+
+        num_tile_gen = self._tile_generated_token_count(tile)
+        positions = modality.positions[:, :, keep_indices, :]
+        if normalize_positions:
+            gen_pos = positions[:, :, :num_tile_gen, :]  # (B, 3, num_tile_gen, 2)
+            offset = gen_pos[..., 0].amin(dim=2, keepdim=True).unsqueeze(-1)  # (B, 3, 1, 1)
+            positions = positions - offset
+        return _TilePlan(
+            keep_indices=keep_indices,
+            gen_indices=gen_indices,
+            cond_indices=cond_indices,
+            num_tile_gen=num_tile_gen,
+            cond_blend_weights=cond_blend_weights,
+            positions=positions,
+        )
 
     def _tile_generated_token_count(self, tile: Tile) -> int:
         """Number of generated tokens in *tile*."""
@@ -295,3 +368,18 @@ class VideoModalityTilingHelper:
         overlaps_all_dims = overlaps.all(dim=2)  # (num_tiles, B, num_cond)
         has_negative_time = (cond_positions[:, 0, :, 0] < 0)[None]  # (1, B, num_cond)
         return (overlaps_all_dims | has_negative_time).any(dim=1)  # (num_tiles, num_cond)
+
+
+def _device_weights(
+    cache: dict[tuple[torch.dtype, torch.device], torch.Tensor],
+    weights: Callable[[], torch.Tensor],
+    like: torch.Tensor,
+) -> torch.Tensor:
+    """``weights()`` on ``like``'s device and dtype, built and uploaded once per plan through pinned memory."""
+    key = (like.dtype, like.device)
+    if key not in cache:
+        host = weights().to(dtype=like.dtype)
+        if like.device.type == "cuda" and host.device.type == "cpu":
+            host = host.pin_memory()
+        cache[key] = host.to(device=like.device, non_blocking=True)
+    return cache[key]

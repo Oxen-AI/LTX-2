@@ -6,7 +6,7 @@ import torch
 
 from ltx_core.conditioning.item import ConditioningItem
 from ltx_core.tools import LatentTools
-from ltx_core.types import LatentState
+from ltx_core.types import DenoiseMask, LatentState
 
 
 class VideoConditionByMask(ConditioningItem):
@@ -45,5 +45,5 @@ class VideoConditionByMask(ConditioningItem):
         return replace(
             latent_state,
             clean_latent=latent_state.clean_latent * inv + tokens * m,
-            denoise_mask=latent_state.denoise_mask * inv + (1.0 - self.strength) * m,
+            denoise_mask=DenoiseMask(latent_state.denoise_mask.tensor * inv.cpu() + (1.0 - self.strength) * m.cpu()),
         )

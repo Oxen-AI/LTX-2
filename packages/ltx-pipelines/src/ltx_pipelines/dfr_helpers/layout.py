@@ -95,20 +95,27 @@ class TemporalTilePlan:
         temporal_scale: int = VIDEO_SCALE_FACTORS.time,
     ) -> None:
         """Partition the canvas with :func:`split_canvas_at_seams` and attach per-window anchors/slots.
-        Overlap is one canvas segment in latent cells plus the shared seam cell, matching the old
-        lead-in + ``drop_latent_prefix += 1`` handover. Remainder segments go to the leading tiles.
+        Remainder segments go to the leading tiles.
+        Slots are one per canvas segment midpoint, derived globally and then handed to whichever
+        window contains them.
+        The split takes **no overlap**: a tile's kept cells are exactly the segments it owns. The
+        pinned prefix a non-first tile denoises before them is not a cell count at all -- it starts
+        at the last keyframe before the seam, so the caller derives it from the plane positions
+        (:func:`~ltx_pipelines.dfr_helpers.ops.tile_prefix`) rather than from a configured overlap.
         """
         seams = [0, *(pixel_to_latent_index(position, temporal_scale) for position in seam_positions)]
         latent_len = (num_frames - 1) // temporal_scale + 1
-        overlap = (seams[1] - seams[0]) + 1 if len(seams) > 1 else 0
-        intervals = split_canvas_at_seams(seams, num_tiles, overlap, latent_len)
+        intervals = split_canvas_at_seams(seams, num_tiles, 0, latent_len)
+        # Midpoints of the *canvas* segments, not of each window's own marks. A window's first mark
+        # is its own start, so per-window midpoints land wherever that falls -- including off the x8
+        # latent border, which a plane may not do: a tile starts on one (see ``tile_prefix``).
+        global_slots = [(left + right) // 2 for left, right in itertools.pairwise([0, *seam_positions])]
         tiles: list[TemporalTile] = []
         for interval in intervals:
             pixel_start = interval.start * temporal_scale
             pixel_end = (interval.end - 1) * temporal_scale
             anchors = tuple(position for position in seam_positions if pixel_start <= position <= pixel_end)
-            marks = [pixel_start, *[position for position in seam_positions if pixel_start < position <= pixel_end]]
-            slots = tuple((left + right) // 2 for left, right in itertools.pairwise(marks))
+            slots = tuple(position for position in global_slots if pixel_start <= position <= pixel_end)
             tiles.append(TemporalTile(interval, pixel_start, pixel_end, anchors, slots))
         self.tiles = tuple(tiles)
 

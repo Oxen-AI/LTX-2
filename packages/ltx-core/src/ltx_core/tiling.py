@@ -222,6 +222,55 @@ def split_by_size(size: int, overlap: int, min_tile_size: int | None = None) -> 
     return split
 
 
+def split_by_size_pinned(size: int, min_overlap: int) -> SplitOperation:
+    """Split into equal-size tiles with first and last origins pinned to the extent.
+    Unlike :func:`split_by_size`, this operation never emits a short trailing
+    tile. ``min_overlap`` is a target of at most half ``size``. The tile count
+    grows until the target is met, capped so three tiles never cover one cell.
+    The realized overlap therefore follows from the extent and can differ from
+    the target in either direction: below it when the cap is hit, and up to
+    ``size - 1`` when two tiles span an extent barely longer than one tile
+    (33 cells, ``size=32``: overlap 31).
+    This layout is intended for models trained on a fixed spatial window, where
+    changing the final tile's shape changes the model's effective content scale.
+    """
+    if size <= 0:
+        raise ValueError(f"size must be > 0, got {size}")
+    if min_overlap < 0 or min_overlap * 2 > size:
+        raise ValueError(f"min_overlap must be at most half the tile size, got min_overlap={min_overlap}, size={size}")
+
+    def split(dimension_size: int) -> DimensionIntervals:
+        if dimension_size <= size:
+            return DEFAULT_SPLIT_OPERATION(dimension_size)
+
+        # Cap so a tile and the one two steps away cannot overlap.
+        limit = max(2, 1 + (dimension_size - size) // ((size + 1) // 2))
+        tiles_count = 2
+        while tiles_count < limit and (tiles_count * size - dimension_size) / (tiles_count - 1) < min_overlap:
+            tiles_count += 1
+        base, remainder = divmod(dimension_size - size, tiles_count - 1)
+        origins = [0]
+        for index in range(tiles_count - 1):
+            origins.append(origins[-1] + base + (1 if index < remainder else 0))
+
+        intervals: list[DimensionInterval] = []
+        for index, start in enumerate(origins):
+            left_overlap = 0 if index == 0 else origins[index - 1] + size - start
+            right_overlap = 0 if index == tiles_count - 1 else start + size - origins[index + 1]
+            intervals.append(
+                DimensionInterval(
+                    start=start,
+                    end=start + size,
+                    left_ramp=left_overlap,
+                    right_ramp=right_overlap,
+                )
+            )
+        _validate_tile_intervals(intervals, dim_size=dimension_size, min_tile_size=size)
+        return DimensionIntervals(intervals=intervals)
+
+    return split
+
+
 def split_temporal_causal(size: int, overlap: int, min_tile_size: int | None = None) -> SplitOperation:
     """Split a temporal axis into overlapping tiles with causal handling.
     Each tile after the first is shifted back by 1 and its left ramp is

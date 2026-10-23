@@ -439,10 +439,9 @@ Here's how all the components work together conceptually ([`src/ltx_core/compone
 7. **VAE Decoding**: Decode latents to pixel space (with optional upsampling for two-stage)
 
 - [`DFRPipeline`](../ltx-pipelines/src/ltx_pipelines/dfr_pipeline.py) - Production-quality text/image-to-video
-- [`TI2VidTwoStagesPipeline`](../ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages.py) - Guided two-stage text-to-video
+- [`TI2VidTwoStagesPipeline`](../ltx-pipelines/src/ltx_pipelines/ti2vid_two_stages.py) - Guided two-stage text/image-to-video and keyframe interpolation
 - [`ICLoraPipeline`](../ltx-pipelines/src/ltx_pipelines/ic_lora.py) - Video-to-video with IC-LoRA control
 - [`DistilledPipeline`](../ltx-pipelines/src/ltx_pipelines/distilled.py) - Fast inference with distilled model
-- [`KeyframeInterpolationPipeline`](../ltx-pipelines/src/ltx_pipelines/keyframe_interpolation.py) - Keyframe-based interpolation
 
 See the [ltx-pipelines README](../ltx-pipelines/README.md) for usage examples.
 

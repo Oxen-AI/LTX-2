@@ -16,6 +16,7 @@ at::Tensor rms_norm_split_rope(
     at::Tensor &sin_freqs,
     at::Tensor &cos_freqs,
     at::Tensor &weights,
+    double eps,
     bool out_fp8
 );
 

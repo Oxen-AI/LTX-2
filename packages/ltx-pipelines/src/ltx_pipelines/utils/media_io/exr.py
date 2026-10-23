@@ -13,11 +13,27 @@ import OpenImageIO
 import torch
 
 from ltx_core.color.primaries import Primaries
-from ltx_pipelines.utils.media_io.color_config import HDRColorSpace
+from ltx_pipelines.utils.media_io.color_config import EXRColorSpace, to_working_space
 from ltx_pipelines.utils.media_io.range_map import to_vae_range
 from ltx_pipelines.utils.media_io.resize import ResizeMode, resize_and_center_crop, resize_and_reflect_pad
 
 logger = logging.getLogger(__name__)
+
+
+def exr_dir_label(color_space: EXRColorSpace) -> str:
+    """Path token for HDR EXR dirs."""
+    return color_space.value
+
+
+def exr_colorspace_tag(color_space: EXRColorSpace) -> str:
+    """OpenEXR ``colorSpace`` attribute (transfer). Chromaticities come from ``source_primaries``."""
+    match color_space:
+        case EXRColorSpace.ACESCCT:
+            return "ACEScct"
+        case EXRColorSpace.ACESCG:
+            return "ACEScg"
+        case EXRColorSpace.SRGB_LINEAR:
+            return "sRGB"
 
 
 def is_exr_dir(path: str | Path) -> bool:
@@ -57,7 +73,7 @@ def _exr_paths_for_conditioning(path: str | Path) -> list[Path]:
     raise ValueError(f"EXR conditioning path must be a .exr file or a directory of EXRs; got {path!r}")
 
 
-def load_exr_conditioning_hdr(
+def load_exr_as_hdr_conditioning(
     path: str | Path,
     height: int,
     width: int,
@@ -66,14 +82,14 @@ def load_exr_conditioning_hdr(
     *,
     frame_cap: int,
     frame_start: int = 0,
-    color_space: HDRColorSpace,
+    color_space: EXRColorSpace,
     resize_mode: ResizeMode = ResizeMode.REFLECT_PAD,
 ) -> Iterator[torch.Tensor]:
     """Load EXR still(s) as HDR conditioning for the VAE.
     ``path`` may be a single ``.exr`` or a directory of ``*.exr`` frames (sorted
     lexicographically). Colour handling follows ``color_space``:
-    * ``SRGB_LINEAR`` / ``ACESCG`` — compress via :meth:`HDRTransfer.to_working_space`
-      (ACEScct) from the matching source primaries.
+    * ``SRGB_LINEAR`` / ``ACESCG`` — compress via :func:`~ltx_core.hdr.to_acescct_working_space`
+      from the matching source primaries.
     * ``ACESCCT`` — already working-space log codes; clamp then :func:`to_vae_range`
       (no transfer).
     Yields:
@@ -91,17 +107,13 @@ def load_exr_conditioning_hdr(
             break
         pixels = read_exr(fp).to(device=device, dtype=torch.float32)  # [H, W, 3]
         frame = resize_fn(pixels, height, width)  # [1, 3, 1, H, W]
-        if color_space.is_log_working:
-            # Already working-space codes; clamp file noise into the legal range.
-            working = frame.clamp(0.0, 1.0)
-        else:
-            working = color_space.transfer.to_working_space(frame, source_primaries=color_space.source_primaries)
+        working = to_working_space(frame, color_space)
         yield to_vae_range(working).to(device=device, dtype=dtype)
         count += 1
 
     if count < frame_cap:
         logger.warning(
-            "load_exr_conditioning_hdr: requested %d frames from '%s' (frame_start=%d) "
+            "load_exr_as_hdr_conditioning: requested %d frames from '%s' (frame_start=%d) "
             "but only %d were available — conditioning is shorter than the generation length.",
             frame_cap,
             path,
@@ -110,47 +122,22 @@ def load_exr_conditioning_hdr(
         )
 
 
-def load_exr_folder_conditioning_hdr(
-    exr_dir: str | Path,
-    height: int,
-    width: int,
-    frame_cap: int,
-    dtype: torch.dtype,
-    device: torch.device,
-    color_space: HDRColorSpace,
-    resize_mode: ResizeMode = ResizeMode.REFLECT_PAD,
-    frame_start: int = 0,
-) -> Iterator[torch.Tensor]:
-    """Load a folder of EXR frames as HDR conditioning. See :func:`load_exr_conditioning_hdr`."""
-    return load_exr_conditioning_hdr(
-        exr_dir,
-        height,
-        width,
-        dtype,
-        device,
-        frame_cap=frame_cap,
-        frame_start=frame_start,
-        color_space=color_space,
-        resize_mode=resize_mode,
-    )
-
-
-def load_exr_image_conditioning_hdr(
+def load_exr_image_as_hdr_conditioning(
     exr_path: str | Path,
     height: int,
     width: int,
     dtype: torch.dtype,
     device: torch.device,
-    color_space: HDRColorSpace,
+    color_space: EXRColorSpace,
     resize_mode: ResizeMode = ResizeMode.CENTER_CROP,
 ) -> torch.Tensor:
     """Load a single EXR still as HDR image conditioning for the VAE.
-    Thin wrapper over :func:`load_exr_conditioning_hdr` (default center-crop).
+    Thin wrapper over :func:`load_exr_as_hdr_conditioning` (default center-crop).
     Returns:
         Tensor ``(1, C, 1, height, width)`` in VAE range ``[-1, 1]``.
     """
     return next(
-        load_exr_conditioning_hdr(
+        load_exr_as_hdr_conditioning(
             exr_path,
             height,
             width,

@@ -217,12 +217,12 @@ That `natten` extra pins `natten==0.21.7+torch2130cu132` with `torch==2.13.0` (c
 | stage-5 VRAM coefficient | 5 | 7 | 11 | 2.5 |
 | withheld reserve | 1 GiB | 2 GiB | 2 GiB | 2 GiB |
 | `joint_na3d`, with keyframes | Triton > pure-torch | Triton > pure-torch | Triton > pure-torch | `na_attention_joint_dsl` |
-| stage-5 VRAM coefficient | 5 | **5** | **15** | 2.5 |
+| stage-5 VRAM coefficient | 5 | **5** | **15** | **4.0** |
 | withheld reserve | 1 GiB (2 on MATH SDPA) | 1 GiB (2 on MATH SDPA) | 1 GiB (2 on MATH SDPA) | 2 GiB |
 
-A keyframe decode is **not** compiled -- the compiled entry points are the keyframe-free ones -- so its diff blocks run eager whatever the mode asked for, and the budget follows that: `chunked_compile` drops to the `chunked_eager` coefficient, and `combined_compile` needs **15** rather than 11 because it holds several live full-volume intermediates where the compiled path holds one fused buffer. On a host whose joint attention falls back to torch's MATH SDPA kernel (no CUDA, e.g. MPS) the reserve grows by a GiB, since that kernel materializes its score block.
+A keyframe decode is **not** compiled -- the compiled entry points are the keyframe-free ones -- so its diff blocks run eager whatever the mode asked for, and the budget follows that: `chunked_compile` drops to the `chunked_eager` coefficient, and `combined_compile` needs **15** rather than 11 because it holds several live full-volume intermediates where the compiled path holds one fused buffer. `blackwell_dsl` serves keyframes with its fused joint kernel, but the keyframe decode's eager det blocks and keyframe planes raise its measured working set to **4.0**. On a host whose joint attention falls back to torch's MATH SDPA kernel (no CUDA, e.g. MPS) the reserve grows by a GiB, since that kernel materializes its score block.
 
-Pipeline `AUTO_TILING` resolves via `tiling_config_for_vae`: for a **Conv VAE** that is aspect-coupled long-side `768/64` spatial tiles plus temporal `80/24` (`TileSizeConfig.from_long_side`). For **DiffVAE**, recommended decode tiling enumerates legal per-axis tile **sizes** on the VAE grid (via the same `split_by_size` path decode uses) and emits a `TileSizeConfig` with independent `frames` / `height` / `width` `DimensionSizeConfig` values. Tile sizes are floored at ``2xOverlap`` so blend masks stay complementary. Stage-5 coefficients and reserves come from the grid above; `tiling_config_for_vae(..., keyframes=True)` selects the keyframe column, and a `chunked_compile` remapped to the Triton/eager fallback uses the `chunked_eager` row.
+Pipeline `AUTO_TILING` resolves via `tiling_config_for_vae`: for a **Conv VAE** that is aspect-coupled long-side `768/64` spatial tiles plus temporal `80/24` (`TileSizeConfig.from_long_side`). For **DiffVAE**, recommended decode tiling enumerates legal per-axis tile **sizes** on the VAE grid (via the same `split_by_size` path decode uses) and emits a `TileSizeConfig` with independent `frames` / `height` / `width` `DimensionSizeConfig` values. Tile sizes are floored at ``2xOverlap`` so blend masks stay complementary. The resolved tile is logged at INFO. Stage-5 coefficients and reserves come from the grid above; `tiling_config_for_vae(..., keyframes=True)` selects the keyframe column, and a `chunked_compile` remapped to the Triton/eager fallback uses the `chunked_eager` row.
 
 **DFR** always keyframe-decodes (`decode_video(keyframes=)`), so `AUTO_TILING` uses the **keyframe** VRAM column. At 4K with temporal rounds, decode is usually the memory cliff, not the denoise; there is no decode-tile CLI flag. `--spatial-upscalings 2` keeps stage-2 denoise at half resolution. Each temporal tile reloads the transformer. See [Running DFR](pipelines.md#running-dfr).
 
@@ -312,12 +312,11 @@ Instead of the standard Euler denoising loop, you can use gradient estimation fo
 from ltx_pipelines.utils import gradient_estimating_euler_denoising_loop
 
 # Use gradient estimation denoising loop
-def denoising_loop(sigmas, video_state, audio_state, stepper):
+def denoising_loop(sigmas, video_state, audio_state):
     return gradient_estimating_euler_denoising_loop(
         sigmas=sigmas,
         video_state=video_state,
         audio_state=audio_state,
-        stepper=stepper,
         transformer=transformer,
         denoiser=denoiser,
         ge_gamma=2.0,  # Gradient estimation coefficient

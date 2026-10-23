@@ -25,6 +25,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ltx_core.model.video_vae.keyframes import KeyframePlanes
+from ltx_core.model.video_vae.ops import rms_norm_uint32_safe
 from ltx_core.model.video_vae.transformer.attention import (
     JointNAAttentionCallable,
     NAAttentionCallable,
@@ -37,6 +39,7 @@ from ltx_core.model.video_vae.transformer.rope_math import (
     rot_abs_axis_impl,
     t_positions,
 )
+from ltx_core.types import HostDeviceTensorPair
 
 # Bound by ``chunked()`` for the duration of the opaque custom_op. Dynamo only sees
 # the op call site; the Python body reads these at runtime.
@@ -155,10 +158,10 @@ def _slab_qkv(  # noqa: PLR0913
     eps = 1e-6
     head_shape = (batch, t, h, ext_w, num_heads, head_dim)
     q = F.linear(y, q_w, q_b).view(head_shape)
-    q = F.rms_norm(q, (head_dim,), q_norm_w, eps) * attn_scale
+    q = rms_norm_uint32_safe(q, (head_dim,), q_norm_w, eps) * attn_scale
     q = _apply_in_slab_abs_rope(q, rope_split, inv_freqs, w_pos, compute_dtype=rope_dtype, t_pos=t_pos)
     k = F.linear(y, k_w, k_b).view(head_shape)
-    k = F.rms_norm(k, (head_dim,), k_norm_w, eps)
+    k = rms_norm_uint32_safe(k, (head_dim,), k_norm_w, eps)
     k = _apply_in_slab_abs_rope(k, rope_split, inv_freqs, w_pos, compute_dtype=rope_dtype, t_pos=t_pos)
     v = F.linear(y, v_w, v_b).view(head_shape)
     return q, k, v
@@ -208,7 +211,7 @@ def _attn_on_chunk_impl(  # noqa: PLR0913
     inv_freqs = (inv_t, inv_h, inv_w)
     rope_split = (d_t, d_h, d_w)
 
-    y = F.rms_norm(x_chunk, (dim,), norm_weight, 1e-6)
+    y = rms_norm_uint32_safe(x_chunk, (dim,), norm_weight, 1e-6)
     y = y * (1.0 + scale) + shift
 
     q, k, v = _slab_qkv(
@@ -244,6 +247,8 @@ def _joint_attn_on_chunk_impl(  # noqa: PLR0913
     w_pos: torch.Tensor,
     keyframe_times: torch.Tensor,
     keyframe_valid: torch.Tensor,
+    keyframe_times_host: torch.Tensor,
+    keyframe_valid_host: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
     norm_weight: torch.Tensor,
@@ -286,9 +291,9 @@ def _joint_attn_on_chunk_impl(  # noqa: PLR0913
     weights = (q_w, q_b, k_w, k_b, v_w, v_b, q_norm_w, k_norm_w)
     meta = (rope_split, inv_freqs, num_heads, head_dim, attn_scale, rope_dtype)
 
-    y = F.rms_norm(x_chunk, (dim,), norm_weight, 1e-6)
+    y = rms_norm_uint32_safe(x_chunk, (dim,), norm_weight, 1e-6)
     y = y * (1.0 + scale) + shift
-    keyframe_y = F.rms_norm(keyframe_chunk, (dim,), norm_weight, 1e-6)
+    keyframe_y = rms_norm_uint32_safe(keyframe_chunk, (dim,), norm_weight, 1e-6)
     keyframe_y = keyframe_y * (1.0 + scale) + shift
 
     q, k, v = _slab_qkv(y, w_pos, *weights, *meta)
@@ -305,8 +310,10 @@ def _joint_attn_on_chunk_impl(  # noqa: PLR0913
         keyframe_q.contiguous(),
         keyframe_k.contiguous(),
         keyframe_v.contiguous(),
-        times,
-        keyframe_valid,
+        KeyframePlanes(
+            HostDeviceTensorPair(keyframe_times_host.to(dtype=torch.float32), times),
+            HostDeviceTensorPair(keyframe_valid_host, keyframe_valid),
+        ),
     )
     del q, k, v, keyframe_q, keyframe_k, keyframe_v
     return (
@@ -661,6 +668,8 @@ def _na_residual_w_chunked_joint_op(  # noqa: PLR0913
     shift: torch.Tensor,
     keyframe_times: torch.Tensor,
     keyframe_valid: torch.Tensor,
+    keyframe_times_host: torch.Tensor,
+    keyframe_valid_host: torch.Tensor,
     norm_weight: torch.Tensor,
     q_w: torch.Tensor,
     q_b: torch.Tensor,
@@ -743,6 +752,8 @@ def _na_residual_w_chunked_joint_op(  # noqa: PLR0913
             w_pos,
             times,
             valid,
+            keyframe_times_host,
+            keyframe_valid_host,
             scale_,
             shift_,
             *rest,  # type: ignore[arg-type]
@@ -770,6 +781,8 @@ def _na_residual_w_chunked_joint_fake(  # noqa: PLR0913
     shift: torch.Tensor,
     keyframe_times: torch.Tensor,
     keyframe_valid: torch.Tensor,
+    keyframe_times_host: torch.Tensor,
+    keyframe_valid_host: torch.Tensor,
     norm_weight: torch.Tensor,
     q_w: torch.Tensor,
     q_b: torch.Tensor,
@@ -805,6 +818,8 @@ def _na_residual_w_chunked_joint_fake(  # noqa: PLR0913
         shift,
         keyframe_times,
         keyframe_valid,
+        keyframe_times_host,
+        keyframe_valid_host,
         norm_weight,
         q_w,
         q_b,
@@ -842,8 +857,7 @@ def chunked_with_keyframes(
     norm: nn.RMSNorm,
     scale: torch.Tensor,
     shift: torch.Tensor,
-    keyframe_times: torch.Tensor,
-    keyframe_valid: torch.Tensor,
+    keyframe_planes: KeyframePlanes,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """In-place dual-stream W-chunked residual through one joint softmax per slab.
     Keyframe counterpart of :func:`chunked`, using ``attn.joint_attention_function``
@@ -858,8 +872,10 @@ def chunked_with_keyframes(
             keyframe_x,
             scale,
             shift,
-            keyframe_times,
-            keyframe_valid,
+            keyframe_planes.times.device_tensor,
+            keyframe_planes.valid.device_tensor,
+            keyframe_planes.times.host_tensor,
+            keyframe_planes.valid.host_tensor,
             *packed,
             attn.w_chunks,
         )

@@ -36,7 +36,7 @@ from ltx_core.guidance.perturbations import (
 )
 from ltx_core.loader import SafetensorsModelStateDictLoader
 from ltx_core.model.audio_vae.audio_vae import encode_audio as ltx_encode_audio
-from ltx_core.model.transformer.modality import Modality
+from ltx_core.model.transformer.modality import Modality, TokenTimesteps
 from ltx_core.model.transformer.model import X0Model
 from ltx_core.model.video_vae import DimensionSizeConfig, TileSizeConfig
 from ltx_core.model.video_vae.diffusion_tiling import recommended_decode_tiling_config
@@ -50,6 +50,7 @@ from ltx_core.tools import AudioLatentTools, VideoLatentTools
 from ltx_core.types import (
     Audio,
     AudioLatentShape,
+    DenoiseMask,
     LatentState,
     SpatioTemporalScaleFactors,
     VideoLatentShape,
@@ -614,13 +615,14 @@ class ValidationRunner:
                 )
                 video_state = replace(
                     video_state,
-                    denoise_mask=torch.zeros_like(video_state.denoise_mask),
+                    denoise_mask=DenoiseMask(torch.zeros_like(video_state.denoise_mask.tensor)).compact(device),
                     frozen=True,
                 )
                 video_clean = video_state
             else:
                 video_state = video_tools.create_initial_state(device=device, dtype=torch.bfloat16)
                 video_state = self._apply_video_conditionings(video_state, video_tools, sample, cached_media, device)
+                video_state = replace(video_state, denoise_mask=video_state.denoise_mask.compact(device))
                 video_clean = video_state
                 video_state = noiser(video_state, noise_scale=1.0)
 
@@ -642,7 +644,7 @@ class ValidationRunner:
                 )
                 audio_state = replace(
                     audio_state,
-                    denoise_mask=torch.zeros_like(audio_state.denoise_mask),
+                    denoise_mask=DenoiseMask(torch.zeros_like(audio_state.denoise_mask.tensor)).compact(device),
                     frozen=True,
                 )
                 audio_clean = audio_state
@@ -650,6 +652,7 @@ class ValidationRunner:
                 audio_tools = self._create_audio_tools(num_frames, self._config.frame_rate)
                 audio_state = audio_tools.create_initial_state(device=device, dtype=torch.bfloat16)
                 audio_state = self._apply_audio_conditionings(audio_state, audio_tools, sample, cached_media, device)
+                audio_state = replace(audio_state, denoise_mask=audio_state.denoise_mask.compact(device))
                 audio_clean = audio_state
                 audio_state = noiser(audio_state, noise_scale=1.0)
 
@@ -754,7 +757,7 @@ class ValidationRunner:
                 stop = start + num_cond_tokens
 
                 state.clean_latent[:, start:stop] = tokens
-                state.denoise_mask[:, start:stop] = 0.0
+                state.denoise_mask.tensor[:, start:stop] = 0.0
 
             elif cond.type == "reference" and getattr(cond, "audio", None) is not None:
                 tokens = tools.patchifier.patchify(latent)
@@ -768,13 +771,12 @@ class ValidationRunner:
                 denoise_mask = torch.zeros(
                     *tokens.shape[:2],
                     1,
-                    device=device,
                     dtype=torch.float32,
                 )
 
                 state = LatentState(
                     latent=torch.cat([state.latent, torch.zeros_like(tokens, dtype=state.latent.dtype)], dim=1),
-                    denoise_mask=torch.cat([state.denoise_mask, denoise_mask], dim=1),
+                    denoise_mask=DenoiseMask(torch.cat([state.denoise_mask.tensor, denoise_mask], dim=1)),
                     positions=torch.cat([state.positions, positions], dim=2),
                     clean_latent=torch.cat([state.clean_latent, tokens], dim=1),
                     attention_mask=None,
@@ -802,7 +804,7 @@ class ValidationRunner:
 
                 state = LatentState(
                     latent=state.latent,
-                    denoise_mask=state.denoise_mask * inv,
+                    denoise_mask=DenoiseMask(state.denoise_mask.tensor * inv.cpu()),
                     positions=state.positions,
                     clean_latent=state.clean_latent * inv + tokens * m,
                     attention_mask=state.attention_mask,
@@ -955,13 +957,13 @@ class ValidationRunner:
             if denoised_video is not None and video_clean is not None:
                 denoised_video = self._post_process_latent(
                     denoised_video,
-                    video_state.denoise_mask,
+                    video_state.denoise_mask.tensor,
                     video_clean.clean_latent,
                 )
             if denoised_audio is not None and audio_clean is not None:
                 denoised_audio = self._post_process_latent(
                     denoised_audio,
-                    audio_state.denoise_mask,
+                    audio_state.denoise_mask.tensor,
                     audio_clean.clean_latent,
                 )
 
@@ -1266,7 +1268,7 @@ class ValidationRunner:
             enabled=True,
             latent=state.latent,
             sigma=sigma,
-            timesteps=state.denoise_mask * sigma,
+            timesteps=TokenTimesteps(state.denoise_mask.tensor * sigma),
             positions=state.positions,
             context=context,
             context_mask=None,

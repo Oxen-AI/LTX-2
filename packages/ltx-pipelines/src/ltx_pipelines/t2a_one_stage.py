@@ -15,10 +15,11 @@ from ltx_core.loader.registry import Registry
 from ltx_core.model.transformer import LTXV_AUDIO_ONLY_MODEL_COMFY_RENAMING_MAP, LTXAudioOnlyModelConfigurator
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.types import Audio
+from ltx_core.types import Audio, AudioLatentShape
 from ltx_pipelines.utils import get_device
 from ltx_pipelines.utils.args import (
     default_1_stage_t2a_arg_parser,
+    markers_from_args,
     resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
@@ -32,12 +33,7 @@ from ltx_pipelines.utils.blocks import (
 from ltx_pipelines.utils.denoisers import FactoryGuidedDenoiser
 from ltx_pipelines.utils.media_io import encode_audio
 from ltx_pipelines.utils.model_paths import ModelPaths
-from ltx_pipelines.utils.types import DEFAULT_AUTO_DURATION, AutoDuration, ModalitySpec, OffloadMode
-
-# Placeholder pixel dimensions used for ``VideoPixelShape`` construction.
-# Audio-only generation reads ``frames`` and ``fps`` from the pixel shape via
-# ``AudioLatentShape.from_video_pixel_shape`` (height/width are unused).
-_AUDIO_ONLY_PLACEHOLDER_RES = 512
+from ltx_pipelines.utils.types import DEFAULT_AUTO_DURATION, AutoDuration, ModalitySpec, OffloadMode, VideoAudio
 
 
 class T2AOneStagePipeline:
@@ -45,8 +41,8 @@ class T2AOneStagePipeline:
     Single-stage text-to-audio generation pipeline.
     Generates audio at the target duration in a single diffusion pass with
     classifier-free guidance (CFG) on the audio modality only. The video
-    modality is fully absent — the transformer runs audio-only by passing
-    ``video=None`` to the ``DiffusionStage``.
+    modality is fully absent — the transformer runs audio-only via
+    ``VideoAudio(audio=...)``.
     Assumes full non distilled model is provided in the checkpoint_path.
     """
 
@@ -159,12 +155,19 @@ class T2AOneStagePipeline:
             ),
             sigmas=sigmas,
             noiser=noiser,
-            width=_AUDIO_ONLY_PLACEHOLDER_RES,
-            height=_AUDIO_ONLY_PLACEHOLDER_RES,
-            frames=num_frames,
-            fps=frame_rate,
-            video=None,
-            audio=ModalitySpec(context=a_context_p),
+            modalities=VideoAudio(
+                audio=ModalitySpec(
+                    latent=torch.zeros(
+                        *AudioLatentShape.from_duration(
+                            batch=1, duration=float(num_frames) / float(frame_rate)
+                        ).to_torch_shape(),
+                        device=self.device,
+                        dtype=self.dtype,
+                    ),
+                    conditioning_fps=frame_rate,
+                    context=a_context_p,
+                ),
+            ),
             max_batch_size=max_batch_size,
         )
 
@@ -177,6 +180,7 @@ def main() -> None:
     params = resolve_cli_params()
     parser = default_1_stage_t2a_arg_parser(params=params)
     args = parser.parse_args()
+    _, audio_marker = markers_from_args(args, device=get_device())
     pipeline = T2AOneStagePipeline(
         model_paths=args.model_paths,
         loras=tuple(args.lora) if args.lora else (),
@@ -207,7 +211,7 @@ def main() -> None:
         max_batch_size=args.max_batch_size,
     )
 
-    encode_audio(audio=audio, output_path=args.output_path)
+    encode_audio(audio=audio, output_path=args.output_path, audio_marker=audio_marker)
 
 
 if __name__ == "__main__":

@@ -13,13 +13,13 @@ Do you need HDR / EXR I/O?
 ├─ YES → Do you have EXR stills or EXR-frame folders for a standard pipeline?
 │  ├─ YES → Use Distilled / TI2V / Retake / IC-LoRA with `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}`
 │  │         (see [HDR Support](hdr.md); EXR + BT.2020/HLG output)
-│  └─ NO → Use HDRICLoraPipeline (video-to-video with HDR IC-LoRA / LogC3 decode)
+│  └─ NO → Use HDRICLoraPipeline (SDR video → ACEScct HDR; HLG master + EXR)
 │
 Do you need to condition on existing images/videos?
 ├─ YES → Do you have reference videos for video-to-video?
 │  ├─ YES → Use ICLoraPipeline
 │  └─ NO → Do you have multiple keyframe images to interpolate?
-│     ├─ YES → Use KeyframeInterpolationPipeline
+│     ├─ YES → Use TI2VidTwoStagesPipeline with `--image … guide` bindings
 │     └─ NO → Image-to-video (one still)
 │        ├─ Production quality / higher fps → DFRPipeline
 │        └─ Guided CFG/STG two-stage → TI2VidTwoStagesPipeline
@@ -43,14 +43,13 @@ Do you need to condition on existing images/videos?
 | -------- | ------ | --- | ---------- | ------------- | -------- |
 | [**DistilledPipeline**](pipelines.md#4-distilledpipeline) | 2 | ❌ | ✅ | Image | Fastest inference (starting point) |
 | [**DFRPipeline**](pipelines.md#12-dfrpipeline) | 2 (+ optional temporal rounds) | ❌ | ✅ spatial + optional temporal 2x | Image + [generated keyframes](conditioning.md#generated-keyframe-slots) | **Production quality**; higher effective frame rate |
-| [**TI2VidTwoStagesPipeline**](pipelines.md#1-ti2vidtwostagespipeline) | 2 | ✅ | ✅ | Image | Guided two-stage with CFG/STG |
+| [**TI2VidTwoStagesPipeline**](pipelines.md#1-ti2vidtwostagespipeline) | 2 | ✅ | ✅ | Image + keyframes | Guided two-stage with CFG/STG; animation and interpolation |
 | [**TI2VidTwoStagesHQPipeline**](pipelines.md#2-ti2vidtwostageshqpipeline) | 2 | ✅ | ✅ | Image | Same guided flow, res_2s sampler |
 | [**TI2VidOneStagePipeline**](pipelines.md#3-ti2vidonestagepipeline) | 1 | ✅ | ❌ | Image | Educational, prototyping |
 | [**ICLoraPipeline**](pipelines.md#5-iclorapipeline) | 2 | ✅ | ✅ | Image + Video | Video-to-video transformations |
-| [**KeyframeInterpolationPipeline**](pipelines.md#6-keyframeinterpolationpipeline) | 2 | ✅ | ✅ | Keyframes | Animation, interpolation |
 | [**A2VidPipelineTwoStage**](pipelines.md#7-a2vidpipelinetwostage) | 2 | ✅ | ✅ | Audio + Image | Audio-driven video generation |
 | [**RetakePipeline**](pipelines.md#8-retakepipeline) | 1 | ✅ | ❌ | Source Video | Regenerating a time region of a video |
-| [**HDRICLoraPipeline**](pipelines.md#9-hdriclorapipeline) | 2 | ❌ | ✅ | Video | HDR IC-LoRA video-to-video (linear float / EXR); see also native [`--hdr`](hdr.md) |
+| [**HDRICLoraPipeline**](pipelines.md#9-hdriclorapipeline) | 1 | ❌ | ❌ | Video | SDR-to-HDR with an HDR IC-LoRA (HLG master + EXR via `--exr-colorspace`); see also native [`--hdr`](hdr.md) |
 | [**DubItPipeline**](pipelines.md#10-dubitpipeline) | 2 | ✅ | ✅ | Video + Audio | Dub-It with audio ref conditioning |
 | [**T2AOneStagePipeline**](pipelines.md#11-t2aonestagepipeline) | 1 | Audio only | ❌ | None (text) | Text-to-audio (audio-only output, no video) |
 

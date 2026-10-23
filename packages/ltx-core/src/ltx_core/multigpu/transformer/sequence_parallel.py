@@ -16,6 +16,7 @@ import torch
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.model.transformer.attention import Attention
+from ltx_core.model.transformer.cudagraph_capture import capture_key_scope
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.model import LTXModel
 from ltx_core.model.transformer.transformer import BasicAVTransformerBlock
@@ -72,11 +73,6 @@ def pad_modality_for_uniform_sharding(
     latent_pad = torch.zeros(b, pad, modality.latent.shape[2], dtype=dtype, device=device)
     latent = torch.cat([modality.latent, latent_pad], dim=1)
 
-    timesteps_pad_shape = list(modality.timesteps.shape)
-    timesteps_pad_shape[1] = pad
-    timesteps_pad = torch.zeros(timesteps_pad_shape, dtype=modality.timesteps.dtype, device=modality.timesteps.device)
-    timesteps = torch.cat([modality.timesteps, timesteps_pad], dim=1)
-
     positions_pad_shape = list(modality.positions.shape)
     positions_pad_shape[2] = pad
     positions_pad = torch.zeros(positions_pad_shape, dtype=modality.positions.dtype, device=modality.positions.device)
@@ -113,7 +109,7 @@ def pad_modality_for_uniform_sharding(
     padded = replace(
         modality,
         latent=latent,
-        timesteps=timesteps,
+        timesteps=modality.timesteps.pad_tokens(pad),
         positions=positions,
         attention_mask=attention_mask,
         keyframes_mask=keyframes_mask,
@@ -132,51 +128,87 @@ def compute_sequence_offsets(token_counts: list[int]) -> list[int]:
     return [0, *accumulate(token_counts[:-1])]
 
 
+def spread_padding_order(num_tokens: int, padded_tokens: int, world_size: int, device: torch.device) -> torch.Tensor:
+    """Source row of each position of a padded sequence laid out shard by shard, with the padding spread.
+    ``padded_tokens`` is ``num_tokens`` rounded up to a multiple of ``world_size``, with the padded
+    rows at its end (:func:`pad_modality_for_uniform_sharding`). Every shard holds
+    ``padded_tokens // world_size`` rows: the first shards only real tokens, each of the last
+    ``padded_tokens - num_tokens`` shards one real token fewer and then one padded row. Real tokens
+    keep their order, so the real rows of the shards, concatenated, are the original sequence.
+    Built on ``device`` from ``arange``, without a host sync.
+    """
+    shard = padded_tokens // world_size
+    full = world_size - (padded_tokens - num_tokens)
+    position = torch.arange(padded_tokens, device=device)
+    rank, offset = position // shard, position % shard
+    short = (rank - full).clamp(min=0)
+    real = rank * shard - short + offset
+    return torch.where((rank < full) | (offset < shard - 1), real, num_tokens + short)
+
+
 def tile_modality_for_rank(
     modality: Modality,
     rank: int,
     world_size: int,
+    num_tokens: int | None = None,
 ) -> tuple[Modality, list[int]]:
     """
     Tile a modality's tensors for a specific GPU rank.
     Splits the sequence dimension (dim 1 for latent/timesteps, dim 2 for positions)
     across GPUs, returning the local tile for the given rank.
+    ``num_tokens`` is the real token count of a modality :func:`pad_modality_for_uniform_sharding`
+    padded. The padding is then spread one row per shard over the last shards
+    (:func:`spread_padding_order`), so no rank holds more than one padded token, and the
+    attention mask is reordered the same way: the sequence every rank gathers in the all-to-all
+    is in shard order.
     Args:
         modality: The modality to tile.
         rank: Current GPU rank.
         world_size: Total number of GPUs.
+        num_tokens: Real (unpadded) token count; ``None`` when the modality is not padded.
     Returns:
-        Tuple of (tiled_modality, token_counts_per_rank).
+        Tuple of (tiled_modality, real token count per rank).
     """
     total_tokens = modality.latent.shape[1]
     token_counts = compute_sequence_partition(total_tokens, world_size)
-    offsets = compute_sequence_offsets(token_counts)
-
-    start = offsets[rank]
-    end = start + token_counts[rank]
+    shard = token_counts[rank]
+    start = rank * shard
+    padding = 0 if num_tokens is None else total_tokens - num_tokens
+    if padding == 0:
+        rows: slice | torch.Tensor = slice(start, start + shard)
+        attention_mask = modality.attention_mask
+    else:
+        order = spread_padding_order(num_tokens, total_tokens, world_size, modality.latent.device)
+        rows = order[start : start + shard]
+        attention_mask = modality.attention_mask
+        if attention_mask is not None:
+            attention_mask = attention_mask.index_select(-1, order)
+            if attention_mask.shape[-2] > 1:
+                attention_mask = attention_mask.index_select(-2, order)
+        token_counts = [shard] * (world_size - padding) + [shard - 1] * padding
 
     # Tile latent: (B, T, D) -> (B, T_local, D)
-    tiled_latent = modality.latent[:, start:end, :]
-
-    # Tile timesteps: (B, T) -> (B, T_local)
-    tiled_timesteps = modality.timesteps[:, start:end]
+    tiled_latent = modality.latent[:, rows, :]
 
     # Tile positions: (B, 3, T, 2) -> (B, 3, T_local, 2)
-    tiled_positions = modality.positions[:, :, start:end, :]
+    tiled_positions = modality.positions[:, :, rows]
 
     # Tile keyframes_mask: (B, T, 1) -> (B, T_local, 1). Sharding splits the sequence, so each
     # rank must carry the marker for its own slice -- the embedding is applied per rank, before
     # the all-to-all.
     tiled_keyframes_mask = None
     if modality.keyframes_mask is not None:
-        tiled_keyframes_mask = modality.keyframes_mask[:, start:end]
+        tiled_keyframes_mask = modality.keyframes_mask[:, rows]
 
+    # Sharding narrows the per-token timesteps; `select_tokens` applies the slice to whichever
+    # tensor carries the token dimension.
     tiled_modality = replace(
         modality,
         latent=tiled_latent,
-        timesteps=tiled_timesteps,
+        timesteps=modality.timesteps.select_tokens(rows),
         positions=tiled_positions,
         keyframes_mask=tiled_keyframes_mask,
+        attention_mask=attention_mask,
     )
 
     return tiled_modality, token_counts
@@ -293,13 +325,17 @@ class SequenceParallelModelWrapper(torch.nn.Module):
         if video is None:
             return self.model(video, audio, perturbations)
 
-        # Pad the video seq dim up to a multiple of world_size so all ranks get
-        # equal shards. The attention mask we attach makes the padded keys
-        # invisible to attention; padded rows are sliced off after the gather.
+        # Pad the video seq dim up to a multiple of world_size so all ranks get equal shards. The
+        # attention redistributions cut the padded keys (`key_padding`), so a modality without a mask
+        # of its own goes in without the padding mask: attention only ever sees real keys. The
+        # padded rows are dropped when the outputs are gathered.
+        has_mask = video.attention_mask is not None
         video, t_orig = pad_modality_for_uniform_sharding(video, self.attention_manager.world_size)
+        if not has_mask:
+            video = replace(video, attention_mask=None)
 
         video_tile, token_counts = tile_modality_for_rank(
-            video, self.attention_manager.rank, self.attention_manager.world_size
+            video, self.attention_manager.rank, self.attention_manager.world_size, num_tokens=t_orig
         )
         total_tokens = sum(token_counts)
         if total_tokens > self.attention_manager.max_tokens:
@@ -307,12 +343,18 @@ class SequenceParallelModelWrapper(torch.nn.Module):
                 f"Total video token count ({total_tokens}) exceeds attention_manager max_tokens "
                 f"({self.attention_manager.max_tokens}). Use a smaller resolution or fewer frames."
             )
-        self.attention_manager.set_seqlen_all2all(token_counts)
-        torch.distributed.barrier(self.attention_manager.group)
-        video, audio = self.model(video_tile, audio, perturbations)
+        # This must remain a device-side collective: the first all2all requires aligned ranks,
+        # while the host must remain free to queue the next forward.
+        torch.distributed.all_reduce(
+            torch.zeros(1, device=video_tile.latent.device), group=self.attention_manager.group
+        )
+        # The padding layout is host state the redistributions branch on (`key_padding`) but no input
+        # shape carries: Dynamo guards on it, and the scope keys the CUDA-graph captures on it.
+        padding = video.latent.shape[1] - t_orig
+        self.attention_manager.key_padding = padding
+        with capture_key_scope(("sequence_parallel_padding", padding)):
+            video, audio = self.model(video_tile, audio, perturbations)
+        # Each rank's real tokens lead its shard, so gathering the real counts drops the padding and
+        # restores the caller's order and length.
         video = gather_output_tokens(video, token_counts, self.attention_manager.group)
-        # Unpad: drop the rows we added in `pad_modality_for_uniform_sharding` to make
-        # the seq dim divisible by world_size, restoring the caller's original length.
-        if video.shape[1] != t_orig:
-            video = video[:, :t_orig, :]
         return video, audio

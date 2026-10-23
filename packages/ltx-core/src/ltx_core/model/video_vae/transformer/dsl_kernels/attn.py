@@ -35,16 +35,17 @@ def require_softmax_bound(attn: NeighborhoodAttention3D) -> torch.Tensor:
     Apply registers a NaN 0-d buffer; SDOps overwrite it at load. Rejecting meta, empty,
     and non-finite values catches both a missed key under ``assign=True`` (meta left
     behind) and an apply-without-SDOps path that left the NaN sentinel on CUDA.
-    The non-finite probe is skipped while ``torch.compile`` is tracing: ``isfinite().all()``
-    is data-dependent and forces specialization that conflicts with the decoder's hard
-    ``mark_dynamic`` on T/H/W. Meta/empty checks still run under compile; the NaN sentinel
-    is caught on eager first-call warmups and non-compiled paths.
+    The non-finite probe is an asynchronous assert: it raises at once for a CPU buffer, and
+    as a device-side assert for a CUDA one, so the per-block call never blocks the host on
+    the GPU. It is skipped while ``torch.compile`` is tracing: ``isfinite().all()`` is
+    data-dependent and forces specialization that conflicts with the decoder's hard
+    ``mark_dynamic`` on T/H/W. Meta/empty checks still run under compile.
     """
     bound = getattr(attn, NA_SOFTMAX_BOUND_BUFFER, None)
     if bound is None or bound.is_meta or bound.numel() == 0:
         raise RuntimeError(_SOFTMAX_BOUND_UNSET)
-    if not torch.compiler.is_compiling() and not torch.isfinite(bound).all():
-        raise RuntimeError(_SOFTMAX_BOUND_UNSET)
+    if not torch.compiler.is_compiling():
+        torch._assert_async(torch.isfinite(bound).all(), _SOFTMAX_BOUND_UNSET)
     return bound
 
 

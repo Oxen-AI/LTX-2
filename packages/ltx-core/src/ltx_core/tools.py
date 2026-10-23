@@ -12,7 +12,7 @@ from ltx_core.components.patchifiers import (
     get_pixel_coords,
 )
 from ltx_core.components.protocols import Patchifier
-from ltx_core.types import LatentState, SpatioTemporalScaleFactors
+from ltx_core.types import DenoiseMask, LatentState, SpatioTemporalScaleFactors
 
 DEFAULT_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
 
@@ -48,7 +48,9 @@ class LatentTools(Protocol):
         latent_state = latent_state.clone()
         latent = self.patchifier.patchify(latent_state.latent)
         clean_latent = self.patchifier.patchify(latent_state.clean_latent)
-        denoise_mask = self.patchifier.patchify(latent_state.denoise_mask)
+        denoise_mask = latent_state.denoise_mask.with_same_values(
+            self.patchifier.patchify(latent_state.denoise_mask.tensor)
+        )
         # keyframes_mask shares denoise_mask's layout, so it converts alongside it; leaving it
         # behind would produce a state mixing patchified and unpatchified per-token tensors.
         keyframes_mask = (
@@ -70,8 +72,9 @@ class LatentTools(Protocol):
         latent = self.patchifier.unpatchify(latent_state.latent, output_shape=self.target_shape)
         clean_latent = self.patchifier.unpatchify(latent_state.clean_latent, output_shape=self.target_shape)
         denoise_mask = self.patchifier.unpatchify(
-            latent_state.denoise_mask, output_shape=self.target_shape.mask_shape()
+            latent_state.denoise_mask.tensor, output_shape=self.target_shape.mask_shape()
         )
+        denoise_mask = latent_state.denoise_mask.with_same_values(denoise_mask)
         keyframes_mask = (
             self.patchifier.unpatchify(latent_state.keyframes_mask, output_shape=self.target_shape.mask_shape())
             if latent_state.keyframes_mask is not None
@@ -101,12 +104,12 @@ class LatentTools(Protocol):
         num_tokens = self.patchifier.get_token_count(self.target_shape)
         latent = latent_state.latent[:, :num_tokens]
         clean_latent = latent_state.clean_latent[:, :num_tokens]
-        denoise_mask = torch.ones_like(latent_state.denoise_mask)[:, :num_tokens]
+        denoise_mask = torch.ones_like(latent_state.denoise_mask.tensor)[:, :num_tokens]
         positions = latent_state.positions[:, :, :num_tokens]
 
         return LatentState(
             latent=latent,
-            denoise_mask=denoise_mask,
+            denoise_mask=DenoiseMask(denoise_mask, denoise_mask.new_ones((1,))),
             positions=positions,
             clean_latent=clean_latent,
             attention_mask=None,
@@ -155,11 +158,7 @@ class VideoLatentTools(LatentTools):
 
         clean_latent = initial_latent.clone()
 
-        denoise_mask = torch.ones(
-            *self.target_shape.mask_shape().to_torch_shape(),
-            device=device,
-            dtype=torch.float32,
-        )
+        denoise_mask = torch.ones(*self.target_shape.mask_shape().to_torch_shape(), dtype=torch.float32)
 
         latent_coords = self.patchifier.get_patch_grid_bounds(
             output_shape=self.target_shape,
@@ -176,7 +175,7 @@ class VideoLatentTools(LatentTools):
         state = self.patchify(
             LatentState(
                 latent=initial_latent,
-                denoise_mask=denoise_mask,
+                denoise_mask=DenoiseMask(denoise_mask),
                 positions=positions,
                 clean_latent=clean_latent,
             )
@@ -191,7 +190,7 @@ class VideoLatentTools(LatentTools):
         independently of whether any keyframe slots exist. This is plain data about the latent, so
         it is always populated; models without the keyframe embedding ignore it.
         """
-        mask = torch.zeros_like(state.denoise_mask)
+        mask = torch.zeros_like(state.denoise_mask.tensor, device=state.latent.device)
         mask[:, : self.tokens_per_latent_frame] = 1.0
         return mask
 
@@ -262,11 +261,7 @@ class AudioLatentTools(LatentTools):
 
         clean_latent = initial_latent.clone()
 
-        denoise_mask = torch.ones(
-            *self.target_shape.mask_shape().to_torch_shape(),
-            device=device,
-            dtype=torch.float32,
-        )
+        denoise_mask = torch.ones(*self.target_shape.mask_shape().to_torch_shape(), dtype=torch.float32)
 
         latent_coords = self.patchifier.get_patch_grid_bounds(
             output_shape=self.target_shape,
@@ -275,6 +270,9 @@ class AudioLatentTools(LatentTools):
 
         return self.patchify(
             LatentState(
-                latent=initial_latent, denoise_mask=denoise_mask, positions=latent_coords, clean_latent=clean_latent
+                latent=initial_latent,
+                denoise_mask=DenoiseMask(denoise_mask),
+                positions=latent_coords,
+                clean_latent=clean_latent,
             )
         )

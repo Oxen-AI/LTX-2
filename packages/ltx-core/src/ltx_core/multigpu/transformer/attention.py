@@ -9,6 +9,8 @@ _DEFAULT_ALL2ALL_TIMEOUT_SECONDS = 10.0
 
 
 class AttentionManager:
+    """Owns sequence-parallel attention state for an aggregate token capacity."""
+
     def __init__(
         self,
         max_tokens: int,
@@ -29,12 +31,12 @@ class AttentionManager:
         hidden_dim = num_heads * head_dim
         num_sms = torch.cuda.get_device_properties(self.rank).multi_processor_count
         self.copy_out = copy_out_
-        buffer_seqlen = (max_tokens + self.world_size - 1) // self.world_size
+        max_rank_tokens = (max_tokens + self.world_size - 1) // self.world_size
         self.all2all_heads, self.all2all_q = (
             All2All(
                 rank=self.rank,
                 world_size=self.world_size,
-                seqlen=buffer_seqlen,
+                seqlen=max_rank_tokens,
                 hidden_dim=hidden_dim,
                 num_sms=num_sms,
                 tensor_dtype=tensor_dtype,
@@ -46,7 +48,7 @@ class AttentionManager:
             All2All(
                 rank=self.rank,
                 world_size=self.world_size,
-                seqlen=buffer_seqlen,
+                seqlen=max_rank_tokens,
                 hidden_dim=hidden_dim,
                 num_sms=num_sms,
                 tensor_dtype=tensor_dtype,
@@ -58,14 +60,11 @@ class AttentionManager:
         )
         self.group = group
         self._all2all_timeout_seconds = _DEFAULT_ALL2ALL_TIMEOUT_SECONDS
-
-    def set_seqlen_all2all(self, seqlens: list[int]) -> None:
-        # Route through the wrappers so the registered custom ops' fake-impl
-        # shape info gets updated alongside the C++ runtime's rank_tokens.
-        self.all2all_q.set_rank_tokens(seqlens)
-        self.all2all_k.set_rank_tokens(seqlens)
-        self.all2all_v.set_rank_tokens(seqlens)
-        self.all2all_heads.set_rank_tokens(seqlens)
+        # Padded tokens in the current forward's video sequence, one at the end of each of the last
+        # `key_padding` shards (see `tile_modality_for_rank`), which the redistributions cut from the
+        # gathered keys. Set by the SP model wrapper per forward; host state the block loop branches
+        # on, so Dynamo guards on it and the wrapper adds it to the CUDA-graph capture key.
+        self.key_padding = 0
 
     @property
     def all2all_timeout_seconds(self) -> float:
@@ -96,6 +95,24 @@ class AttentionManager:
         return out
 
 
+def drop_padding_keys(t: torch.Tensor, world_size: int, padding: int, dim: int = 1) -> torch.Tensor:
+    """Drop the padded tokens from a gathered sequence in shard order along ``dim``.
+    Each of the last ``padding`` of the ``world_size`` equal shards ends with one padded token (the
+    layout of :func:`~ltx_core.multigpu.transformer.sequence_parallel.tile_modality_for_rank`). With
+    one, it is the last token and the result is a view.
+    """
+    if padding == 0:
+        return t
+    dim %= t.ndim
+    tokens = t.shape[dim]
+    if padding == 1:
+        return t.narrow(dim, 0, tokens - 1)
+    shard = tokens // world_size
+    full = (world_size - padding) * shard
+    short = t.narrow(dim, full, tokens - full).unflatten(dim, (padding, shard)).narrow(dim + 1, 0, shard - 1)
+    return torch.cat([t.narrow(dim, 0, full), short.flatten(dim, dim + 1)], dim=dim)
+
+
 class _All2AllRedistribute:
     """Shared redistribute/gather pipeline for self-attention SP wrappers.
     Folds the head dim view-and-shuffle so the masked and unmasked variants only
@@ -119,6 +136,10 @@ class _All2AllRedistribute:
 
         t_q, t_k, t_v = self.manager.send_recv_qkv(q, k, v)
         local_heads = heads // self.manager.world_size
+        # The gathered keys hold the sharding's padded tokens; cut them here, so attention only ever
+        # sees real keys. Queries keep them: their rows are dropped when the outputs are gathered.
+        t_k = drop_padding_keys(t_k, self.manager.world_size, self.manager.key_padding)
+        t_v = drop_padding_keys(t_v, self.manager.world_size, self.manager.key_padding)
 
         # `flatten` / `unflatten` collapse only the head dims, avoiding a `-1` in the
         # seq position -- that would otherwise be ambiguous if the seq is 0 for a
@@ -152,6 +173,12 @@ class All2AllAttention(AttentionCallable):
 
 
 class MaskedAll2AllAttention(MaskedAttentionCallable):
+    """Masked SP attention, for a caller's own mask.
+    The mask is in the shard order the keys are gathered in
+    (:func:`~ltx_core.multigpu.transformer.sequence_parallel.tile_modality_for_rank`); its columns for
+    the padded keys the redistribution cuts are cut with them.
+    """
+
     def __init__(self, manager: AttentionManager, original_attention: MaskedAttentionCallable):
         self._sp = _All2AllRedistribute(manager)
         self.original_attention = original_attention
@@ -165,6 +192,7 @@ class MaskedAll2AllAttention(MaskedAttentionCallable):
         mask: torch.Tensor,
     ) -> torch.Tensor:
         t_q, t_k, t_v, local_heads, head_dim = self._sp.redistribute(q, k, v, heads)
+        mask = drop_padding_keys(mask, self._sp.manager.world_size, self._sp.manager.key_padding, dim=-1)
         hidden_states = self.original_attention(q=t_q, k=t_k, v=t_v, heads=local_heads, mask=mask)
         return self._sp.gather(hidden_states, local_heads, head_dim)
 
@@ -199,6 +227,9 @@ class _AudioAll2AllRedistribute:
         t_q = q[:, :, heads_per_rank * rank : heads_per_rank * (rank + 1), :].clone()
         t_k = self.manager.all2all_k.send_recv_heads(k, copy_out=self.manager.copy_out)
         t_v = self.manager.all2all_v.send_recv_heads(v, copy_out=self.manager.copy_out)
+        # The keys are the sharded video sequence: cut its padded tokens, as for self-attention.
+        t_k = drop_padding_keys(t_k, self.manager.world_size, self.manager.key_padding)
+        t_v = drop_padding_keys(t_v, self.manager.world_size, self.manager.key_padding)
 
         # `flatten` / `unflatten` collapse only the head dims, avoiding a `-1` in the
         # seq position -- that would otherwise be ambiguous if the seq is 0 for a

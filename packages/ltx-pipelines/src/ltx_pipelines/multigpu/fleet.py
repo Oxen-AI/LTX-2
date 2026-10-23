@@ -9,6 +9,7 @@ lives in ``runner.py``.
 from __future__ import annotations
 
 import contextlib
+import gc
 import logging
 import os
 import socket
@@ -26,7 +27,7 @@ from torch.distributed.elastic.multiprocessing import start_processes
 from torch.distributed.elastic.multiprocessing.api import LogsSpecs
 from torch.distributed.elastic.multiprocessing.errors import ProcessFailure, record
 
-from ltx_pipelines.multigpu._broadcast import BroadcastCoordinator
+from ltx_core.multigpu.broadcast import BroadcastCoordinator
 from ltx_pipelines.multigpu.nccl_groups import create_local_nccl_groups
 from ltx_pipelines.multigpu.runner import MGPURunner, RunnerError
 
@@ -160,6 +161,18 @@ class _RankLink:
         return shell
 
 
+def _freeze_long_lived_heap() -> None:
+    """After a rank's first job, move everything that survived it out of the cyclic GC's reach.
+    The first job builds the models, compiled graphs and caches the later jobs reuse; full
+    collections otherwise rescan those objects every time (3.3 s of pauses in a cold 4K DFR job).
+    Collected first, so only survivors are frozen; anything a later job leaves in a cycle is
+    still collected.
+    """
+    if gc.get_freeze_count() == 0:
+        gc.collect()
+        gc.freeze()
+
+
 def _run_job(runner: MGPURunner, kwargs: dict[str, Any], job_id: int, rank: int, result: Queue[_JobResult]) -> None:
     """Run one job on this rank and put each item on the result queue: every yield is a `_JobResult`
     (tagged by rank), forwarded straight to the caller; the rank's end -- a clean StopIteration or a
@@ -194,6 +207,7 @@ def _relay_loop(runner: MGPURunner, link: _RankLink, channels: _Channels) -> Non
         if job is None:  # shutdown sentinel (already broadcast to the others)
             return
         _run_job(runner, job.kwargs, job.job_id, _RELAY_RANK, channels.results)
+        _freeze_long_lived_heap()
 
 
 def _worker_loop(runner: MGPURunner, link: _RankLink, channels: _Channels, rank: int) -> None:
@@ -203,6 +217,7 @@ def _worker_loop(runner: MGPURunner, link: _RankLink, channels: _Channels, rank:
         if job is None:  # shutdown sentinel
             return
         _run_job(runner, job.kwargs, job.job_id, rank, channels.results)
+        _freeze_long_lived_heap()
 
 
 def _shutdown_distributed() -> None:
@@ -223,9 +238,15 @@ def _worker_entrypoint(
     init_timeout: timedelta,
     channels: _Channels,
     device_ids: list[int] | None = None,
+    cpu_threads: int | None = 8,
 ) -> None:
     """Per-worker entry. @record turns a crash into a readable failure on the controller."""
     local_rank = int(os.environ["LOCAL_RANK"])
+    # Torch's CPU pool defaults to one thread per core. A rank runs only small host tensor ops (conditioning
+    # masks, tile plans), which a pool that wide stalls -- tens to hundreds of ms per op on a 176-CPU host --
+    # while the GPU waits for the work they gate. None keeps torch's default.
+    if cpu_threads is not None:
+        torch.set_num_threads(cpu_threads)
     # All GPUs stay visible; we bind this rank to its physical GPU by index. (Setting
     # CUDA_VISIBLE_DEVICES here is unreliable -- the spawn bootstrap can touch CUDA, freezing
     # the device list, before a late env override would apply.)
@@ -320,6 +341,7 @@ class _RunnersFleet:
         num_gpus: int,
         logs_specs: LogsSpecs,
         device_ids: list[int] | None = None,
+        cpu_threads: int | None = 8,
     ) -> _RunnersFleet:
         port = _find_free_port()
         envs = {
@@ -334,7 +356,7 @@ class _RunnersFleet:
         }
         # device_ids maps rank -> physical GPU (None = identity); the worker binds to it. The runner
         # class ships by value so a __main__/test-module runner survives the spawn (see _RunnerShipper).
-        packed = (_RunnerShipper(runner_cls), setup_kwargs, init_timeout, channels, device_ids)
+        packed = (_RunnerShipper(runner_cls), setup_kwargs, init_timeout, channels, device_ids, cpu_threads)
         args = dict.fromkeys(range(num_gpus), packed)
         logger.info("Spawning %d MGPU workers...", num_gpus)
         return cls(

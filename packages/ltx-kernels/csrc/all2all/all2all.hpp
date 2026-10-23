@@ -49,9 +49,6 @@
  * // ... gather all handles ...
  * comm.sync(all_handles);
  *
- * // Set token distribution for current batch
- * comm.set_rank_tokens({128, 128, 128, 128});  // tokens per rank
- *
  * // Perform All2All on attention heads
  * auto result = comm.send_recv_heads(input_tensor, copy_output=false);
  *
@@ -108,12 +105,6 @@ private:
 
   at::ScalarType tensor_dtype; ///< Data type of tensors (BFloat16 or Float8_e4m3fn)
   bool destroyed = false;      ///< Flag to track if resources have been released
-
-  int total_tokens;                      ///< Sum of tokens across all ranks for current batch
-  int rank_tokens[MAX_NUM_PEERS];        ///< Number of tokens on each rank
-  int prefix_rank_tokens[MAX_NUM_PEERS]; ///< Cumulative sum of tokens (for offset calculation)
-  int *rank_tokens_gpu = nullptr;        ///< Device copy of rank_tokens
-  int *prefix_rank_tokens_gpu = nullptr; ///< Device copy of prefix_rank_tokens
 
   /// Device peak SM clock in Hz (from cudaDeviceGetAttribute(cudaDevAttrClockRate)), queried
   /// once at construction. Used to convert a wall-clock timeout in seconds to barrier cycles.
@@ -172,6 +163,16 @@ public:
   pybind11::bytearray get_local_ipc_handle() const;
 
   /**
+   * @brief Returns the local data buffer as a flat tensor of num_elems elements.
+   *
+   * The tensor does not own the memory: it is valid until destroy(). Every operation writes
+   * its output here, and peers write into it remotely, so its contents change with each call.
+   *
+   * @return 1-D tensor of dtype tensor_dtype on this rank's device
+   */
+  at::Tensor local_buffer() const;
+
+  /**
    * @brief Creates a tensor view or copy of the local output buffer.
    *
    * @param x Reference tensor for options (dtype, device)
@@ -198,12 +199,13 @@ public:
    * @brief Performs All2All communication to redistribute attention heads.
    *
    * Redistributes tensor from [batch, local_tokens, all_heads, head_size] to
-   * [batch, all_tokens, local_heads, head_size]. Each rank sends its portion
-   * of heads to the corresponding target rank.
+   * [batch, local_tokens * world_size, local_heads, head_size]. Each rank sends
+   * its portion of heads to the corresponding target rank. Token counts must be
+   * uniform across ranks.
    *
    * @param x Input tensor with shape [batch, num_tokens, num_heads, head_size]
    * @param copy_output If true, returns a copy; if false, returns a view of the IPC buffer
-   * @return Tensor with shape [batch, total_tokens, num_heads/world_size, head_size]
+   * @return Tensor with shape [batch, local_tokens * world_size, num_heads/world_size, head_size]
    */
   at::Tensor send_recv_heads(at::Tensor &x, bool copy_output);
 
@@ -211,36 +213,40 @@ public:
    * @brief Performs inverse All2All to gather heads back to original distribution.
    *
    * Inverse of send_recv_heads(). Redistributes from [batch, all_tokens, local_heads, head_size]
-   * back to [batch, local_tokens, all_heads, head_size].
+   * back to [batch, all_tokens / world_size, all_heads, head_size]. Token counts must be
+   * uniform across ranks.
    *
    * @param x Input tensor with shape [batch, total_tokens, heads_per_rank, head_size]
    * @param copy_output If true, returns a copy; if false, returns a view of the IPC buffer
-   * @return Tensor with shape [batch, rank_tokens[rank], num_heads, head_size]
+   * @return Tensor with shape [batch, total_tokens/world_size, num_heads, head_size]
    */
   at::Tensor gather_heads(at::Tensor &x, bool copy_output);
 
   /**
    * @brief Gathers sequence tokens from all ranks.
    *
-   * Each rank contributes its local sequence tokens, which are gathered into
-   * a complete sequence on all ranks.
+   * Each rank contributes the same number of local sequence tokens, which are
+   * gathered into a complete sequence on all ranks.
    *
    * @param x Input tensor with shape [batch, seqlen, num_heads, head_size]
    * @param copy_output If true, returns a copy; if false, returns a view of the IPC buffer
-   * @return Tensor with shape [batch, total_tokens, num_heads, head_size]
+   * @return Tensor with shape [batch, seqlen * world_size, num_heads, head_size]
    */
   at::Tensor allgather(at::Tensor &x, bool copy_output);
 
-  /**
-   * @brief Sets the token count for each rank in the current batch.
-   *
-   * Must be called before send_recv_heads(), gather_heads(), or allgather()
-   * to configure the token distribution. This allows variable-length sequences
-   * across ranks.
-   *
-   * @param rank_num_tokens Vector of token counts, one per rank (must have world_size elements)
-   */
-  void set_rank_tokens(const std::vector<int> &rank_num_tokens);
+  /// Fused RMS-norm + split RoPE of ``x`` ``[b, s, h]``, written straight into every rank's buffer in the
+  /// ``send_recv_heads`` layout ``[b, world_size * s, h / world_size]``. With ``barrier``, returns once all
+  /// ranks' writes into the local buffer are visible; without it, a later exchange_barrier() does that.
+  void rope_send_recv_heads(at::Tensor &x, at::Tensor &sin_freqs, at::Tensor &cos_freqs, at::Tensor &weights,
+                            double eps, bool barrier);
+
+  /// ``x @ weight.T + bias`` with each rank's output columns written straight into that rank's buffer in
+  /// the ``send_recv_heads`` layout. ``barrier`` as for rope_send_recv_heads().
+  void linear_send_recv_heads(at::Tensor &x, at::Tensor &weight, at::Tensor &bias, bool barrier);
+
+  /// Returns once every rank's writes issued earlier on this stream -- into any instance's buffer --
+  /// are visible to every rank. Completes the exchanges run with ``barrier`` false.
+  void exchange_barrier();
 
   /**
    * @brief Sets the all2all barrier timeout in seconds.

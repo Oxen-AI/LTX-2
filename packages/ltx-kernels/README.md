@@ -21,13 +21,18 @@ Custom CUDA/C++ kernels for `ltx-core`. Four compiled extensions:
 The Python surface for blockwise quantization lives in
 `ltx_kernels.blockwise` (`functional`, `linear`, `triton_ops`).
 
-`ltx_kernels.vae` adds two JIT-compiled CuTe DSL kernels for the diffusion VAE decoder
-(no C++ extension; `nvidia-cutlass-dsl` compiles them on first call):
+`ltx_kernels.vae` adds two CuTe DSL kernels for the diffusion VAE decoder:
 
 - **`na_attn_dsl`** -- standalone 3D neighborhood attention, a drop-in for
   `natten.na3d`, used by the decoder's deterministic stages.
 - **`block_fna_dsl`** -- a whole `DiffusionNABlock` in one launch, with no full-volume
   Q/K/V, used by stage 5.
+
+Production `sm_100a` wheels carry six CuTe AOT objects: plain and keyframe variants
+for the two deterministic-stage kernels, plus plain and keyframe variants for the
+LTX-2.5 stage-5 block. The launcher loads a matching object on first use, so a fresh
+process does not compile those kernels. Non-production channel widths, custom kernel
+or tile shapes, and the standalone context-only NA API keep the existing JIT fallback.
 
 Both need a **datacenter Blackwell** GPU: they use `tcgen05` MMA *and* Tensor Memory
 (`sm_100`/`sm_101`/`sm_103`). Consumer Blackwell has the former but not the latter, and
@@ -73,6 +78,20 @@ architecture (so `uv pip install` "just works" on a dev box); pin it on build
 hosts to cut compile time. Any `9.0` entry enables the SM90 GEMM kernel, which
 is compiled for `sm_90a` (the deep_gemm kernel uses wgmma/TMA).
 
+To include the production VAE AOT bundle in a wheel, generate it in the package
+tree before building. CuTe fake tensors make this an offline compile; the build
+host does not need a GPU:
+
+```bash
+PYTHONPATH=packages/ltx-kernels/src python packages/ltx-kernels/scripts/build_vae_aot.py \
+  --output-dir packages/ltx-kernels/src/ltx_kernels/vae/_aot/sm100a \
+  --gpu-arch sm_100a --host-target linux-aarch64
+```
+
+CuTe's object-file format check decides whether the installed
+`nvidia-cutlass-dsl` can load the object. Source/editable installs without a
+bundle continue to JIT.
+
 ### cutlass headers
 
 `blockwise_cpp` includes cute/cutlass headers (header-only; compiled into the
@@ -99,7 +118,7 @@ The `ltx_kernels.vae` and `ltx_kernels.nvfp4` tests additionally require a datac
 Blackwell GPU and skip elsewhere. NVFP4 layout/API docs: [`docs/NVFP4.md`](docs/NVFP4.md).
 
 ```bash
-uv run pytest packages/ltx-kernels/tests/test_nvfp4.py -v
+uv run pytest packages/ltx-kernels/tests/ltx_kernels/test_nvfp4.py -v
 ```
 
 ## Operations

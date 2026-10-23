@@ -56,9 +56,9 @@ attn_mgr = AttentionManager(
 )
 ```
 
-Owns the all2all buffers (sized `ceil(max_tokens / world_size)` tokens per rank) and, per step,
-`set_seqlen_all2all(...)` updates the per-rank token counts. `num_heads` must be
-divisible by `world_size`.
+Owns the all2all buffers, sized `ceil(max_tokens / world_size)` tokens per rank. All2All operations
+derive their uniform per-rank token counts from the input tensors; callers pad before sharding.
+`num_heads` must be divisible by `world_size`.
 
 ### `SequenceParallelBuilder`
 

@@ -5,7 +5,7 @@ import torch
 from einops import rearrange
 from torch import nn
 
-from .convolution import make_conv_nd
+from .convolution import make_conv_nd, memory_format_of
 from .enums import PaddingModeType
 
 
@@ -36,6 +36,7 @@ class SpaceToDepthDownsample(nn.Module):
         x: torch.Tensor,
         causal: bool = True,
     ) -> torch.Tensor:
+        memory_format = memory_format_of(x)
         if self.stride[0] == 2:
             x = torch.cat([x[:, :, :1, :, :], x], dim=2)  # duplicate first frames for padding
 
@@ -60,9 +61,12 @@ class SpaceToDepthDownsample(nn.Module):
             p3=self.stride[2],
         )
 
-        x = x + x_in
-
-        return x
+        # The space-to-depth rearranges come out NCHW; summing into a buffer laid out like the input
+        # keeps channels-last activations channels-last for the next block's convs. ``out=`` has no
+        # autograd support, so a graph-recording call pays one extra copy instead.
+        if x.requires_grad or x_in.requires_grad:
+            return (x + x_in).contiguous(memory_format=memory_format)
+        return torch.add(x, x_in, out=torch.empty_like(x, memory_format=memory_format))
 
 
 class DepthToSpaceUpsample(nn.Module):

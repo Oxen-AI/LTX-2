@@ -31,7 +31,6 @@ def build_fp8_policy() -> QuantizationPolicy:
     return QuantizationPolicy(
         sd_ops=impl.build_sd_ops_fp8(),
         module_ops=(impl.build_module_ops_fp8(),),
-        model_configurator=impl.BlockwiseFP8LTXModelConfigurator,
         fuse_rule=impl.fuse_rule_fp8,
     )
 
@@ -42,6 +41,5 @@ def build_fp6_policy() -> QuantizationPolicy:
     return QuantizationPolicy(
         sd_ops=impl.build_sd_ops_fp6(),
         module_ops=(impl.build_module_ops_fp6(),),
-        model_configurator=impl.BlockwiseFP6LTXModelConfigurator,
         fuse_rule=impl.fuse_rule_fp6,
     )

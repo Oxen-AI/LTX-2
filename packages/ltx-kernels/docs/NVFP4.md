@@ -28,7 +28,7 @@ Reconstruction: `x ≈ data * s_b * s_t`.
 `hi_first=False` puts it in the low nibble. Pre-quantized checkpoints used with
 `nvfp4-prequant` are expected in the default (`hi_first=True`) order.
 
-Measured fact (see `tests/test_nvfp4.py::test_nibble_order_is_gemm_invariant`): the block
+Measured fact (see `tests/ltx_kernels/test_nvfp4.py::test_nibble_order_is_gemm_invariant`): the block
 scale covers all 16 elements of a block, so swapping nibble order in **both** operands
 only permutes the terms of each dot product — the result is bit-identical. A nibble swap
 is only needed when *mixing* layouts.

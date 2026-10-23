@@ -493,6 +493,7 @@ class ConvVideoDecoder(nn.Module, Disposable, VideoDecoder):
         generator: torch.Generator | None = None,
         *,
         keyframes: DecodeKeyframes | None = None,
+        **_kwargs: object,
     ) -> Iterator[torch.Tensor]:
         """Decode a video latent tensor, yielding float chunks ``[f, h, w, c]`` in ``[0, 1]``.
         Subclasses (e.g. ``DistributedVideoDecoder``) may override this to

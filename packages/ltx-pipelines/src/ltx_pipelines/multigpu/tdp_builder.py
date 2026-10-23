@@ -51,6 +51,11 @@ class TiledDataParallelBuilder(DelegatingBuilder[InnerModelT], Generic[InnerMode
         self._normalize_positions = normalize_positions
 
     @property
+    def builds_per_shape(self) -> bool:
+        # Each build wraps the model for one call's video tools, so it cannot serve another shape.
+        return True
+
+    @property
     def keeps_gpu_resident_weights(self) -> bool:
         # Weight tracker keeps registry tensors GPU-resident and rebinds them across builds.
         return True

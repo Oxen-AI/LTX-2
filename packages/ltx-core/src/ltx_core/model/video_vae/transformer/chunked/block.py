@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from ltx_core.model.video_vae.transformer.blocks import DiffusionNABlock
@@ -13,6 +15,9 @@ from ltx_core.model.video_vae.transformer.chunked.context import deferred as inj
 from ltx_core.model.video_vae.transformer.chunked.context import deferred_keyframes as inject_keyframe_context
 from ltx_core.model.video_vae.transformer.chunked.mlp import residual_modulating_mlp
 from ltx_core.model.video_vae.transformer.layers import LinearPixelShuffleUpsample
+
+if TYPE_CHECKING:
+    from ltx_core.model.video_vae.keyframes import KeyframePlanes
 
 
 class ChunkedDiffusionNABlock(DiffusionNABlock):
@@ -47,8 +52,7 @@ class ChunkedDiffusionNABlock(DiffusionNABlock):
         shift_msa: torch.Tensor,
         scale_mlp: torch.Tensor,
         shift_mlp: torch.Tensor,
-        keyframe_times: torch.Tensor,
-        keyframe_valid: torch.Tensor,
+        keyframe_planes: KeyframePlanes,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Dual-stream chunked NA residual + modulating SwiGLU, both in place.
         Invalid keyframe planes are re-zeroed on the way out, matching
@@ -63,12 +67,11 @@ class ChunkedDiffusionNABlock(DiffusionNABlock):
             self.norm1,
             scale_msa,
             shift_msa,
-            keyframe_times,
-            keyframe_valid,
+            keyframe_planes,
         )
         x = residual_modulating_mlp(x, self.mlp, self.norm2, scale_mlp, shift_mlp, self.mlp.tile)
         keyframe_x = residual_modulating_mlp(keyframe_x, self.mlp, self.norm2, scale_mlp, shift_mlp, self.mlp.tile)
-        keyframe_x.mul_(keyframe_valid[None, :, None, None, None])
+        keyframe_x.mul_(keyframe_planes.valid.device_tensor[None, :, None, None, None])
         return x, keyframe_x
 
     def forward_x_ctx_with_keyframes(
@@ -78,8 +81,7 @@ class ChunkedDiffusionNABlock(DiffusionNABlock):
         keyframe_x: torch.Tensor,
         keyframe_stage4_feat: torch.Tensor,
         modulation: tuple[torch.Tensor, ...],
-        keyframe_times: torch.Tensor,
-        keyframe_valid: torch.Tensor,
+        keyframe_planes: KeyframePlanes,
         *,
         drop_leading_frame: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -118,8 +120,7 @@ class ChunkedDiffusionNABlock(DiffusionNABlock):
             shift_msa,
             scale_mlp,
             shift_mlp,
-            keyframe_times,
-            keyframe_valid,
+            keyframe_planes,
         )
 
     def forward_x_ctx(

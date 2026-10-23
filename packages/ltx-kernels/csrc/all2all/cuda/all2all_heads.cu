@@ -48,7 +48,7 @@ namespace all2all_cuda {
  *   Dest:   [batch, total_tokens, heads_per_rank, head_size]
  *
  * Each GPU writes heads [target_rank * heads_per_rank : (target_rank+1) * heads_per_rank]
- * to target_rank's buffer at token offset prefix_rank_tokens[rank].
+ * to target_rank's buffer at token offset rank * num_tokens.
  *
  * ## Memory Layout
  *
@@ -60,7 +60,7 @@ namespace all2all_cuda {
  *
  * Output buffer (per target rank):
  *   - Similar layout but with heads_per_rank instead of num_heads
- *   - Tokens from this rank placed at offset prefix_rank_tokens[rank]
+ *   - Tokens from this rank placed at offset rank * num_tokens
  *
  * ## Thread Block Organization
  *
@@ -81,12 +81,11 @@ namespace all2all_cuda {
  * @param num_heads Total number of attention heads
  * @param head_size Size of each attention head
  * @param total_tokens Sum of tokens across all ranks
- * @param prefix_rank_tokens Cumulative token counts for offset calculation
  */
 template <typename ELEM_T>
 __global__ void send_recv_all2all(void **buffer_ptrs, int **barrier_signal_ptrs, void *x, int rank, int world_size,
                                   int batch_size, int num_tokens, int num_heads, int head_size, int total_tokens,
-                                  int *prefix_rank_tokens, uint64_t timeout_cycles) {
+                                  uint64_t timeout_cycles) {
   // Grid dimensions
   int num_sms = gridDim.x;
   int sm_id = blockIdx.x;
@@ -133,7 +132,7 @@ __global__ void send_recv_all2all(void **buffer_ptrs, int **barrier_signal_ptrs,
          token_idx += num_tokens_per_copy * num_sms_for_this_rank) {
       int64_t copy_token_idx = token_idx + copy_thr_row_idx;
       // Destination token index accounts for this rank's offset in the global sequence
-      int64_t dst_token_idx = prefix_rank_tokens[rank] + copy_token_idx;
+      int64_t dst_token_idx = int64_t(rank) * num_tokens + copy_token_idx;
 
       if (copy_token_idx >= num_tokens)
         break;
@@ -176,7 +175,7 @@ __global__ void send_recv_all2all(void **buffer_ptrs, int **barrier_signal_ptrs,
  *
  * Data layout transformation:
  *   Source: [batch, total_tokens, heads_per_rank, head_size]  (per GPU)
- *   Dest:   [batch, rank_tokens[target], num_heads, head_size]  (per target GPU)
+ *   Dest:   [batch, total_tokens/world_size, num_heads, head_size]  (per target GPU)
  *
  * ## Memory Layout
  *
@@ -186,7 +185,7 @@ __global__ void send_recv_all2all(void **buffer_ptrs, int **barrier_signal_ptrs,
  *
  * Output buffer (per target rank):
  *   - Contains only that rank's tokens but all heads
- *   - Layout: [batch, rank_tokens[target], num_heads, head_size]
+ *   - Layout: [batch, total_tokens/world_size, num_heads, head_size]
  *   - This rank writes heads [rank * heads_per_rank : (rank+1) * heads_per_rank]
  *
  * @tparam ELEM_T Element type (at::BFloat16 or at::Float8_e4m3fn)
@@ -198,14 +197,11 @@ __global__ void send_recv_all2all(void **buffer_ptrs, int **barrier_signal_ptrs,
  * @param batch_size Number of batches
  * @param num_heads Total number of heads (reconstructed)
  * @param head_size Size of each attention head
- * @param rank_tokens Number of tokens for each rank
  * @param total_tokens Sum of tokens across all ranks
- * @param prefix_rank_tokens Cumulative token counts for offset calculation
  */
 template <typename ELEM_T>
 __global__ void gather_heads(void **buffer_ptrs, int **barrier_signal_ptrs, void *x, int rank, int world_size,
-                             int batch_size, int num_heads, int head_size, const int *__restrict__ rank_tokens,
-                             int total_tokens, int *prefix_rank_tokens, uint64_t timeout_cycles) {
+                             int batch_size, int num_heads, int head_size, int total_tokens, uint64_t timeout_cycles) {
   // Grid dimensions
   int num_sms = gridDim.x;
   int sm_id = blockIdx.x;
@@ -227,7 +223,7 @@ __global__ void gather_heads(void **buffer_ptrs, int **barrier_signal_ptrs, void
   int64_t copy_thr_row_idx = threadIdx.x / num_threads_per_token;
 
   // Number of tokens owned by target rank
-  const int64_t tgt_tokens = int64_t(rank_tokens[target_rank]);
+  const int64_t tgt_tokens = int64_t(total_tokens / world_size);
 
   // This rank writes its heads at offset [rank * heads_per_rank] in the output
   int64_t head_idx = rank * heads_per_rank;
@@ -248,7 +244,7 @@ __global__ void gather_heads(void **buffer_ptrs, int **barrier_signal_ptrs, void
         break;
 
       // Source: Read from global token position (target rank's tokens in our buffer)
-      int64_t src_token_idx = prefix_rank_tokens[target_rank] + copy_token;
+      int64_t src_token_idx = target_rank * tgt_tokens + copy_token;
       // Destination: Write to local token position in target's buffer
       int64_t dst_token_idx = copy_token;
 
@@ -285,8 +281,6 @@ __global__ void gather_heads(void **buffer_ptrs, int **barrier_signal_ptrs, void
  * @param buffer_ptrs Device array of buffer pointers
  * @param barrier_signal_ptrs Device array of barrier signal pointers
  * @param x Input tensor data pointer
- * @param rank_tokens Token count per rank (device memory)
- * @param prefix_rank_tokens Cumulative token counts (device memory)
  * @param rank This GPU's rank
  * @param world_size Total number of GPUs
  * @param batch_size Number of batches
@@ -297,19 +291,18 @@ __global__ void gather_heads(void **buffer_ptrs, int **barrier_signal_ptrs, void
  * @param num_sms Number of SMs to launch
  * @param tensor_dtype Data type (BFloat16 or Float8_e4m3fn)
  */
-void all2all_head_gather_launch(void **buffer_ptrs, int **barrier_signal_ptrs, void *x, const int *rank_tokens,
-                                int *prefix_rank_tokens, int rank, int world_size, int batch_size, int total_tokens,
-                                int num_heads, int head_size, cudaStream_t stream, int num_sms,
-                                at::ScalarType tensor_dtype, uint64_t timeout_cycles) {
+void all2all_head_gather_launch(void **buffer_ptrs, int **barrier_signal_ptrs, void *x, int rank, int world_size,
+                                int batch_size, int total_tokens, int num_heads, int head_size, cudaStream_t stream,
+                                int num_sms, at::ScalarType tensor_dtype, uint64_t timeout_cycles) {
   do {
     if (tensor_dtype == at::ScalarType::BFloat16) {
       gather_heads<at::BFloat16><<<num_sms, DEFAULT_KERNEL_THREADS, 0, stream>>>(
-          buffer_ptrs, barrier_signal_ptrs, x, rank, world_size, batch_size, num_heads, head_size, rank_tokens,
-          total_tokens, prefix_rank_tokens, timeout_cycles);
+          buffer_ptrs, barrier_signal_ptrs, x, rank, world_size, batch_size, num_heads, head_size, total_tokens,
+          timeout_cycles);
     } else if (tensor_dtype == at::ScalarType::Float8_e4m3fn) {
       gather_heads<at::Float8_e4m3fn><<<num_sms, DEFAULT_KERNEL_THREADS, 0, stream>>>(
-          buffer_ptrs, barrier_signal_ptrs, x, rank, world_size, batch_size, num_heads, head_size, rank_tokens,
-          total_tokens, prefix_rank_tokens, timeout_cycles);
+          buffer_ptrs, barrier_signal_ptrs, x, rank, world_size, batch_size, num_heads, head_size, total_tokens,
+          timeout_cycles);
     }
 
     // Check for kernel launch errors
@@ -331,7 +324,6 @@ void all2all_head_gather_launch(void **buffer_ptrs, int **barrier_signal_ptrs, v
  * @param buffer_ptrs Device array of buffer pointers
  * @param barrier_signal_ptrs Device array of barrier signal pointers
  * @param x Input tensor data pointer
- * @param prefix_rank_tokens Cumulative token counts (device memory)
  * @param rank This GPU's rank
  * @param world_size Total number of GPUs
  * @param batch_size Number of batches
@@ -343,18 +335,18 @@ void all2all_head_gather_launch(void **buffer_ptrs, int **barrier_signal_ptrs, v
  * @param num_sms Number of SMs to launch
  * @param tensor_dtype Data type (BFloat16 or Float8_e4m3fn)
  */
-void all2all_head_launch(void **buffer_ptrs, int **barrier_signal_ptrs, void *x, int *prefix_rank_tokens, int rank,
-                         int world_size, int batch_size, int total_tokens, int num_tokens, int num_heads, int head_size,
+void all2all_head_launch(void **buffer_ptrs, int **barrier_signal_ptrs, void *x, int rank, int world_size,
+                         int batch_size, int total_tokens, int num_tokens, int num_heads, int head_size,
                          cudaStream_t stream, int num_sms, at::ScalarType tensor_dtype, uint64_t timeout_cycles) {
   do {
     if (tensor_dtype == at::ScalarType::BFloat16) {
       send_recv_all2all<at::BFloat16><<<num_sms, DEFAULT_KERNEL_THREADS, 0, stream>>>(
           buffer_ptrs, barrier_signal_ptrs, x, rank, world_size, batch_size, num_tokens, num_heads, head_size,
-          total_tokens, prefix_rank_tokens, timeout_cycles);
+          total_tokens, timeout_cycles);
     } else if (tensor_dtype == at::ScalarType::Float8_e4m3fn) {
       send_recv_all2all<at::Float8_e4m3fn><<<num_sms, DEFAULT_KERNEL_THREADS, 0, stream>>>(
           buffer_ptrs, barrier_signal_ptrs, x, rank, world_size, batch_size, num_tokens, num_heads, head_size,
-          total_tokens, prefix_rank_tokens, timeout_cycles);
+          total_tokens, timeout_cycles);
     }
 
     // Check for kernel launch errors

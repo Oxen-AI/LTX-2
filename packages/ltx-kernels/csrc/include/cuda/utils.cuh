@@ -357,4 +357,65 @@ __device__ __forceinline__ void barrier_wait_and_reset_roundrobin(int **barrier_
   }
 }
 
+/**
+ * @brief Barrier for a kernel in which every block writes to every rank.
+ *
+ * barrier_wait_and_reset and its round-robin variant have each block signal the one rank it wrote
+ * to, which assumes a block's writes go to a single rank. When every block writes to every rank,
+ * no single block's signal covers the others' writes. Here each block instead counts itself done
+ * in `blocks_done` (a counter on this rank), and the last block to finish signals every rank once,
+ * then waits for one signal from every rank -- the same per-source counters and counts as
+ * barrier_wait_and_reset with one block per target. Earlier blocks return without waiting, so no
+ * block spins on an SM that unfinished blocks still need.
+ *
+ * Call from every block after its last write. Needs blockDim.x >= world_size.
+ *
+ * @param barrier_signal_ptrs Array of pointers to barrier signal buffers for each rank
+ * @param blocks_done This rank's count of finished blocks; zero on entry, zero again on return
+ * @param rank This GPU's rank
+ * @param world_size Total number of GPUs/ranks
+ * @param thread_id The thread ID within the block (threadIdx.x)
+ * @param timeout_cycles Number of cycles to wait before timeout
+ */
+__device__ __forceinline__ void barrier_last_block_wait_and_reset(int **barrier_signal_ptrs, int *blocks_done, int rank,
+                                                                  int world_size, int thread_id,
+                                                                  uint64_t timeout_cycles) {
+  __shared__ bool is_last_block;
+
+  // Release: every block fences its own writes before counting itself done.
+  __threadfence_system();
+  __syncthreads();
+  if (thread_id == 0) {
+    is_last_block = atomicAdd(blocks_done, 1) == static_cast<int>(gridDim.x) - 1;
+  }
+  __syncthreads();
+  if (!is_last_block) {
+    return;
+  }
+  if (thread_id == 0) {
+    *blocks_done = 0;
+  }
+  __threadfence_system();
+
+  // Each thread signals one rank and waits for that rank's signal.
+  if (thread_id < world_size) {
+    atomicAdd_system(barrier_signal_ptrs[thread_id] + rank, 1);
+    auto start_time = clock64();
+    while (true) {
+      // Acquire: seeing the signal guarantees the peer's data is visible.
+      int recv_count = ld_acquire_sys_global(barrier_signal_ptrs[rank] + thread_id);
+      if (recv_count == 1) {
+        break;
+      }
+      if (clock64() - start_time >= timeout_cycles) {
+        printf("All2All barrier timeout (last block): rank=%d, waiting_for_source=%d, expected=1, got=%d\n", rank,
+               thread_id, recv_count);
+        trap();
+      }
+    }
+    // Reset barrier for next use
+    atomicSub_system(barrier_signal_ptrs[rank] + thread_id, 1);
+  }
+}
+
 } // namespace ltx_kernels

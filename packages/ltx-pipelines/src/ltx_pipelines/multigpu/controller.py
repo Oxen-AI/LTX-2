@@ -161,12 +161,18 @@ class MGPUController:
         num_gpus: int | None = None,
         devices: Sequence[int] | None = None,
         logs_specs: LogsSpecs | None = None,
+        cpu_threads_per_rank: int | None = 8,
     ) -> None:
         """`num_gpus` uses GPUs 0..num_gpus-1 (default: all). `devices` places the fleet on specific
         physical GPUs (e.g. `[2, 3]` -> rank r on cuda:devices[r]), so several controllers can share a
         box on disjoint GPU sets; the two are mutually exclusive. Indices are as the controller sees
         them; every GPU stays visible to each worker, which simply binds to its assigned one.
+        `cpu_threads_per_rank` sets each rank's intra-op CPU threads (`torch.set_num_threads`); None
+        keeps torch's default. Ranks only run small host tensor ops, which a pool as wide as the machine
+        stalls.
         """
+        if cpu_threads_per_rank is not None and cpu_threads_per_rank < 1:
+            raise ValueError(f"cpu_threads_per_rank must be >= 1: {cpu_threads_per_rank}.")
         if devices is not None:
             if num_gpus is not None:
                 raise ValueError("Pass either num_gpus or devices, not both.")
@@ -176,6 +182,7 @@ class MGPUController:
         self._devices = list(devices) if devices is not None else None
         self._num_gpus = num_gpus
         self._logs_specs = logs_specs
+        self._cpu_threads_per_rank = cpu_threads_per_rank
         self._spawn_ctx = torch_mp.get_context("spawn")
 
         self._fleet: _RunnersFleet | None = None
@@ -232,6 +239,7 @@ class MGPUController:
             num_gpus=num_gpus,
             logs_specs=self._logs_specs or DefaultLogsSpecs(tee=Std.ALL),
             device_ids=device_ids,
+            cpu_threads=self._cpu_threads_per_rank,
         )
         try:
             self._await_ready(num_gpus, timeout.total_seconds())

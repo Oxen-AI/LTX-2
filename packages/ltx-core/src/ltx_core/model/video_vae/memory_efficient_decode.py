@@ -55,7 +55,7 @@ from torch.nn import functional as F
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
 from ltx_core.model.common.normalization import PixelNorm
-from ltx_core.model.video_vae.convolution import CausalConv3d
+from ltx_core.model.video_vae.convolution import CausalConv3d, memory_format_of
 from ltx_core.model.video_vae.ops import unpatchify
 from ltx_core.model.video_vae.resnet import ResnetBlock3D, UNetMidBlock3D
 from ltx_core.model.video_vae.sampling import DepthToSpaceUpsample
@@ -67,25 +67,6 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Low-level helpers
 # ---------------------------------------------------------------------------
-
-
-def _memory_format_of(t: torch.Tensor, prefer_channels_last_3d: bool = False) -> torch.memory_format:
-    """Pick the memory format for a workspace allocation.
-    When ``prefer_channels_last_3d`` is True and ``t`` is 5D, return
-    ``channels_last_3d`` regardless of ``t``'s current strides -- the
-    workspace's ``.copy_(t)`` will transcribe the data into the new layout.
-    This is needed because intermediate tensors inside the decoder (after
-    ``rearrange`` + slice + residual add in ``_upsample_forward_efficient``)
-    are not NHWC-contiguous, so an auto-detect helper would silently fall
-    back to NCHW for every workspace after the first upsample.
-    Otherwise fall back to inspecting ``t``: ``channels_last_3d`` if ``t``
-    already uses it, else contiguous.
-    """
-    if prefer_channels_last_3d and t.dim() == 5:
-        return torch.channels_last_3d
-    if t.dim() == 5 and t.is_contiguous(memory_format=torch.channels_last_3d):
-        return torch.channels_last_3d
-    return torch.contiguous_format
 
 
 def _find_temporal_split_size(num_frames: int) -> int:
@@ -164,7 +145,7 @@ def inplace_conv3d_temporal_chunked(workspace: torch.Tensor, conv: nn.Conv3d) ->
         workspace.shape[4],
         device=workspace.device,
         dtype=workspace.dtype,
-        memory_format=_memory_format_of(workspace),
+        memory_format=memory_format_of(workspace),
     )
     o_buf = torch.empty_like(x_buf)
 
@@ -223,7 +204,7 @@ def _causal_pad(x: torch.Tensor, pad_size: int) -> torch.Tensor:
         x.shape[4],
         device=x.device,
         dtype=x.dtype,
-        memory_format=_memory_format_of(x),
+        memory_format=memory_format_of(x),
     )
     padded[:, :, pad_size:].copy_(x)
     for i in range(pad_size):
@@ -386,7 +367,7 @@ def _midblock_forward_efficient(
         hidden_states.shape[4],
         device=hidden_states.device,
         dtype=hidden_states.dtype,
-        memory_format=_memory_format_of(hidden_states, prefer_channels_last_3d),
+        memory_format=memory_format_of(hidden_states, prefer_channels_last_3d),
     )
 
     for resnet in block.res_blocks:
@@ -430,7 +411,7 @@ def _upsample_forward_efficient(
     if causal:
         x = _causal_pad_free_and_conv(x, block.conv)
     else:
-        mem_fmt = _memory_format_of(x, prefer_channels_last_3d)
+        mem_fmt = memory_format_of(x, prefer_channels_last_3d)
         workspace = torch.empty(
             x.shape[0],
             max(in_channels, out_channels),
@@ -480,7 +461,7 @@ def _final_norm_and_conv_out(
     conv_out = conv_out_mod.conv
     feature_channels = sample.shape[1]
 
-    mem_fmt = _memory_format_of(sample, prefer_channels_last_3d)
+    mem_fmt = memory_format_of(sample, prefer_channels_last_3d)
     workspace = torch.empty(
         sample.shape[0],
         max(feature_channels, conv_out.out_channels),

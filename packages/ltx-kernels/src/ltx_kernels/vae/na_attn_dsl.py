@@ -11,15 +11,14 @@ Q must arrive carrying the attention scale, exactly as ``natten.na3d`` expects i
 The one extra thing this kernel needs is the ``k_norm`` weight, from which it builds a
 fixed softmax offset in place of an online row max -- see
 :mod:`ltx_kernels.vae.softmax_bound`, which is worth reading before calling this.
-Compile keys are ``(kernel_size, tile_thw)`` and nothing else -- head count, T, H and
-W are all runtime -- so the four deterministic stages share two binaries.
+Compile keys are ``(kernel_size, tile_thw)`` per GPU architecture -- head count,
+T, H and W are all runtime -- so the four deterministic stages share two binaries.
 """
 
 # NOTE: no `from __future__ import annotations` -- cute.struct needs real types.
 
 import functools
-import os
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
@@ -27,6 +26,8 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass.utils import SmemAllocator
 
+from ltx_kernels.devices import upload_from_host
+from ltx_kernels.vae.aot import KERNEL_CACHE, fake_dynamic_matrix, fake_dynamic_vector
 from ltx_kernels.vae.availability import UNSUPPORTED_MESSAGE, gpu_supports_dsl_kernels
 from ltx_kernels.vae.fna_attn_core import (
     _as_rows,
@@ -75,8 +76,6 @@ from ltx_kernels.vae.fna_types import (
 )
 from ltx_kernels.vae.keyframe_slots import KEYFRAME_CONTEXT_SLOTS, nearest_video_frames, tile_plane_union
 from ltx_kernels.vae.softmax_bound import softmax_row_bound
-
-_COMPILED: "dict[tuple, Any]" = {}
 
 # Heads per group. ``HG * HD`` TMEM columns for the attention accumulators plus 256
 # for the two Q@K accumulators must fit in 512, so 4 is the ceiling; it also has to
@@ -181,6 +180,8 @@ def _na_kernel(
     pool = smem.allocate_tensor(IO, cute.make_layout((pool_elems,)), byte_alignment=128)
     sO = _alias(pool, o_layout)
     sP = _alias(pool, p_layout)
+    # This warpgroup's chunk of ``sP`` at stage 0, for ``attention_tile``'s P fill.
+    sP_own = _alias(pool, p_layout, wg * (M * TILE_K))
     sK = _alias(pool, k_layout, 2 * M * TILE_K)
     sV = _alias(pool, v_layout, 4 * M * TILE_K)
     sQ = smem.allocate_tensor(IO, q_layout.outer, byte_alignment=128, swizzle=q_layout.inner)
@@ -325,7 +326,7 @@ def _na_kernel(
             if deep:
                 attention_tile(
                     (frQ, frK, frP, frV),
-                    (sK, sV, sP),
+                    (sK, sV, sP_own),
                     acc_qk,
                     acc_o,
                     (qkbar, pvbar),
@@ -392,7 +393,7 @@ def _na_kernel(
                         v_src = select_tensor(video_kv != 0, v, v_kf)
                     attention_tile(
                         (frQ, frK, frP, frV),
-                        (sK, sV, sP),
+                        (sK, sV, sP_own),
                         acc_qk,
                         acc_o,
                         (qkbar, pvbar),
@@ -424,7 +425,7 @@ def _na_kernel(
                     pass_i += 1
 
             cute.arch.sync_threads()
-            attn_epilogue(acc_o, l_sm, oreg, sO, lane, wg, HG)
+            attn_epilogue(acc_o, l_sm, oreg, pool, o_layout, lane, wg, HG)
             cute.arch.sync_threads()
             _scatter_a(sO, y_dst, rowix_w, copy_slot, HG * HD, c_off)
             cute.arch.sync_threads()
@@ -451,17 +452,17 @@ def _launch(
     y_kf,
     kf_video,
     kf_video_counts,
-    T,
-    H,
-    W,
-    NH,
-    n_hg,
-    n_tiles,
-    n_ctas,
-    grid_hw,
-    grid_w_,
-    n_kf,
-    n_kfq_tiles,
+    T: cutlass.Int32,
+    H: cutlass.Int32,
+    W: cutlass.Int32,
+    NH: cutlass.Int32,
+    n_hg: cutlass.Int32,
+    n_tiles: cutlass.Int32,
+    n_ctas: cutlass.Int32,
+    grid_hw: cutlass.Int32,
+    grid_w_: cutlass.Int32,
+    n_kf: cutlass.Int32,
+    n_kfq_tiles: cutlass.Int32,
     kt: cutlass.Constexpr,
     kh: cutlass.Constexpr,
     kw: cutlass.Constexpr,
@@ -565,25 +566,15 @@ def na_supported(
     return pt <= T and ph <= H and pw <= W
 
 
-def _compile(
+def _compile_kernel(
     *,
     kernel_size: "tuple[int, int, int]",
     tile_thw: "tuple[int, int, int]",
     keyframes: bool = False,
     keyframe_queries: bool = False,
+    options: str | None = None,
 ):
-    # ``keyframes`` is part of the key so the no-keyframe binary keeps the exact trace it
-    # had before the tail existed -- ``n_kf = 0`` must stay bit-identical, and a runtime
-    # zero-trip loop would still perturb the codegen around it.
-    # Everything in this key is *structural*. Nothing derived from the anchor layout may join
-    # it: the per-tile plane union bound used to, and since it moves with the clip length it
-    # recompiled the whole stage ladder on every new duration -- 12+ minutes of in-process
-    # MLIR before a 545-frame decode could start. It is now ``SLOTS * TT``, the true upper
-    # bound (each of a tile's ``TT`` timesteps contributes at most ``SLOTS`` planes), which is
-    # a constant of ``tile_thw`` and so already covered here.
-    key = (kernel_size, tile_thw, keyframes, keyframe_queries)
-    if key in _COMPILED:
-        return _COMPILED[key]
+    """Compile one structural key from storage-free ABI descriptors."""
     kt, kh, kw = kernel_size
     tt, th, tw = tile_thw
     pt, ph, pw = tt + kt - 1, th + kh - 1, tw + kw - 1
@@ -595,32 +586,29 @@ def _compile(
     # *query* tiles borrow it too, which is what keeps them on one instantiation with the
     # video tail (see the keyframe query loop in ``_na_kernel``).
     nkv_kf = (ph * pw + TILE_N - 1) // TILE_N
-    dev = torch.device("cuda")
 
-    def za(a: int, b: int):
-        return _dyn_act(torch.zeros(a, b, device=dev, dtype=torch.bfloat16))
+    def activation():
+        return fake_dynamic_matrix(cutlass.BFloat16, assumed_align=16)
 
-    def zi(n: int):
-        return _dyn(torch.zeros(n, device=dev, dtype=torch.int32))
+    def i32_vector():
+        return fake_dynamic_vector(cutlass.Int32)
 
-    # Pass-through for CuTe DSL compiler flags, e.g. --keep-sass / --ptxas-options=-v.
-    opts = os.environ.get("CUTE_DSL_OPTS")
-    _COMPILED[key] = cute.compile(
+    return cute.compile(
         _launch,
-        za(M, HG * HD),
-        za(M, HD),
-        za(M, HD),
-        za(M, HG * HD),
-        _dyn(torch.zeros(1, device=dev, dtype=torch.float32)),
-        za(M, HD),
-        za(M, HD),
-        zi(KEYFRAME_CONTEXT_SLOTS),
-        zi(1),
-        zi(1),
-        za(M, HG * HD),
-        za(M, HG * HD),
-        zi(KEYFRAME_CONTEXT_SLOTS),
-        zi(1),
+        activation(),
+        activation(),
+        activation(),
+        activation(),
+        fake_dynamic_vector(cutlass.Float32),
+        activation(),
+        activation(),
+        i32_vector(),
+        i32_vector(),
+        i32_vector(),
+        activation(),
+        activation(),
+        i32_vector(),
+        i32_vector(),
         4,
         4,
         4,
@@ -647,9 +635,8 @@ def _compile(
         KEYFRAME_CONTEXT_SLOTS * tt,
         nkv_kf,
         keyframe_queries,
-        **({"options": opts} if opts else {}),
+        **({"options": options} if options else {}),
     )
-    return _COMPILED[key]
 
 
 @functools.lru_cache(maxsize=8)
@@ -759,9 +746,9 @@ def _keyframe_operands(
         enabled=True,
         k=_dyn_act(rows(k_keyframes)),
         v=_dyn_act(rows(v_keyframes)),
-        slots=_dyn(slots_cpu.reshape(-1).to(device=device)),
-        planes=_dyn(planes.reshape(-1).to(device=device)),
-        counts=_dyn(counts.to(device=device)),
+        slots=_dyn(upload_from_host(slots_cpu.reshape(-1).contiguous(), device)),
+        planes=_dyn(upload_from_host(planes.reshape(-1).contiguous(), device)),
+        counts=_dyn(upload_from_host(counts, device)),
     )
 
 
@@ -860,47 +847,59 @@ def run_na_attention_bound(
         y_kf_buf = torch.empty((n_kf * H * W + M, NH * hd), device=q_.device, dtype=torch.bfloat16)
         y_kf_dyn = _dyn_act(y_kf_buf)
         q_kf_ = _dyn_act(q_kf_rows)
-        kfv = _dyn(video_frames.reshape(-1).to(device=q_.device))
-        kfv_counts = _dyn((video_frames >= 0).sum(dim=-1).to(dtype=torch.int32, device=q_.device))
+        kfv = _dyn(upload_from_host(video_frames.reshape(-1).contiguous(), q_.device))
+        kfv_counts = _dyn(upload_from_host((video_frames >= 0).sum(dim=-1).to(dtype=torch.int32), q_.device))
         n_kfq_tiles = n_kf * grid_h * grid_w
     else:
         _, _, q_kf_, y_kf_dyn = _inert_operands(hd, NH * hd, q_.device)
         kfv = kfv_counts = kf.counts
         n_kfq_tiles = 0
 
-    compiled = _compile(
-        kernel_size=kernel_size,
-        tile_thw=(tt, th, tw),
-        keyframes=kf.enabled,
-        keyframe_queries=kfq,
-    )
-    compiled(
-        _dyn_act(q_),
-        _dyn_act(k_),
-        _dyn_act(v_),
-        _dyn_act(y_buf),
-        _dyn(k_bound.detach().reshape(1).float().to(device=q_.device)),
-        kf.k,
-        kf.v,
-        kf.slots,
-        kf.planes,
-        kf.counts,
-        q_kf_,
-        y_kf_dyn,
-        kfv,
-        kfv_counts,
-        T,
-        H,
-        W,
-        NH,
-        NH // HG,
-        n_tiles,
-        n_ctas,
-        grid_h * grid_w,
-        grid_w,
-        n_kf,
-        n_kfq_tiles,
-    )
+    with torch.cuda.device(q_.device):
+        # ``keyframes`` is part of the key so the no-keyframe binary keeps the exact trace it
+        # had before the tail existed -- ``n_kf = 0`` must stay bit-identical, and a runtime
+        # zero-trip loop would still perturb the codegen around it.
+        # Everything in this key is *structural*. Nothing derived from the anchor layout may join
+        # it: the per-tile plane union bound used to, and since it moves with the clip length it
+        # recompiled the whole stage ladder on every new duration -- 12+ minutes of in-process
+        # MLIR before a 545-frame decode could start. It is now ``SLOTS * TT``, the true upper
+        # bound (each of a tile's ``TT`` timesteps contributes at most ``SLOTS`` planes), which is
+        # a constant of ``tile_thw`` and so already covered here.
+        compiled = KERNEL_CACHE.get(
+            _compile_kernel,
+            q_.device,
+            kernel_size=kernel_size,
+            tile_thw=(tt, th, tw),
+            keyframes=kf.enabled,
+            keyframe_queries=kfq,
+        )
+        compiled(
+            _dyn_act(q_),
+            _dyn_act(k_),
+            _dyn_act(v_),
+            _dyn_act(y_buf),
+            _dyn(k_bound.detach().reshape(1).float().to(device=q_.device)),
+            kf.k,
+            kf.v,
+            kf.slots,
+            kf.planes,
+            kf.counts,
+            q_kf_,
+            y_kf_dyn,
+            kfv,
+            kfv_counts,
+            T,
+            H,
+            W,
+            NH,
+            NH // HG,
+            n_tiles,
+            n_ctas,
+            grid_h * grid_w,
+            grid_w,
+            n_kf,
+            n_kfq_tiles,
+        )
     video_out = y_buf[: T * H * W].view(1, T, H, W, NH * hd).to(dtype=q.dtype)
     if q_keyframes is None:
         return video_out
