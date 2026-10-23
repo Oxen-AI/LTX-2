@@ -1,4 +1,7 @@
+import errno
 import json
+import logging
+from pathlib import Path
 
 import safetensors
 import safetensors.torch
@@ -6,6 +9,45 @@ import torch
 
 from ltx_core.loader.primitives import StateDict, StateDictLoader
 from ltx_core.loader.sd_ops import SDOps
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+class _InMemoryShard:
+    """Serves keys() and get_tensor() like a safe_open handle, from a shard read fully into memory."""
+
+    def __init__(self, path: str) -> None:
+        self._tensors = safetensors.torch.load(Path(path).read_bytes())
+
+    def __enter__(self) -> "_InMemoryShard":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self._tensors.clear()
+
+    def keys(self) -> list[str]:
+        return list(self._tensors)
+
+    def get_tensor(self, name: str) -> torch.Tensor:
+        return self._tensors[name]
+
+
+def _mmap_unsupported(error: OSError) -> bool:
+    # safetensors raises a failed mmap from Rust as OSError("No such device (os error 19)")
+    # with errno unset, which leaves the message as the only place the error number appears.
+    return error.errno == errno.ENODEV or f"(os error {errno.ENODEV})" in str(error)
+
+
+def _open_shard(shard_path: str, device: torch.device) -> safetensors.safe_open | _InMemoryShard:
+    # Some network filesystems refuse mmap with ENODEV. Reading the shard instead costs its
+    # whole size in RAM (tens of GB for a full checkpoint), so it is only the fallback.
+    try:
+        return safetensors.safe_open(shard_path, framework="pt", device=str(device))
+    except OSError as error:
+        if not _mmap_unsupported(error):
+            raise
+        logger.warning("Cannot memory map %s (%s), reading it into memory instead", shard_path, error)
+    return _InMemoryShard(shard_path)
 
 
 class SafetensorsStateDictLoader(StateDictLoader):
@@ -28,24 +70,20 @@ class SafetensorsStateDictLoader(StateDictLoader):
         device = device or torch.device("cpu")
         model_paths = path if isinstance(path, list) else [path]
         for shard_path in model_paths:
-            # Read the file into memory before parsing instead of using
-            # safetensors.safe_open(), in order to avoid mmap failures on
-            # network-mounted filesystems (triggering os error 19).
-            with open(shard_path, "rb") as shard_file:
-                shard_content = shard_file.read()
-            shard_tensors = safetensors.torch.load(shard_content)
-            for name, tensor in shard_tensors.items():
-                expected_name = name if sd_ops is None else sd_ops.apply_to_key(name)
-                if expected_name is None:
-                    continue
-                moved = tensor.to(device=device, non_blocking=True)
-                key_value_pairs = ((expected_name, moved),)
-                if sd_ops is not None:
-                    key_value_pairs = sd_ops.apply_to_key_value(expected_name, moved)
-                for key, value in key_value_pairs:
-                    size += value.nbytes
-                    dtype.add(value.dtype)
-                    sd[key] = value
+            with _open_shard(shard_path, device) as f:
+                safetensor_keys = f.keys()
+                for name in safetensor_keys:
+                    expected_name = name if sd_ops is None else sd_ops.apply_to_key(name)
+                    if expected_name is None:
+                        continue
+                    value = f.get_tensor(name).to(device=device, non_blocking=True, copy=False)
+                    key_value_pairs = ((expected_name, value),)
+                    if sd_ops is not None:
+                        key_value_pairs = sd_ops.apply_to_key_value(expected_name, value)
+                    for key, value in key_value_pairs:
+                        size += value.nbytes
+                        dtype.add(value.dtype)
+                        sd[key] = value
 
         return StateDict(sd=sd, device=device, size=size, dtype=dtype)
 
