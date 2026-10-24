@@ -35,6 +35,7 @@ from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
     assert_stage_supports_generated_keyframes,
+    cleanup_memory,
     decode_keyframes_from_slots,
     ensure_tiling_config,
     generated_keyframe_conditionings,
@@ -166,6 +167,9 @@ class HDRICLoraPipeline:
     Pass ``keyframe_strength`` to ``__call__`` for DFR-style seam keyframes
     (generated HDR slots + 1-frame SDR guides + keyframe-aware DiffVAE decode).
     ``None`` is plain IC-LoRA.
+    ``evict_weights_above_pixels`` drops the transformer's weights from a weight caching
+    ``registry`` before decoding a clip of more pixels (frames x height x width). The decode of a
+    long 4K clip does not fit beside them on an 80 GB GPU.
     """
 
     def __init__(  # noqa: PLR0913
@@ -181,8 +185,11 @@ class HDRICLoraPipeline:
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
         diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
         compilation_config: CompilationConfig | None = None,
+        evict_weights_above_pixels: int | None = None,
     ) -> None:
         self.device = device or get_device()
+        self._registry = registry
+        self._evict_weights_above_pixels = evict_weights_above_pixels
         self._tiled_vae_encode_threshold = tiled_vae_encode_pixel_threshold
         if isinstance(quantization, QuantizationKind):
             quantization = quantization.to_policy(checkpoint_path=model_paths.transformer())
@@ -369,6 +376,10 @@ class HDRICLoraPipeline:
             generated_kf=generated_kf,
         )
 
+        if self._evicts_weights_for(gen_frames * gen_h * gen_w):
+            self.stage.evict_weights(self._registry)
+            cleanup_memory()
+
         acescct_hdr = self._decode_video(
             video_state,
             tiling_config,
@@ -380,6 +391,10 @@ class HDRICLoraPipeline:
             high_quality_hdr=high_quality_hdr,
         )
         return acescct_hdr, meta.fps
+
+    def _evicts_weights_for(self, pixels: int) -> bool:
+        threshold = self._evict_weights_above_pixels
+        return self._registry is not None and threshold is not None and pixels > threshold
 
     def _load_acescct_conditioning(
         self,
