@@ -388,7 +388,11 @@ class HDRICLoraPipeline:
         width: int,
         num_frames: int,
     ) -> torch.Tensor:
-        """Load the IC-LoRA reference as ACEScct BCTHW on CPU."""
+        """Load the IC-LoRA reference as ACEScct BCTHW on CPU.
+        A video's colour transform runs on the pipeline's device, where it takes seconds; on the
+        few CPUs of a serving container it took most of a minute at 4K. Each chunk comes back to
+        the CPU, so the reference holds no device memory through the denoise.
+        """
         match video:
             case EXRVideoInput(dir=path, color_space=color_space):
                 frames = load_exr_as_hdr_conditioning(
@@ -408,11 +412,11 @@ class HDRICLoraPipeline:
                     width,
                     num_frames,
                     torch.float32,
-                    torch.device("cpu"),
+                    self.device,
                     gamma_encoded=gamma_encoded,
                     resize_mode=ResizeMode.REFLECT_PAD,
                 )
-        chunks = list(frames)
+        chunks = [chunk.cpu() for chunk in frames]
         if not chunks:
             raise ValueError(f"No frames loaded from {path}")
         return torch.cat(chunks, dim=2)
