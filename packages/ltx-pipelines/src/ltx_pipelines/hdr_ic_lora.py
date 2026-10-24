@@ -184,6 +184,7 @@ class HDRICLoraPipeline:
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
         diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
+        *,
         compilation_config: CompilationConfig | None = None,
         evict_weights_above_pixels: int | None = None,
     ) -> None:
