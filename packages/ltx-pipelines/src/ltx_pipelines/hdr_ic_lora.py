@@ -19,6 +19,7 @@ from ltx_core.conditioning import (
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
 from ltx_core.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP
+from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, VideoEncoder
 from ltx_core.model.video_vae.keyframes import DecodeKeyframes
 from ltx_core.model.video_vae.transformer import DiffVAEMode
@@ -167,7 +168,7 @@ class HDRICLoraPipeline:
     ``None`` is plain IC-LoRA.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         model_paths: ModelPaths,
         hdr_lora: str | Path,
@@ -179,6 +180,7 @@ class HDRICLoraPipeline:
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
         diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
+        compilation_config: CompilationConfig | None = None,
     ) -> None:
         self.device = device or get_device()
         self._tiled_vae_encode_threshold = tiled_vae_encode_pixel_threshold
@@ -211,6 +213,7 @@ class HDRICLoraPipeline:
             self.device,
             loras=loras,
             quantization=quantization,
+            compilation_config=compilation_config,
             registry=registry,
             offload_mode=offload_mode,
             alloc_trim_strategy=alloc_trim_strategy,
