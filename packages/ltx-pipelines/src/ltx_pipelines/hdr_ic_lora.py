@@ -16,6 +16,7 @@ from ltx_core.conditioning import (
     VideoConditionByKeyframeIndex,
     VideoConditionByReferenceLatent,
 )
+from ltx_core.devices import activation_budget_bytes
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
 from ltx_core.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP
@@ -170,6 +171,9 @@ class HDRICLoraPipeline:
     ``evict_weights_above_pixels`` drops the transformer's weights from a weight caching
     ``registry`` before decoding a clip of more pixels (frames x height x width). The decode of a
     long 4K clip does not fit beside them on an 80 GB GPU.
+    ``decode_memory_fraction`` is the share of free GPU memory that the decode's tiles are sized to. The
+    tiling estimate runs short by more the bigger the tile: on an H100 by 3 to 4 GiB for 121 frames of
+    1080p and by about 10 GiB for 257 frames of 2560x1440, and those decodes ran out of memory.
     """
 
     def __init__(  # noqa: PLR0913
@@ -187,10 +191,12 @@ class HDRICLoraPipeline:
         *,
         compilation_config: CompilationConfig | None = None,
         evict_weights_above_pixels: int | None = None,
+        decode_memory_fraction: float = 1.0,
     ) -> None:
         self.device = device or get_device()
         self._registry = registry
         self._evict_weights_above_pixels = evict_weights_above_pixels
+        self._decode_memory_fraction = decode_memory_fraction
         self._tiled_vae_encode_threshold = tiled_vae_encode_pixel_threshold
         if isinstance(quantization, QuantizationKind):
             quantization = quantization.to_policy(checkpoint_path=model_paths.transformer())
@@ -315,22 +321,8 @@ class HDRICLoraPipeline:
                     guides_kf,
                 )
 
-        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
-        tiling_config = ensure_tiling_config(
-            tiling_config,
-            scale_factors=scale_factors,
-            vae_checkpoint_path=self.video_decoder.checkpoint_path,
-            video_shape=VideoPixelShape(
-                batch=1,
-                frames=gen_frames,
-                height=gen_h,
-                width=gen_w,
-                fps=meta.fps,
-            ),
-            diffvae_optimization=self.video_decoder.diffvae_optimization,
-            device=self.device,
-            keyframes=bool(generated_kf),
-        )
+        video_shape = VideoPixelShape(batch=1, frames=gen_frames, height=gen_h, width=gen_w, fps=meta.fps)
+        tiling_config = self._resolve_tiling(tiling_config, video_shape, keyframes=bool(generated_kf))
 
         acescct_sdr = self._load_acescct_conditioning(video, gen_h, gen_w, num_frames)
         if high_quality_hdr:
@@ -392,6 +384,25 @@ class HDRICLoraPipeline:
             high_quality_hdr=high_quality_hdr,
         )
         return acescct_hdr, meta.fps
+
+    def _resolve_tiling(
+        self,
+        tiling_config: TilingConfig | AutoTiling | None,
+        video_shape: VideoPixelShape,
+        *,
+        keyframes: bool,
+    ) -> TilingConfig | None:
+        fraction = self._decode_memory_fraction
+        return ensure_tiling_config(
+            tiling_config,
+            scale_factors=tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path),
+            vae_checkpoint_path=self.video_decoder.checkpoint_path,
+            video_shape=video_shape,
+            diffvae_optimization=self.video_decoder.diffvae_optimization,
+            device=self.device,
+            free_bytes=int(activation_budget_bytes(self.device) * fraction) if fraction < 1 else None,
+            keyframes=keyframes,
+        )
 
     def _evicts_weights_for(self, pixels: int) -> bool:
         threshold = self._evict_weights_above_pixels
