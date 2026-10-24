@@ -235,7 +235,8 @@ def encode_sdr_h264(  # noqa: PLR0913
         width = first_slice.shape[-1]
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    container = av.open(output_path, mode="w")
+    # The index goes before the frames so a player can start before the whole file has arrived.
+    container = av.open(output_path, mode="w", options={"movflags": "+faststart"})
     success = False
     try:
         stream = _open_video_stream(container, fps, height, width, frame_converter, crf, preset, thread_count)
