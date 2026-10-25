@@ -170,8 +170,7 @@ def _open_video_stream(
     preset: str,
     thread_count: int,
 ) -> av.video.VideoStream:
-    # NTSC rates are multiples of 1000/1001 (23.976 fps is 24000/1001), so 1001 is the smallest bound that keeps
-    # them exact.
+    # A bound of 1001 keeps NTSC rates, which are multiples of 1000/1001, exact.
     rate = Fraction(fps).limit_denominator(1001)
     stream = container.add_stream("libx264", rate=rate, options={"crf": str(crf), "preset": preset})
     stream.width = width
