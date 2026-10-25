@@ -416,9 +416,10 @@ class HDRICLoraPipeline:
         num_frames: int,
     ) -> torch.Tensor:
         """Load the IC-LoRA reference as ACEScct BCTHW on CPU.
-        A video's colour transform runs on the pipeline's device, where it takes seconds; on the
-        few CPUs of a serving container it took most of a minute at 4K. Each chunk comes back to
-        the CPU, so the reference holds no device memory through the denoise.
+
+        The colour transform runs on the pipeline's device, because a serving container's few CPUs
+        took most of a minute on it at 4K. Each chunk then returns to the CPU, keeping the reference
+        off the device through the denoise.
         """
         match video:
             case EXRVideoInput(dir=path, color_space=color_space):

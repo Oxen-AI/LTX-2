@@ -302,8 +302,8 @@ class DiffusionStage:
         return self.with_builder(self._transformer_builder.with_loras(loras))
 
     def evict_weights(self, registry: Registry) -> None:
-        """Drop this stage's transformer weights from ``registry``, which frees the memory a weight
-        caching registry holds them in between calls. The next call loads them again."""
+        """Drop this stage's transformer weights from a caching ``registry`` to free their memory
+        between calls. The next call loads them again."""
         builder = self._prepared_builder()
         registry.pop(as_path_list(builder.checkpoint), builder.model_sd_ops)
 
