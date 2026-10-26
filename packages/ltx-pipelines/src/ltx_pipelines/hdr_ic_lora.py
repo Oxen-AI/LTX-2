@@ -16,9 +16,11 @@ from ltx_core.conditioning import (
     VideoConditionByKeyframeIndex,
     VideoConditionByReferenceLatent,
 )
+from ltx_core.devices import activation_budget_bytes
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
 from ltx_core.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP
+from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, VideoEncoder
 from ltx_core.model.video_vae.keyframes import DecodeKeyframes
 from ltx_core.model.video_vae.transformer import DiffVAEMode
@@ -34,6 +36,7 @@ from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
     assert_stage_supports_generated_keyframes,
+    cleanup_memory,
     decode_keyframes_from_slots,
     ensure_tiling_config,
     generated_keyframe_conditionings,
@@ -165,9 +168,15 @@ class HDRICLoraPipeline:
     Pass ``keyframe_strength`` to ``__call__`` for DFR-style seam keyframes
     (generated HDR slots + 1-frame SDR guides + keyframe-aware DiffVAE decode).
     ``None`` is plain IC-LoRA.
+    ``evict_weights_above_pixels`` drops the transformer's weights from a weight caching
+    ``registry`` before decoding a clip of more pixels (frames x height x width). The decode of a
+    long 4K clip does not fit beside them on an 80 GB GPU.
+    ``decode_memory_fraction`` is the share of free GPU memory that the decode's tiles are sized to. The
+    tiling estimate runs short by more the bigger the tile: on an H100 by 3 to 4 GiB for 121 frames of
+    1080p and by about 10 GiB for 257 frames of 2560x1440, and those decodes ran out of memory.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         model_paths: ModelPaths,
         hdr_lora: str | Path,
@@ -179,8 +188,15 @@ class HDRICLoraPipeline:
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
         diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
+        *,
+        compilation_config: CompilationConfig | None = None,
+        evict_weights_above_pixels: int | None = None,
+        decode_memory_fraction: float = 1.0,
     ) -> None:
         self.device = device or get_device()
+        self._registry = registry
+        self._evict_weights_above_pixels = evict_weights_above_pixels
+        self._decode_memory_fraction = decode_memory_fraction
         self._tiled_vae_encode_threshold = tiled_vae_encode_pixel_threshold
         if isinstance(quantization, QuantizationKind):
             quantization = quantization.to_policy(checkpoint_path=model_paths.transformer())
@@ -211,6 +227,7 @@ class HDRICLoraPipeline:
             self.device,
             loras=loras,
             quantization=quantization,
+            compilation_config=compilation_config,
             registry=registry,
             offload_mode=offload_mode,
             alloc_trim_strategy=alloc_trim_strategy,
@@ -304,22 +321,8 @@ class HDRICLoraPipeline:
                     guides_kf,
                 )
 
-        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
-        tiling_config = ensure_tiling_config(
-            tiling_config,
-            scale_factors=scale_factors,
-            vae_checkpoint_path=self.video_decoder.checkpoint_path,
-            video_shape=VideoPixelShape(
-                batch=1,
-                frames=gen_frames,
-                height=gen_h,
-                width=gen_w,
-                fps=meta.fps,
-            ),
-            diffvae_optimization=self.video_decoder.diffvae_optimization,
-            device=self.device,
-            keyframes=bool(generated_kf),
-        )
+        video_shape = VideoPixelShape(batch=1, frames=gen_frames, height=gen_h, width=gen_w, fps=meta.fps)
+        tiling_config = self._resolve_tiling(tiling_config, video_shape, keyframes=bool(generated_kf))
 
         acescct_sdr = self._load_acescct_conditioning(video, gen_h, gen_w, num_frames)
         if high_quality_hdr:
@@ -366,6 +369,10 @@ class HDRICLoraPipeline:
             generated_kf=generated_kf,
         )
 
+        if self._evicts_weights_for(gen_frames * gen_h * gen_w):
+            self.stage.evict_weights(self._registry)
+            cleanup_memory()
+
         acescct_hdr = self._decode_video(
             video_state,
             tiling_config,
@@ -378,6 +385,29 @@ class HDRICLoraPipeline:
         )
         return acescct_hdr, meta.fps
 
+    def _resolve_tiling(
+        self,
+        tiling_config: TilingConfig | AutoTiling | None,
+        video_shape: VideoPixelShape,
+        *,
+        keyframes: bool,
+    ) -> TilingConfig | None:
+        fraction = self._decode_memory_fraction
+        return ensure_tiling_config(
+            tiling_config,
+            scale_factors=tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path),
+            vae_checkpoint_path=self.video_decoder.checkpoint_path,
+            video_shape=video_shape,
+            diffvae_optimization=self.video_decoder.diffvae_optimization,
+            device=self.device,
+            free_bytes=int(activation_budget_bytes(self.device) * fraction) if fraction < 1 else None,
+            keyframes=keyframes,
+        )
+
+    def _evicts_weights_for(self, pixels: int) -> bool:
+        threshold = self._evict_weights_above_pixels
+        return self._registry is not None and threshold is not None and pixels > threshold
+
     def _load_acescct_conditioning(
         self,
         video: VideoInput | EXRVideoInput,
@@ -385,7 +415,12 @@ class HDRICLoraPipeline:
         width: int,
         num_frames: int,
     ) -> torch.Tensor:
-        """Load the IC-LoRA reference as ACEScct BCTHW on CPU."""
+        """Load the IC-LoRA reference as ACEScct BCTHW on CPU.
+
+        The colour transform runs on the pipeline's device, because a serving container's few CPUs
+        took most of a minute on it at 4K. Each chunk then returns to the CPU, keeping the reference
+        off the device through the denoise.
+        """
         match video:
             case EXRVideoInput(dir=path, color_space=color_space):
                 frames = load_exr_as_hdr_conditioning(
@@ -405,11 +440,11 @@ class HDRICLoraPipeline:
                     width,
                     num_frames,
                     torch.float32,
-                    torch.device("cpu"),
+                    self.device,
                     gamma_encoded=gamma_encoded,
                     resize_mode=ResizeMode.REFLECT_PAD,
                 )
-        chunks = list(frames)
+        chunks = [chunk.cpu() for chunk in frames]
         if not chunks:
             raise ValueError(f"No frames loaded from {path}")
         return torch.cat(chunks, dim=2)

@@ -17,7 +17,7 @@ from ltx_core.conditioning import ConditioningItem, VideoGeneratedKeyframeSlots
 from ltx_core.loader import SDOps
 from ltx_core.loader.attention_ops import set_attention_module_op
 from ltx_core.loader.fuse_loras import bf16_fuse_rule
-from ltx_core.loader.helpers import to_device
+from ltx_core.loader.helpers import as_path_list, to_device
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import LoraPathStrengthAndSDOps, ModelBuilderProtocol
 from ltx_core.loader.registry import ModelRegistry, Registry
@@ -300,6 +300,12 @@ class DiffusionStage:
     def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> "DiffusionStage":
         """Return a new ``DiffusionStage`` built with exactly ``loras`` (replacing the current set)."""
         return self.with_builder(self._transformer_builder.with_loras(loras))
+
+    def evict_weights(self, registry: Registry) -> None:
+        """Drop this stage's transformer weights from a caching ``registry`` to free their memory
+        between calls. The next call loads them again."""
+        builder = self._prepared_builder()
+        registry.pop(as_path_list(builder.checkpoint), builder.model_sd_ops)
 
     def _prepared_builder(self) -> ModelBuilderProtocol[LTXModelProtocol]:
         """Return the configured builder with the stage's build-time ops applied.
