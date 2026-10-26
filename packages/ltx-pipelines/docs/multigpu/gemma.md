@@ -14,6 +14,18 @@ lightweight `AccelerateGemmaWrapper` stub that receives the encoded embeddings o
 NCCL. The source rank fuses all prompts into one Gemma call, then broadcasts each
 output.
 
+Gemma's shards share GPUs with the other ranks, so the non-source ranks must not
+post their NCCL receives while Gemma is still running: a receive kernel spins on
+its GPU, and the two processes then time-slice it. Each builder therefore owns a
+`BroadcastCoordinator` (`ltx_core.multigpu.broadcast`) on the default store and
+hands it to every wrapper it builds. The source rank synchronizes the devices
+holding Gemma's outputs and signals; the other ranks poll the store every 1 ms on
+the host and only then receive. `enhance_*` results are gated the same way.
+A waiting rank raises `TimeoutError` after 10 minutes (NCCL's default collective
+timeout), e.g. when the source rank failed before broadcasting. Construct the
+builders on every rank in `setup()`, in the same order and before any job runs:
+each builder's store key comes from its construction order.
+
 The first `build()` loads Gemma via `load_gemma_with_device_map` (directory
 `from_pretrained(device_map="auto")`, or single-file TE with the same balanced
 placement) and caches the full state dict (including non-persistent buffers) in

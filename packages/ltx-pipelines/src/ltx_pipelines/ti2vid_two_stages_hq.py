@@ -4,10 +4,10 @@ from collections.abc import Sequence
 import torch
 
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
-from ltx_core.components.diffusion_steps import Res2sDiffusionStep
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.conditioning import VideoGeneratedKeyframeSlots
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
 from ltx_core.model.transformer.compiling import CompilationConfig
@@ -16,9 +16,10 @@ from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import VideoLatentShape, VideoPixelShape
 from ltx_pipelines.utils.args import (
-    ImageConditioningInput,
     add_generated_keyframes_arg,
+    add_keyframe_decode_arg,
     hq_2_stage_arg_parser,
+    markers_from_args,
 )
 from ltx_pipelines.utils.blocks import (
     AudioDecoder,
@@ -37,23 +38,34 @@ from ltx_pipelines.utils.constants import (
 )
 from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
+    assert_generated_keyframes_request,
     assert_resolution,
-    combined_image_conditionings,
+    create_initial_av_latents,
+    decode_keyframes_from_slots,
     ensure_tiling_config,
     generated_keyframe_conditionings,
     get_device,
-    has_generated_keyframes,
+    image_conditionings,
+    resolve_generated_keyframes,
     tiling_scale_factors_for_vae,
 )
 from ltx_pipelines.utils.media_io import (
-    HDRColorSpace,
+    EXRColorSpace,
     encode_video,
     resolve_hdr_color_space,
     vae_dtype_for_hdr,
 )
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.samplers import res2s_audio_video_denoising_loop
-from ltx_pipelines.utils.types import DEFAULT_AUTO_DURATION, AutoDuration, ModalitySpec, OffloadMode, PipelineOutput
+from ltx_pipelines.utils.types import (
+    DEFAULT_AUTO_DURATION,
+    AutoDuration,
+    ImageConditioningInput,
+    ModalitySpec,
+    OffloadMode,
+    PipelineOutput,
+    VideoAudio,
+)
 
 
 class TI2VidTwoStagesHQPipeline:
@@ -191,14 +203,15 @@ class TI2VidTwoStagesHQPipeline:
         max_batch_size: int = 1,
         stage_1_sigmas: torch.Tensor | None = None,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
-        color_space: HDRColorSpace | None = None,
+        color_space: EXRColorSpace | None = None,
         generated_keyframes: int | Sequence[int] = 0,
+        decode_with_keyframes: bool = False,
     ) -> PipelineOutput:
         require_num_frames_source(num_frames, self.duration_predictor)
-        images = self.image_conditioner.resolve_crf(images)
+        enhance_prompt_image = images[0].path if images else None
+        images = self.image_conditioner.load_conditionings(images, color_space)
         assert_resolution(height=height, width=width, is_two_stage=True)
-        if has_generated_keyframes(generated_keyframes):
-            self.stage_1.assert_generated_keyframes_supported()
+        assert_generated_keyframes_request(decode_with_keyframes, generated_keyframes, self.stage_1)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -210,7 +223,7 @@ class TI2VidTwoStagesHQPipeline:
             [prompt, negative_prompt],
             enhance_first_prompt=enhance_prompt,
             enhance_static_cache=enhance_static_cache,
-            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
+            enhance_prompt_image=enhance_prompt_image,
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -231,7 +244,10 @@ class TI2VidTwoStagesHQPipeline:
             video_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate),
             diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
+            keyframes=decode_with_keyframes,
         )
+
+        keyframe_positions = resolve_generated_keyframes(generated_keyframes, num_frames)
 
         # Stage 1: Generate video at half resolution with CFG guidance using res2s sampler.
         stage_1_output_shape = VideoPixelShape(
@@ -242,19 +258,16 @@ class TI2VidTwoStagesHQPipeline:
             fps=frame_rate,
         )
         stage_1_conditionings = self.image_conditioner(
-            lambda enc: combined_image_conditionings(
+            lambda enc: image_conditionings(
                 images=images,
                 height=stage_1_output_shape.height,
                 width=stage_1_output_shape.width,
                 video_encoder=enc,
                 dtype=dtype,
                 device=self.device,
-                color_space=color_space,
             )
         )
         stage_1_conditionings.extend(generated_keyframe_conditionings(generated_keyframes, num_frames))
-
-        stepper = Res2sDiffusionStep()
 
         if stage_1_sigmas is None:
             empty_latent = torch.empty(
@@ -266,6 +279,15 @@ class TI2VidTwoStagesHQPipeline:
             stage_1_sigmas = self._scheduler.execute(latent=empty_latent, steps=num_inference_steps)
         sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
 
+        video_latent, audio_latent = create_initial_av_latents(
+            width=stage_1_output_shape.width,
+            height=stage_1_output_shape.height,
+            frames=num_frames,
+            fps=frame_rate,
+            device=self.device,
+            dtype=self.dtype,
+            video_scale_factors=self.stage_1.video_scale_factors,
+        )
         video_state, audio_state = self.stage_1(
             denoiser=GuidedDenoiser(
                 v_context=v_context_p,
@@ -281,13 +303,19 @@ class TI2VidTwoStagesHQPipeline:
             ),
             sigmas=sigmas,
             noiser=noiser,
-            stepper=stepper,
-            width=stage_1_output_shape.width,
-            height=stage_1_output_shape.height,
-            frames=num_frames,
-            fps=frame_rate,
-            video=ModalitySpec(context=v_context_p, conditionings=stage_1_conditionings),
-            audio=ModalitySpec(context=a_context_p),
+            modalities=VideoAudio(
+                video=ModalitySpec(
+                    latent=video_latent,
+                    conditioning_fps=frame_rate,
+                    context=v_context_p,
+                    conditionings=stage_1_conditionings,
+                ),
+                audio=ModalitySpec(
+                    latent=audio_latent,
+                    conditioning_fps=frame_rate,
+                    context=a_context_p,
+                ),
+            ),
             loop=res2s_audio_video_denoising_loop,
             max_batch_size=max_batch_size,
         )
@@ -298,16 +326,24 @@ class TI2VidTwoStagesHQPipeline:
         stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
         stage_2_conditionings = self.image_conditioner(
-            lambda enc: combined_image_conditionings(
+            lambda enc: image_conditionings(
                 images=images,
                 height=stage_2_output_shape.height,
                 width=stage_2_output_shape.width,
                 video_encoder=enc,
                 dtype=dtype,
                 device=self.device,
-                color_space=color_space,
             )
         )
+        if decode_with_keyframes:
+            if video_state.generated_keyframes is None:
+                raise RuntimeError("Stage 1 did not return generated_keyframes despite requesting slots")
+            stage_2_conditionings.append(
+                VideoGeneratedKeyframeSlots(
+                    pixel_frame_indices=keyframe_positions,
+                    initial_keyframes=self.upsampler(video_state.generated_keyframes),
+                )
+            )
 
         # Stage 2 refines video only; discard its audio. On the multi-GPU path stage-2 audio
         # runs under partial tiled/TDP video context, so the full-context stage-1 audio is kept.
@@ -315,35 +351,54 @@ class TI2VidTwoStagesHQPipeline:
             denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
             sigmas=stage_2_sigmas,
             noiser=noiser,
-            stepper=stepper,
-            width=width,
-            height=height,
-            frames=num_frames,
-            fps=frame_rate,
-            video=ModalitySpec(
-                context=v_context_p,
-                conditionings=stage_2_conditionings,
-                noise_scale=stage_2_sigmas[0].item(),
-                initial_latent=upscaled_video_latent,
-            ),
-            audio=ModalitySpec(
-                context=a_context_p,
-                noise_scale=stage_2_sigmas[0].item(),
-                initial_latent=audio_state.latent,
+            modalities=VideoAudio(
+                video=ModalitySpec(
+                    latent=upscaled_video_latent,
+                    conditioning_fps=frame_rate,
+                    context=v_context_p,
+                    conditionings=stage_2_conditionings,
+                    noise_scale=stage_2_sigmas[0].item(),
+                ),
+                audio=ModalitySpec(
+                    latent=audio_state.latent,
+                    conditioning_fps=frame_rate,
+                    context=a_context_p,
+                    noise_scale=stage_2_sigmas[0].item(),
+                ),
             ),
             loop=res2s_audio_video_denoising_loop,
         )
 
-        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
+        decode_keyframes = None
+        if decode_with_keyframes:
+            decode_keyframes = decode_keyframes_from_slots(
+                video_state.generated_keyframes,
+                keyframe_positions,
+                num_frames,
+            )
+            if decode_keyframes is None:
+                raise RuntimeError("decode_with_keyframes was set but no keyframe slots were produced")
+
+        decoded_video = self.video_decoder(
+            video_state.latent,
+            tiling_config,
+            generator,
+            dtype=vae_dtype,
+            keyframes=decode_keyframes,
+        )
         decoded_audio = self.audio_decoder(audio_state.latent)
-        return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config, None, video_state.latent)
+        return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config)
 
 
 @torch.inference_mode()
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    parser = add_generated_keyframes_arg(hq_2_stage_arg_parser(params=LTX_2_3_HQ_PARAMS, supports_auto_duration=True))
+    parser = add_keyframe_decode_arg(
+        add_generated_keyframes_arg(hq_2_stage_arg_parser(params=LTX_2_3_HQ_PARAMS, supports_auto_duration=True))
+    )
     args = parser.parse_args()
+    hdr = resolve_hdr_color_space(images=args.images, hdr=args.hdr)
+    video_marker, audio_marker = markers_from_args(args, device=get_device(), color_space=hdr)
     pipeline = TI2VidTwoStagesHQPipeline(
         model_paths=args.model_paths,
         distilled_lora=args.distilled_lora,
@@ -357,7 +412,6 @@ def main() -> None:
         prompt_enhancer_gemma_root=args.prompt_enhancer_gemma_root,
         diffvae_optimization=args.diffvae_optimization,
     )
-    hdr = resolve_hdr_color_space(images=args.images, hdr=args.hdr)
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
     result = pipeline(
         prompt=args.prompt,
@@ -392,6 +446,7 @@ def main() -> None:
         max_batch_size=args.max_batch_size,
         tiling_config=AUTO_TILING,
         generated_keyframes=args.num_generated_keyframes,
+        decode_with_keyframes=args.decode_with_keyframes,
     )
 
     encode_video(
@@ -401,6 +456,8 @@ def main() -> None:
         output_path=args.output_path,
         video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
         color_space=hdr,
+        video_marker=video_marker,
+        audio_marker=audio_marker,
     )
 
 

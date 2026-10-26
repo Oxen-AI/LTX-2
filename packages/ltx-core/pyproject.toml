@@ -1,6 +1,6 @@
 [project]
 name = "ltx-core"
-version = "1.3.0"
+version = "1.5.0"
 description = "Core implementation of Lightricks' LTX-2 model"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,6 +12,7 @@ dependencies = [
     "torchvision",
     "einops",
     "numpy",
+    "colour-science",
     "av",
     # Upper bound: transformers 5.15.0 routes config attribute access through the
     # heterogeneity layer, which raises AmbiguousGlobalPerLayerAttributeError on global

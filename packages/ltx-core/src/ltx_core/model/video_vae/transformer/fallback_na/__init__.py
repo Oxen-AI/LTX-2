@@ -19,6 +19,7 @@ from ltx_core.model.video_vae.transformer.fallback_na.joint_eager import (
 )
 
 if TYPE_CHECKING:
+    from ltx_core.model.video_vae.keyframes import KeyframePlanes
     from ltx_core.model.video_vae.transformer.attention import NAAttentionCallable, NeighborhoodAttention3D
 
 logger = logging.getLogger(__name__)
@@ -227,8 +228,7 @@ class TritonJointAttention:
         keyframe_q: torch.Tensor,
         keyframe_k: torch.Tensor,
         keyframe_v: torch.Tensor,
-        keyframe_times: torch.Tensor,
-        keyframe_valid: torch.Tensor,
+        keyframe_planes: KeyframePlanes,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from ltx_core.model.video_vae.keyframes import KEYFRAME_CONTEXT_SLOTS  # noqa: PLC0415
 
@@ -239,8 +239,8 @@ class TritonJointAttention:
             )
         return na_attention_joint_triton(
             *_joint_dtypes(q, k, v, keyframe_q, keyframe_k, keyframe_v),
-            keyframe_times,
-            keyframe_valid,
+            keyframe_planes.times.device_tensor,
+            keyframe_planes.valid.device_tensor,
             list(attn.kernel_size),
             KEYFRAME_CONTEXT_SLOTS,
         )
@@ -261,15 +261,14 @@ class EagerJointAttention:
         keyframe_q: torch.Tensor,
         keyframe_k: torch.Tensor,
         keyframe_v: torch.Tensor,
-        keyframe_times: torch.Tensor,
-        keyframe_valid: torch.Tensor,
+        keyframe_planes: KeyframePlanes,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from ltx_core.model.video_vae.keyframes import KEYFRAME_CONTEXT_SLOTS  # noqa: PLC0415
 
         return na_attention_joint_eager(
             *_joint_dtypes(q, k, v, keyframe_q, keyframe_k, keyframe_v),
-            keyframe_times,
-            keyframe_valid,
+            keyframe_planes.times.device_tensor,
+            keyframe_planes.valid.device_tensor,
             list(attn.kernel_size),
             KEYFRAME_CONTEXT_SLOTS,
         )
@@ -296,11 +295,10 @@ class AutoJointAttention:
         keyframe_q: torch.Tensor,
         keyframe_k: torch.Tensor,
         keyframe_v: torch.Tensor,
-        keyframe_times: torch.Tensor,
-        keyframe_valid: torch.Tensor,
+        keyframe_planes: KeyframePlanes,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         backend = self._triton if self._triton is not None and q.is_cuda else self._eager
-        return backend(attn, q, k, v, keyframe_q, keyframe_k, keyframe_v, keyframe_times, keyframe_valid)
+        return backend(attn, q, k, v, keyframe_q, keyframe_k, keyframe_v, keyframe_planes)
 
 
 class EagerSdpaAttention:

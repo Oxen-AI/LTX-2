@@ -69,11 +69,9 @@ def apply_split_rotary_emb(
     second_half_input = split_input[..., 1:, :]
 
     output = split_input * cos_freqs.unsqueeze(-2)
-    first_half_output = output[..., :1, :]
-    second_half_output = output[..., 1:, :]
-
-    first_half_output.addcmul_(-sin_freqs.unsqueeze(-2), second_half_input)
-    second_half_output.addcmul_(sin_freqs.unsqueeze(-2), first_half_input)
+    first_half_output = output[..., :1, :].addcmul(-sin_freqs.unsqueeze(-2), second_half_input)
+    second_half_output = output[..., 1:, :].addcmul(sin_freqs.unsqueeze(-2), first_half_input)
+    output = torch.cat([first_half_output, second_half_output], dim=-2)
 
     output = rearrange(output, "... d r -> ... (d r)")
     if needs_reshape:
@@ -86,7 +84,10 @@ def apply_split_rotary_emb(
 
 @functools.lru_cache(maxsize=5)
 def generate_freq_grid_np(
-    positional_embedding_theta: float, positional_embedding_max_pos_count: int, inner_dim: int
+    positional_embedding_theta: float,
+    positional_embedding_max_pos_count: int,
+    inner_dim: int,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     theta = positional_embedding_theta
     start = 1
@@ -104,12 +105,15 @@ def generate_freq_grid_np(
     )
     # as_tensor (not tensor): under torch.compile the numpy ops above are traced as tensors,
     # so torch.tensor() would copy-construct from a tensor (warns); as_tensor casts in place.
-    return torch.as_tensor(pow_indices * math.pi / 2, dtype=torch.float32)
+    return torch.as_tensor(pow_indices * math.pi / 2, dtype=torch.float32).to(device=device)
 
 
 @functools.lru_cache(maxsize=5)
 def generate_freq_grid_pytorch(
-    positional_embedding_theta: float, positional_embedding_max_pos_count: int, inner_dim: int
+    positional_embedding_theta: float,
+    positional_embedding_max_pos_count: int,
+    inner_dim: int,
+    device: torch.device | None = None,
 ) -> torch.Tensor:
     theta = positional_embedding_theta
     start = 1
@@ -128,7 +132,7 @@ def generate_freq_grid_pytorch(
 
     indices = indices * math.pi / 2
 
-    return indices
+    return indices.to(device=device)
 
 
 def get_fractional_positions(indices_grid: torch.Tensor, max_pos: list[int]) -> torch.Tensor:
@@ -209,7 +213,9 @@ def precompute_freqs_cis(
     if max_pos is None:
         max_pos = [20, 2048, 2048]
 
-    indices = freq_grid_generator(theta, indices_grid.shape[1], dim)
+    # The grids are computed on the CPU and cached per device: a pageable host-to-device copy blocks
+    # the host until the device drains, so repeating it every call keeps the host from running ahead.
+    indices = freq_grid_generator(theta, indices_grid.shape[1], dim, indices_grid.device)
     freqs = generate_freqs(indices, indices_grid, max_pos, use_middle_indices_grid)
 
     if rope_type == LTXRopeType.SPLIT:

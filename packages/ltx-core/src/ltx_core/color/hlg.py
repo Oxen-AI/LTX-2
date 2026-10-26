@@ -1,17 +1,15 @@
 """In-memory scene-linear HDR frames → BT.2020 / HLG / 10-bit HEVC MP4.
-HLG = Hybrid Log-Gamma (ITU-R BT.2100, OETF per ARIB STD-B67). Output is HEVC Main10,
-yuv420p10le, tagged BT.2020 primaries + arib-std-b67 transfer + bt2020nc matrix, limited
-range.
-Per frame: scene-linear RGB → primaries → BT.2020 → map linear light to HLG scene
-signal (diffuse white at ``white_signal``, highlights rolled toward 1.0) → HLG OETF →
-planar YUV420P10 → PyAV/libx265.
+HLG = Hybrid Log-Gamma (ITU-R BT.2100 / ARIB STD-B67). Output is HEVC Main10
+yuv420p10le, tagged BT.2020 + arib-std-b67 + bt2020nc, limited range.
+Pipeline: scene-linear RGB → Rec.2020 → map diffuse white → HLG OETF →
+YUV420P10 → PyAV/libx265. OETF constants / scalar inverse come from
+``colour-science``; the tensor OETF stays in torch for GPU encode.
 """
 
 from __future__ import annotations
 
 import contextlib
 import logging
-import math
 import os
 import threading
 from collections.abc import Iterable, Iterator
@@ -24,6 +22,8 @@ from typing import Any
 import av
 import numpy as np
 import torch
+from colour.models import oetf_inverse_BT2100_HLG
+from colour.models.rgb.transfer_functions.arib_std_b67 import CONSTANTS_ARIBSTDB67
 
 from ltx_core.color.audio_mux import prepare_audio_stream, validate_audio_waveform, write_audio
 from ltx_core.color.primaries import Primaries
@@ -32,24 +32,34 @@ from ltx_core.types import Audio
 
 logger = logging.getLogger(__name__)
 
-# FFmpeg AVColor* tags not covered by ColorSpace / ColorRange.
 _AV_COLOR_PRIMARIES_BT2020 = 9
 _AV_COLOR_TRC_ARIB_STD_B67 = 18  # HLG
 
-# ARIB STD-B67 (HLG) OETF constants.
-HLG_A, HLG_B, HLG_C = 0.17883277, 0.28466892, 0.55991073
+# ARIB STD-B67 / BT.2100 HLG OETF constants (colour-science).
+_HLG_A = float(CONSTANTS_ARIBSTDB67["a"])
+_HLG_B = float(CONSTANTS_ARIBSTDB67["b"])
+_HLG_C = float(CONSTANTS_ARIBSTDB67["c"])
 
 
 def hlg_inverse_oetf(v: float) -> float:
-    """Inverse HLG OETF for a scalar signal value → scene-linear."""
-    return (v * v) / 3.0 if v <= 0.5 else (math.exp((v - HLG_C) / HLG_A) + HLG_B) / 12.0
+    """Inverse HLG OETF: signal → scene-linear (colour ``oetf_inverse_BT2100_HLG``)."""
+    return float(np.asarray(oetf_inverse_BT2100_HLG(v), dtype=np.float64))
+
+
+def _hlg_oetf(x: torch.Tensor) -> torch.Tensor:
+    """HLG OETF on scene-linear ``x`` (torch; matches colour ``oetf_BT2100_HLG``)."""
+    return torch.where(
+        x <= 1.0 / 12.0,
+        torch.sqrt((3.0 * x).clamp(min=0.0)),
+        _HLG_A * torch.log((12.0 * x - _HLG_B).clamp(min=1e-12)) + _HLG_C,
+    ).clamp(0.0, 1.0)
 
 
 @dataclass
 class HlgGpuConverter:
     """GPU linear-HDR ``[F,H,W,3]`` → planar uint16 YUV420P10 (BT.2020 / HLG / limited)."""
 
-    prim_mat: torch.Tensor  # [3, 3] on device
+    prim_mat: torch.Tensor
     white_x: float
     roll_k: float
 
@@ -67,27 +77,26 @@ class HlgGpuConverter:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         white_x = hlg_inverse_oetf(white_signal)
         roll_k = rolloff_k if rolloff_k is not None else white_x / (1.0 - white_x)
-        prim = primaries.matrix_to_rec2020.to(device=device, dtype=dtype)
-        return cls(prim_mat=prim, white_x=float(white_x), roll_k=float(roll_k))
+        return cls(
+            prim_mat=primaries.matrix_to_rec2020.to(device=device, dtype=dtype),
+            white_x=float(white_x),
+            roll_k=float(roll_k),
+        )
 
     def to_hlg_signal_(self, rgb_linear_chw: torch.Tensor) -> torch.Tensor:
         """``(*, 3, H, W)`` scene-linear → HLG signal ``[0, 1]``."""
         lin = torch.nan_to_num(
-            (rgb_linear_chw.movedim(-3, -1) @ self.prim_mat.T).clamp(min=0.0),
+            torch.einsum("...chw,dc->...dhw", rgb_linear_chw, self.prim_mat).clamp(min=0.0),
             nan=0.0,
             neginf=0.0,
         )
+        # Diffuse white → white_x; highlights roll toward 1.0.
         x = torch.where(
             lin <= 1.0,
             lin * self.white_x,
             1.0 - (1.0 - self.white_x) * torch.exp(-self.roll_k * (lin - 1.0)),
         )
-        sig = torch.where(
-            x <= 1.0 / 12.0,
-            torch.sqrt((3.0 * x).clamp(min=0.0)),
-            HLG_A * torch.log((12.0 * x - HLG_B).clamp(min=1e-12)) + HLG_C,
-        )
-        return sig.clamp(0.0, 1.0).movedim(-1, -3)
+        return _hlg_oetf(x)
 
     def __call__(self, frames_fhwc: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``[F,H,W,3]`` scene-linear → planar uint16 Y, U, V on the same device."""
@@ -103,6 +112,23 @@ def _resolve_x265_thread_count(thread_count: int) -> int:
     if thread_count > 0:
         return thread_count
     return max(1, min(os.cpu_count() or 8, 16))
+
+
+def _x265_encode_params(threads: int, width: int, height: int) -> str:
+    """libx265 ``x265-params`` for an HLG ``hvc1`` MP4.
+    When width and height are both at most 32 (single CTU in each axis),
+    default ``frame-threads=4`` plus ultrafast B-frames can flush packets the
+    mp4 muxer rejects (``PatchWelcomeError``) on very short clips, and the
+    failure is timing-sensitive when many libx265 thread pools run
+    concurrently (multi-process or multi-threaded hosts).
+    """
+    base = (
+        "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc:range=limited:"
+        f"repeat-headers=1:info=0:pools={threads}"
+    )
+    if width <= 32 and height <= 32:
+        return f"{base}:frame-threads=1:bframes=0:lookahead=0"
+    return f"{base}:frame-threads=4"
 
 
 @dataclass
@@ -135,10 +161,7 @@ class HlgPyAVEncoder:
         stream.options = {
             "crf": str(crf),
             "preset": preset,
-            "x265-params": (
-                "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc:range=limited:"
-                f"repeat-headers=1:info=0:pools={threads}:frame-threads=4"
-            ),
+            "x265-params": _x265_encode_params(threads, width, height),
         }
         ctx = stream.codec_context
         ctx.thread_count = threads
@@ -173,9 +196,6 @@ def _hlg_encode_planes_threaded(
     encoder: HlgPyAVEncoder,
     plane_chunks: Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]],
     progress_total: int | None = None,
-    *,
-    audio: Audio | None = None,
-    audio_stream: av.audio.AudioStream | None = None,
 ) -> int:
     """libx265-encode planar uint16 chunks on a background thread (1-slot queue)."""
     chunk_queue: Queue[tuple[np.ndarray, np.ndarray, np.ndarray] | None] = Queue(maxsize=1)
@@ -200,9 +220,6 @@ def _hlg_encode_planes_threaded(
         if error is None:
             try:
                 encoder.flush()
-                if audio is not None and audio_stream is not None:
-                    write_audio(encoder.container, audio_stream, audio)
-                encoder.container.close()
             except Exception as e:
                 error = e
         else:
@@ -250,13 +267,27 @@ def encode_linear_hdr_frames_to_hlg_mp4(  # noqa: PLR0913
     progress: bool = False,
     progress_total: int | None = None,
     thread_count: int = 0,
-    audio: Audio | None = None,
+    audio: Audio | Iterator[Audio] | None = None,
     device: torch.device | None = None,
+    audio_sampling_rate: int | None = None,
 ) -> int:
     """Encode scene-linear HDR frames to BT.2020/HLG/10-bit HEVC mp4 via PyAV.
     Consumes ``HxWx3`` / ``FxHxWx3`` chunks one at a time. Conversion runs on
-    ``device``; the encoder thread only muxes planar uint16 into libx265.
+    ``device``; the encoder thread only muxes planar uint16 into libx265. An
+    audio iterator is pulled after all frame chunks have been consumed; pass
+    ``audio_sampling_rate`` so its AAC stream can be opened up front.
     """
+    if isinstance(audio, Audio):
+        validate_audio_waveform(audio)
+        if audio_sampling_rate is not None and audio_sampling_rate != audio.sampling_rate:
+            raise ValueError(
+                f"audio_sampling_rate {audio_sampling_rate} does not match audio sampling rate {audio.sampling_rate}"
+            )
+        audio_sampling_rate = audio.sampling_rate
+        audio = iter((audio,))
+    elif audio is not None and audio_sampling_rate is None:
+        raise ValueError("audio_sampling_rate is required when muxing an audio iterator")
+
     converter = HlgGpuConverter.create(primaries, white_signal, rolloff_k, device=device)
 
     it = iter(frames)
@@ -265,23 +296,16 @@ def encode_linear_hdr_frames_to_hlg_mp4(  # noqa: PLR0913
     except StopIteration as e:
         raise ValueError("No HDR frames to encode.") from e
 
-    first_t = _as_fhwc_torch(first)
-    # ``first_t`` is [F,H,W,C]; open() takes (width, height).
-    height, width = int(first_t.shape[1]), int(first_t.shape[2])
+    first_t = _as_fhwc_torch(first)  # [F, H, W, C]
     encoder = HlgPyAVEncoder.open(
         out_path,
-        width,
-        height,
-        fps,
+        width=int(first_t.shape[2]),
+        height=int(first_t.shape[1]),
+        fps=fps,
         crf=crf,
         preset=preset,
         thread_count=thread_count,
     )
-
-    audio_stream: av.audio.AudioStream | None = None
-    if audio is not None:
-        validate_audio_waveform(audio)
-        audio_stream = prepare_audio_stream(encoder.container, audio.sampling_rate)
 
     def plane_chunks() -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         y, u, v = converter(first_t)
@@ -291,16 +315,26 @@ def encode_linear_hdr_frames_to_hlg_mp4(  # noqa: PLR0913
             yield y.cpu().numpy(), u.cpu().numpy(), v.cpu().numpy()
 
     try:
+        audio_stream: av.audio.AudioStream | None = None
+        if audio is not None:
+            assert audio_sampling_rate is not None
+            audio_stream = prepare_audio_stream(encoder.container, audio_sampling_rate)
         n = _hlg_encode_planes_threaded(
             encoder,
             plane_chunks(),
             progress_total=progress_total if progress or progress_total is not None else None,
-            audio=audio,
-            audio_stream=audio_stream,
         )
-    except Exception:
+        mux_audio = next(audio, None) if audio is not None else None
+        if mux_audio is not None:
+            validate_audio_waveform(mux_audio)
+            assert audio_stream is not None
+            write_audio(encoder.container, audio_stream, mux_audio)
+    except BaseException:
         Path(out_path).unlink(missing_ok=True)
         raise
+    finally:
+        with contextlib.suppress(Exception):
+            encoder.container.close()
     if progress:
         logger.info("  %d frames", n)
     return n

@@ -14,6 +14,34 @@ no-build-isolation-package = ["ltx-kernels"]
 # 9.25.0.15 is yanked. Linux-only: the wheel is CUDA and has no darwin build.
 override-dependencies = ["nvidia-cudnn-cu13==9.24.0.43; sys_platform == 'linux'"]
 
+# Videoseal declares `decord` (no aarch64 wheels) and `opencv-python` (needs libGL).
+# PixelSeal embed/detect does not use decord (try/except in videoseal). Replace OpenCV
+# with the headless wheel so GPU CI / this host can import cv2.
+[[tool.uv.dependency-metadata]]
+name = "videoseal"
+version = "1.0"
+requires-dist = [
+    "PyWavelets",
+    "av",
+    "calflops",
+    "einops",
+    "lpips",
+    "omegaconf",
+    "opencv-python-headless",
+    "pandas",
+    "pycocotools",
+    "pytorch_msssim",
+    "safetensors",
+    "scikit-image",
+    "scipy",
+    "setuptools",
+    "tensorboard",
+    "timm==0.9.16",
+    "torch>=2.3.1",
+    "tqdm",
+    "transformers",
+]
+
 [tool.uv.workspace]
 members = ["packages/*"]
 # ltx-kernels compiles CUDA extensions; keep it out of the workspace so a plain
@@ -48,10 +76,9 @@ kernels = ["ltx-kernels"]
 target-version = "py311"
 line-length = 120
 exclude = [
-    # Vendored kernel sources, excluded from our lint/format rules.
-    "packages/ltx-kernels/src/ltx_kernels/blockwise/functional.py",
+    # Vendored kernel sources / hardware glue, excluded from our lint/format rules.
     "packages/ltx-kernels/src/ltx_kernels/blockwise/linear.py",
-    "packages/ltx-kernels/src/ltx_kernels/blockwise/triton_ops.py",
+    "packages/ltx-kernels/src/ltx_kernels/blockwise/ops/gemm.py",
 ]
 
 [tool.ruff.lint]
@@ -91,18 +118,20 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # CI gates: stand-alone CLIs whose whole job is printing a report / GitHub annotations.
 ".github/actions/golden-pairing-gate/check_golden_pairing.py" = ["T201"]
-# Emits `export …` lines for eval by kernels-build.
-".github/actions/kernels-build/export_cuda_home.py" = ["T201"]
 # setup.py must set CUDA_HOME before importing torch.utils.cpp_extension.
 "packages/ltx-kernels/setup.py" = ["E402"]
 # Tests for the CuTe DSL kernels. ltx-kernels is an optional, CUDA-host-only install,
 # so importing it at module level would turn "skipped" into a collection error wherever
 # it is absent -- which is most of CI.
-"packages/ltx-kernels/tests/test_vae_*.py" = ["PLC0415"]
+"packages/ltx-kernels/tests/ltx_kernels/test_vae_*.py" = ["PLC0415"]
 "packages/ltx-core/tests/**/test_dsl_kernels.py" = ["PLC0415"]
 # NVFP4 tests ``importorskip("ltx_kernels")`` before importing convert/linear/fuse
 # (which import the extension at module top level).
 "packages/ltx-core/tests/ltx_core/quantization/nvfp4/test_*.py" = ["E402"]
+# PixelSeal / AudioSeal tests ``importorskip`` extras before importing seal classes
+# (which import videoseal / audioseal at module top level).
+"packages/ltx-pipelines/tests/ltx_pipelines/test_videoseal.py" = ["E402"]
+"packages/ltx-pipelines/tests/ltx_pipelines/test_audioseal.py" = ["E402"]
 # CuTe DSL kernels. Device-side code written in CUTLASS's own idiom: tensor-algebra
 # names are conventionally uppercase (M, T, H, W, NH, TILER_N128), a `@cute.kernel`
 # entry point takes one parameter per compile-time constant, and its arguments are

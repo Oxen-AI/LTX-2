@@ -12,9 +12,11 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from ltx_core.model.video_vae import decode_workspace
 from ltx_core.model.video_vae.transformer.attention import NeighborhoodAttention3D
+from ltx_core.model.video_vae.transformer.det_rms_norm import DetRMSNorm
 from ltx_core.model.video_vae.transformer.layers import AdaLNZero
-from ltx_core.model.video_vae.transformer.swiglu import SwiGLU, plain_mlp
+from ltx_core.model.video_vae.transformer.swiglu import SwiGLU, plain_mlp, plain_mlp_accumulate
 
 if TYPE_CHECKING:
     from ltx_core.model.video_vae.keyframes import KeyframeStream
@@ -37,17 +39,16 @@ class NABlock(nn.Module):
         rope_dim_split: tuple[int, int, int] | None = None,
     ) -> None:
         super().__init__()
-        self.norm1 = nn.RMSNorm(dim, eps=1e-6)
+        self.norm1 = DetRMSNorm(dim, eps=1e-6)
         self.attn = NeighborhoodAttention3D(dim, kernel_size, head_dim=head_dim, rope_dim_split=rope_dim_split)
-        self.norm2 = nn.RMSNorm(dim, eps=1e-6)
+        self.norm2 = DetRMSNorm(dim, eps=1e-6)
         hidden = (int(dim * mlp_ratio) + 15) // 16 * 16
         self.mlp = SwiGLU(dim, hidden)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Channels-last in/out: (B, T, H, W, C)."""
+        """Channels-last in/out: (B, T, H, W, C). The norms pick their kernel themselves (:class:`DetRMSNorm`)."""
         x = x + self.attn(self.norm1(x))
-        x = plain_mlp(x, self.mlp, self.norm2, self.mlp.tile)
-        return x
+        return plain_mlp(x, self.mlp, self.norm2, self.mlp.tile)
 
     def forward_with_keyframes(
         self,
@@ -60,15 +61,28 @@ class NABlock(nn.Module):
         the decoder re-zeroes after each upsample instead, matching upstream, so a masked
         plane's hidden state may drift within a stage. It is masked out of every softmax
         regardless, so this is cosmetic; reproducing it keeps us comparable.
+        Eager calls carve the video stream's per-block temporaries from the decode workspace's
+        idle volumes (none outlives the block, so the arena is reset at both block boundaries)
+        and add the residuals into the fresh attention and MLP outputs; same values.
         """
+        if torch.compiler.is_compiling():
+            attn_out, keyframe_attn = self.attn.forward_with_keyframes(
+                self.norm1(x), dataclasses.replace(keyframes, x=self.norm1(keyframes.x))
+            )
+            x = x + attn_out
+            keyframe_x = keyframes.x + keyframe_attn.x
+            x = plain_mlp(x, self.mlp, self.norm2, self.mlp.tile)
+            keyframe_x = plain_mlp(keyframe_x, self.mlp, self.norm2, self.mlp.tile)
+            return x, dataclasses.replace(keyframes, x=keyframe_x)
+        decode_workspace.phase_reset()
         attn_out, keyframe_attn = self.attn.forward_with_keyframes(
-            self.norm1(x),
-            dataclasses.replace(keyframes, x=self.norm1(keyframes.x)),
+            self.norm1(x), dataclasses.replace(keyframes, x=self.norm1(keyframes.x))
         )
-        x = x + attn_out
-        keyframe_x = keyframes.x + keyframe_attn.x
-        x = plain_mlp(x, self.mlp, self.norm2, self.mlp.tile)
-        keyframe_x = plain_mlp(keyframe_x, self.mlp, self.norm2, self.mlp.tile)
+        x = attn_out.add_(x)
+        keyframe_x = keyframe_attn.x.add_(keyframes.x)
+        x = plain_mlp_accumulate(x, self.mlp, self.norm2, self.mlp.tile)
+        keyframe_x = plain_mlp_accumulate(keyframe_x, self.mlp, self.norm2, self.mlp.tile)
+        decode_workspace.phase_reset()
         return x, dataclasses.replace(keyframes, x=keyframe_x)
 
 

@@ -10,7 +10,7 @@
  * ## Algorithm Overview
  *
  * Each GPU broadcasts its local tokens to all other GPUs' buffers:
- *   - GPU i writes its tokens to position [prefix_rank_tokens[i]] in each buffer
+ *   - GPU i writes its tokens to position [i * seqlen] in each buffer
  *   - After completion, all buffers contain the full sequence [0:total_tokens]
  *
  * ## Use Case
@@ -46,7 +46,7 @@ namespace all2all_cuda {
  *
  * Output buffer (per target rank, after gather):
  *   - Shape: [batch, total_tokens, hidden_dim]
- *   - This rank's tokens placed at offset rank_tokens_prefix[rank]
+ *   - This rank's tokens placed at offset rank * seqlen
  *
  * ## Thread Mapping
  *
@@ -65,12 +65,10 @@ namespace all2all_cuda {
  * @param world_size Total number of GPUs
  * @param rank This GPU's rank
  * @param total_tokens Sum of tokens across all ranks
- * @param rank_tokens_prefix Cumulative token counts (device memory)
  */
 template <typename ELEM_T>
 __global__ void allgather(void *x, void **buffer_ptrs, int **barrier_signal_ptrs, int batch_size, int seqlen,
-                          int hidden_dim, int world_size, int rank, int total_tokens, int *rank_tokens_prefix,
-                          uint64_t timeout_cycles) {
+                          int hidden_dim, int world_size, int rank, int total_tokens, uint64_t timeout_cycles) {
 
   // Grid dimensions
   int num_sms = gridDim.x;
@@ -116,8 +114,7 @@ __global__ void allgather(void *x, void **buffer_ptrs, int **barrier_signal_ptrs
       // Source: local token index in input tensor
       int64_t src_token_idx = copy_token;
       // Destination: global token index in output buffer
-      // This rank's tokens start at prefix_rank_tokens[rank]
-      int64_t dst_token_idx = copy_token + rank_tokens_prefix[rank];
+      int64_t dst_token_idx = copy_token + int64_t(rank) * seqlen;
 
       // Source pointer: input tensor at [batch, src_token, :]
       int4 *shuffled_x_ptr = reinterpret_cast<int4 *>(reinterpret_cast<uint8_t *>(x) +
@@ -154,7 +151,6 @@ __global__ void allgather(void *x, void **buffer_ptrs, int **barrier_signal_ptrs
  * @param buffer_ptrs Device array of buffer pointers
  * @param barrier_signal_ptrs Device array of barrier signal pointers
  * @param x Input tensor data pointer
- * @param prefix_rank_tokens Cumulative token counts (device memory)
  * @param rank This GPU's rank
  * @param world_size Total number of GPUs
  * @param batch_size Number of batches
@@ -165,18 +161,18 @@ __global__ void allgather(void *x, void **buffer_ptrs, int **barrier_signal_ptrs
  * @param num_sms Number of SMs to launch
  * @param tensor_dtype Data type (BFloat16 or Float8_e4m3fn)
  */
-void allgather_launch(void **buffer_ptrs, int **barrier_signal_ptrs, void *x, int *prefix_rank_tokens, int rank,
-                      int world_size, int batch_size, int seqlen, int hidden_dim, int total_tokens, cudaStream_t stream,
-                      int num_sms, at::ScalarType tensor_dtype, uint64_t timeout_cycles) {
+void allgather_launch(void **buffer_ptrs, int **barrier_signal_ptrs, void *x, int rank, int world_size, int batch_size,
+                      int seqlen, int hidden_dim, int total_tokens, cudaStream_t stream, int num_sms,
+                      at::ScalarType tensor_dtype, uint64_t timeout_cycles) {
   do {
     if (tensor_dtype == at::ScalarType::BFloat16) {
       allgather<at::BFloat16><<<num_sms, ALLGATHER_KERNEL_THREADS, 0, stream>>>(
           x, buffer_ptrs, barrier_signal_ptrs, batch_size, seqlen, hidden_dim, world_size, rank, total_tokens,
-          prefix_rank_tokens, timeout_cycles);
+          timeout_cycles);
     } else if (tensor_dtype == at::ScalarType::Float8_e4m3fn) {
       allgather<at::Float8_e4m3fn><<<num_sms, ALLGATHER_KERNEL_THREADS, 0, stream>>>(
           x, buffer_ptrs, barrier_signal_ptrs, batch_size, seqlen, hidden_dim, world_size, rank, total_tokens,
-          prefix_rank_tokens, timeout_cycles);
+          timeout_cycles);
     } else {
       EPException dtype_exception("allgather_launch", __FILE__, __LINE__, "Unsupported dtype");
       fprintf(stderr, "%s\n", dtype_exception.what());

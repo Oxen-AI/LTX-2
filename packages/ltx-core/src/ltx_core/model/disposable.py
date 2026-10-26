@@ -24,19 +24,12 @@ class Disposable(DisposableProtocol):
         if not isinstance(self, nn.Module):
             raise TypeError(f"{type(self).__name__} must be an nn.Module to dispose")
 
-        persistent = set(self.state_dict().keys())
-        for name, param in list(self.named_parameters()):
-            parent_name, _, attr = name.rpartition(".")
-            parent = self.get_submodule(parent_name) if parent_name else self
-            setattr(
-                parent,
-                attr,
-                nn.Parameter(torch.empty_like(param, device="meta"), requires_grad=param.requires_grad),
-            )
-
-        for name, buf in list(self.named_buffers()):
-            if name not in persistent:
-                continue
-            parent_name, _, attr = name.rpartition(".")
-            parent = self.get_submodule(parent_name) if parent_name else self
-            parent.register_buffer(attr, torch.empty_like(buf, device="meta"), persistent=True)
+        for module in self.modules():
+            for name, param in module._parameters.items():
+                if param is not None:
+                    module._parameters[name] = nn.Parameter(
+                        torch.empty_like(param, device="meta"), requires_grad=param.requires_grad
+                    )
+            for name, buf in module._buffers.items():
+                if buf is not None and name not in module._non_persistent_buffers_set:
+                    module._buffers[name] = torch.empty_like(buf, device="meta")

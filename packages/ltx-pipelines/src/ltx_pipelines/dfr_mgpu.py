@@ -13,8 +13,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
-from functools import wraps
 from multiprocessing import SimpleQueue
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -24,21 +24,23 @@ from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import ModelRegistry
 from ltx_core.model.transformer.compiling import CompilationConfig
-from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, get_video_chunks_number
+from ltx_core.model.video_vae import AUTO_TILING, get_video_chunks_number
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.multigpu.transformer.attention import AttentionManager
-from ltx_core.multigpu.vae.distributed_decoder import dist_rank_tile_pixel_shape
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.quantization.fp8_cast import build_policy as _build_fp8_cast_policy
 from ltx_core.tiling import DimensionTilingConfig, TileCountConfig, balanced_tile_split
-from ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors, VideoLatentShape, VideoPixelShape
+from ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors
 from ltx_pipelines.dfr_pipeline import DFRPipeline, add_dfr_cli_args
 from ltx_pipelines.multigpu.controller import MGPUController
+from ltx_pipelines.multigpu.decode_tiling import dist_auto_tiling
 from ltx_pipelines.multigpu.gemma_builders import AccelerateGemmaBuilder
 from ltx_pipelines.multigpu.runner import MGPURunner
 from ltx_pipelines.multigpu.sp_builder import SequenceParallelBuilder
 from ltx_pipelines.multigpu.vae_builders import DistributedDecoderBuilder
 from ltx_pipelines.multigpu.weight_tracker import TransformerWeightTracker
+from ltx_pipelines.utils.args import markers_from_args
+from ltx_pipelines.utils.helpers import get_device
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.types import DEFAULT_AUTO_DURATION, AutoDuration
@@ -62,62 +64,20 @@ _DEFAULT_VAE_TEMPORAL_BATCHES = 16
 def _dfr_dist_tile_auto_tiling(
     vae_tiling: TileCountConfig,
     *,
-    rank: int,
     world_size: int,
+    group: dist.ProcessGroup | None,
     scale: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS,
 ) -> Iterator[None]:
-    """Rewrite ``DFRPipeline`` AUTO recommend to this rank's Dist-tile pixel shape.
+    """Plan ``DFRPipeline``'s AUTO decode tiling for the group's Dist tiles.
     Patches ``ltx_pipelines.dfr_pipeline.ensure_tiling_config`` (the name
-    ``DFRPipeline.__call__`` looks up) for the duration of the ``with`` block.
-    Dist stays a pass-through; the pipeline still returns the resolved
-    ``TilingConfig``. Explicit configs and ``None`` are unchanged.
+    ``DFRPipeline.__call__`` looks up) with :func:`dist_auto_tiling` for the duration of the
+    ``with`` block, so every rank resolves the same ``TilingConfig``. Explicit configs and
+    ``None`` are unchanged.
     """
     import ltx_pipelines.dfr_pipeline as dfr_mod  # noqa: PLC0415
 
     orig = dfr_mod.ensure_tiling_config
-
-    @wraps(orig)
-    def ensure_tiling_config_dist_tile(
-        tiling_config: TilingConfig | AutoTiling | None,
-        *,
-        video_shape: VideoPixelShape,
-        scale_factors: SpatioTemporalScaleFactors,
-        vae_checkpoint_path: str,
-        diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
-        device: torch.device | None = None,
-        free_bytes: int | None = None,
-        keyframes: bool = False,
-    ) -> TilingConfig | None:
-        if isinstance(tiling_config, AutoTiling):
-            latent_shape = VideoLatentShape.from_pixel_shape(video_shape, scale_factors=scale)
-            tile_shape = dist_rank_tile_pixel_shape(
-                vae_tiling,
-                latent_shape,
-                scale,
-                rank,
-                world_size,
-                fps=video_shape.fps,
-                batch=video_shape.batch,
-            )
-            logger.info(
-                "rank=%s AUTO_TILING Dist tile video_shape=%s (full canvas %s)",
-                rank,
-                tile_shape,
-                video_shape,
-            )
-            video_shape = tile_shape
-        return orig(
-            tiling_config,
-            video_shape=video_shape,
-            scale_factors=scale_factors,
-            vae_checkpoint_path=vae_checkpoint_path,
-            diffvae_optimization=diffvae_optimization,
-            device=device,
-            free_bytes=free_bytes,
-            keyframes=keyframes,
-        )
-
-    dfr_mod.ensure_tiling_config = ensure_tiling_config_dist_tile
+    dfr_mod.ensure_tiling_config = dist_auto_tiling(orig, vae_tiling, world_size=world_size, group=group, scale=scale)
     try:
         yield
     finally:
@@ -244,15 +204,20 @@ class DFRRunner(MGPURunner):
         enhance_static_cache: bool = False,
         temporal_upscalings: int = 0,
         spatial_upscalings: int = 1,
+        marker_root_path: str | None = None,
     ) -> Iterator[str | None]:
         # The pipeline raises ValueError on invalid input (symmetric across ranks); the controller
         # catches that and turns it into a recoverable RunnerError. Anything else is fatal.
+        video_marker, audio_marker = markers_from_args(
+            SimpleNamespace(marker_root_path=marker_root_path),
+            device=get_device(),
+        )
         vae_tiling = self._vae_tiling
         auto_tile = (
             _dfr_dist_tile_auto_tiling(
                 vae_tiling,
-                rank=dist.get_rank(self.groups.vae_group),
                 world_size=dist.get_world_size(self.groups.vae_group),
+                group=self.groups.vae_group,
             )
             if vae_tiling is not None
             else nullcontext()
@@ -271,6 +236,7 @@ class DFRRunner(MGPURunner):
                 enhance_static_cache=enhance_static_cache,
                 temporal_upscalings=temporal_upscalings,
                 spatial_upscalings=spatial_upscalings,
+                decode_device_fn=lambda _: self._pipeline.device,
             )
         if dist.get_rank() != _DRIVER_RANK:
             yield None  # workers: nothing to encode
@@ -281,12 +247,19 @@ class DFRRunner(MGPURunner):
             audio=result.audio,
             output_path=output_path,
             video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
+            video_marker=video_marker,
+            audio_marker=audio_marker,
+            # The distributed decoder's batches are complete on every stream when handed out.
+            chunks_complete=True,
         )
         yield output_path
 
 
 if __name__ == "__main__":
-    from ltx_pipelines.utils.args import default_2_stage_distilled_arg_parser, resolve_cli_params
+    from ltx_pipelines.utils.args import (
+        default_2_stage_distilled_arg_parser,
+        resolve_cli_params,
+    )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     params = resolve_cli_params(distilled=True)
@@ -320,6 +293,7 @@ if __name__ == "__main__":
             enhance_static_cache=args.enhance_static_cache,
             temporal_upscalings=args.temporal_upscalings,
             spatial_upscalings=args.spatial_upscalings,
+            marker_root_path=args.marker_root_path,
         ):
             pass  # drive the job to completion; the runner writes the file as a side effect
     finally:

@@ -11,7 +11,11 @@ from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.sd_ops import SDOps
 from ltx_core.model.transformer.cudagraph_capture import CudaGraphRunner
 from ltx_core.model.transformer.model import LTXModel
-from ltx_core.model.transformer.transformer_args import BlockPerturbationsProcessor, TransformerArgs
+from ltx_core.model.transformer.transformer_args import (
+    AdaLNTimestepEmbedding,
+    BlockPerturbationsProcessor,
+    TransformerArgs,
+)
 
 # Defaults applied inside the patched forward. Overriding via CompilationConfig
 # replaces these wholesale; it does not merge.
@@ -105,20 +109,20 @@ class CompiledBlockPerturbationsProcessor(BlockPerturbationsProcessor):
             torch._dynamo.mark_dynamic(args.self_attention_mask, 3)
         if args.context_mask is not None:
             torch._dynamo.mark_dynamic(args.context_mask, 2)
-        # `timesteps` / `embedded_timestep` are per-token when conditioning sets a
-        # per-position denoise mask, in which case their dim 1 equals the seq length
-        # and must vary with it. When they're a single timestep broadcast across the
-        # sequence (dim 1 == 1), leaving them static lets Dynamo keep the size-1
-        # broadcast.
-        if args.timesteps.shape[1] > 1:
-            torch._dynamo.mark_dynamic(args.timesteps, 1)
-        if args.embedded_timestep.shape[1] > 1:
-            torch._dynamo.mark_dynamic(args.embedded_timestep, 1)
+        if args.timestep_embedding.token_indices is not None:
+            torch._dynamo.mark_dynamic(args.timestep_embedding.token_indices, 1)
+        # The table dimension is the sequence length for dense per-token conditioning
+        # and the candidate count for indexed conditioning. Both can vary between
+        # requests. A single row broadcasts and must remain static.
+        if args.timestep_embedding.modulation.shape[1] > 1:
+            torch._dynamo.mark_dynamic(args.timestep_embedding.modulation, 1)
+        if args.timestep_embedding.embedding.shape[1] > 1:
+            torch._dynamo.mark_dynamic(args.timestep_embedding.embedding, 1)
         # `cross_scale_shift_timestep` is the cross-attn AdaLN scale/shift input
-        # derived from the own-modality per-token timesteps (denoise_mask * sigma),
-        # so its dim 1 equals the seq length when conditioning is per-token.
+        # derived from the own-modality timesteps, so its dim 1 is the sequence length
+        # for dense conditioning and the candidate count for indexed conditioning.
         # `cross_gate_timestep` is the cross-modality sigma scalar -- dim 1 is 1
-        # and broadcasts, leave it static. Same guard pattern as `timesteps`.
+        # and broadcasts, leave it static.
         if args.cross_scale_shift_timestep is not None and args.cross_scale_shift_timestep.shape[1] > 1:
             torch._dynamo.mark_dynamic(args.cross_scale_shift_timestep, 1)
 
@@ -161,11 +165,12 @@ class CompiledBlockPerturbationsProcessor(BlockPerturbationsProcessor):
 
 
 def _register_transformer_args_pytree() -> None:
-    """Register ``TransformerArgs`` as a pytree so :class:`CudaGraphRunner` can flatten it to
-    tensor leaves for copy-in/out. Idempotent.
+    """Register ``TransformerArgs`` and its ``AdaLNTimestepEmbedding`` as pytrees so
+    :class:`CudaGraphRunner` can flatten them to tensor leaves for its capture key. Idempotent.
     """
-    if TransformerArgs not in pytree.SUPPORTED_NODES:
-        pytree.register_dataclass(TransformerArgs)
+    for node in (TransformerArgs, AdaLNTimestepEmbedding):
+        if node not in pytree.SUPPORTED_NODES:
+            pytree.register_dataclass(node)
 
 
 @contextlib.contextmanager

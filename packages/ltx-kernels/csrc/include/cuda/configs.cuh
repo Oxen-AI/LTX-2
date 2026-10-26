@@ -39,6 +39,16 @@ constexpr double DEFAULT_BARRIER_TIMEOUT_SECONDS = 10.0;
  */
 constexpr int MAX_NUM_PEERS = 8;
 
+/**
+ * @brief Layout of each rank's barrier signal slots.
+ *
+ * [0, MAX_NUM_PEERS): per-source signal counters. kBlocksDoneSlot: the local count of finished
+ * blocks that barrier_last_block_wait_and_reset keeps. The count is even so the pointer arrays that
+ * follow the slots in the IPC block stay 8-byte aligned.
+ */
+constexpr int kBlocksDoneSlot = MAX_NUM_PEERS;
+constexpr int kNumSignalSlots = MAX_NUM_PEERS + 2;
+
 // =============================================================================
 // Kernel Configuration
 // =============================================================================

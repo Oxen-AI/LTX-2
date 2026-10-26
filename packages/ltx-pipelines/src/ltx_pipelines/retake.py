@@ -19,7 +19,10 @@ from ltx_core.types import (
     SpatioTemporalScaleFactors,
     VideoPixelShape,
 )
-from ltx_pipelines.utils.args import video_editing_arg_parser
+from ltx_pipelines.utils.args import (
+    markers_from_args,
+    video_editing_arg_parser,
+)
 from ltx_pipelines.utils.blocks import (
     AudioConditioner,
     AudioDecoder,
@@ -32,13 +35,14 @@ from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, detect_params
 from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
     audio_latent_from_file,
+    create_initial_audio_latent,
     ensure_tiling_config,
     get_device,
     tiling_scale_factors_for_vae,
     video_latent_from_file,
 )
 from ltx_pipelines.utils.media_io import (
-    HDRColorSpace,
+    EXRColorSpace,
     encode_video,
     get_videostream_metadata,
     is_exr_dir,
@@ -46,7 +50,7 @@ from ltx_pipelines.utils.media_io import (
     vae_dtype_for_hdr,
 )
 from ltx_pipelines.utils.model_paths import ModelPaths
-from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, PipelineOutput
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, PipelineOutput, VideoAudio
 
 
 class RetakePipeline:
@@ -168,7 +172,7 @@ class RetakePipeline:
         tiling_config: TilingConfig | AutoTiling | None = AUTO_TILING,
         max_batch_size: int = 1,
         sigmas: torch.Tensor | None = None,
-        color_space: HDRColorSpace | None = None,
+        color_space: EXRColorSpace | None = None,
     ) -> PipelineOutput:
         """Regenerate ``[start_time, end_time]`` of the source video (retake).
         Parameters
@@ -205,8 +209,7 @@ class RetakePipeline:
         Returns
         -------
         PipelineOutput
-            Decoded video, audio, frame count, tiling, ``keyframes=None``, and the
-            video latent used for decode when retained (may be ``None``).
+            Decoded video, audio, frame count, and tiling config.
         """
         if start_time >= end_time:
             raise ValueError(f"start_time ({start_time}) must be less than end_time ({end_time})")
@@ -265,20 +268,30 @@ class RetakePipeline:
 
         v_context_p, a_context_p = contexts[0].video_encoding, contexts[0].audio_encoding
         video_modality_spec = ModalitySpec(
+            latent=initial_video_latent,
+            conditioning_fps=output_shape.fps,
             context=v_context_p,
             conditionings=[TemporalRegionMask(start_time=start_time, end_time=end_time, fps=output_shape.fps)]
             if regenerate_video
             else [],
-            initial_latent=initial_video_latent,
             frozen=not regenerate_video,
         )
+        scratch_audio = initial_audio_latent is None
+        if scratch_audio:
+            # Source has no audio track: generate from scratch on the encoded video canvas.
+            initial_audio_latent = create_initial_audio_latent(
+                initial_video_latent,
+                fps=output_shape.fps,
+                video_scale_factors=self.stage.video_scale_factors,
+            )
         audio_modality_spec = ModalitySpec(
+            latent=initial_audio_latent,
+            conditioning_fps=output_shape.fps,
             context=a_context_p,
             conditionings=[TemporalRegionMask(start_time=start_time, end_time=end_time, fps=output_shape.fps)]
-            if (initial_audio_latent is not None and regenerate_audio)
+            if (not scratch_audio and regenerate_audio)
             else [],
-            initial_latent=initial_audio_latent,
-            frozen=initial_audio_latent is not None and not regenerate_audio,
+            frozen=not scratch_audio and not regenerate_audio,
         )
 
         # Build denoiser and resolve sigma schedule.
@@ -313,21 +326,14 @@ class RetakePipeline:
             denoiser=denoiser,
             sigmas=sigmas,
             noiser=noiser,
-            width=output_shape.width,
-            height=output_shape.height,
-            frames=output_shape.frames,
-            fps=output_shape.fps,
-            video=video_modality_spec,
-            audio=audio_modality_spec,
+            modalities=VideoAudio(video=video_modality_spec, audio=audio_modality_spec),
             max_batch_size=max_batch_size,
         )
 
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
         decoded_audio = self.audio_decoder(audio_state.latent)
 
-        return PipelineOutput(
-            decoded_video, decoded_audio, output_shape.frames, tiling_config, None, video_state.latent
-        )
+        return PipelineOutput(decoded_video, decoded_audio, output_shape.frames, tiling_config)
 
 
 @torch.inference_mode()
@@ -337,6 +343,8 @@ def main() -> None:
     parser = video_editing_arg_parser(distilled=True)
     parser.description = "Retake: regenerate a time region of a video with LTX-2."
     args = parser.parse_args()
+    hdr = resolve_hdr_color_space(video_paths=[args.video_path], hdr=args.hdr)
+    video_marker, audio_marker = markers_from_args(args, device=get_device(), color_space=hdr)
 
     if args.start_time >= args.end_time:
         raise ValueError("start_time must be less than end_time")
@@ -364,7 +372,6 @@ def main() -> None:
         diffvae_optimization=args.diffvae_optimization,
     )
     params = detect_params(args.model_paths.transformer())
-    hdr = resolve_hdr_color_space(video_paths=[args.video_path], hdr=args.hdr)
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
     result = pipeline(
         video_path=args.video_path,
@@ -390,6 +397,8 @@ def main() -> None:
         output_path=args.output_path,
         video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
         color_space=hdr,
+        video_marker=video_marker,
+        audio_marker=audio_marker,
     )
 
 

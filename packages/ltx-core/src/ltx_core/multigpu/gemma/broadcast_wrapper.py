@@ -6,7 +6,12 @@ import torch
 import torch.distributed as dist
 
 from ltx_core.model.disposable import Disposable
+from ltx_core.multigpu.broadcast import BroadcastCoordinator
 from ltx_core.text_encoders.gemma.encoders.base_encoder import LTXGemmaTextEncoder
+
+# Bounds a wait on the source rank, which includes its Gemma load on a cold job and any prompt enhancement.
+# Matches NCCL's default collective timeout, which bounded the receive these waits precede.
+_SRC_WAIT_TIMEOUT_S = 600.0
 
 
 class BroadcastGemmaWrapper(torch.nn.Module, Disposable):
@@ -21,6 +26,10 @@ class BroadcastGemmaWrapper(torch.nn.Module, Disposable):
             ``dist.get_group_rank``.
         dtype: Target dtype for output tensors.
         device: Target device for output tensors.
+        coordinator: Store signal whose driver is ``src_rank``. When set, the other ranks wait for it on
+            the host before each broadcast from ``src_rank``, so their NCCL receive kernels do not spin
+            on a GPU the source rank's encoder is still running on. A wait raises ``TimeoutError``
+            after ``_SRC_WAIT_TIMEOUT_S``, e.g. when the source rank failed before broadcasting.
     """
 
     def __init__(
@@ -30,6 +39,7 @@ class BroadcastGemmaWrapper(torch.nn.Module, Disposable):
         src_rank: int,
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device | None = None,
+        coordinator: BroadcastCoordinator | None = None,
     ) -> None:
         super().__init__()
         if device is None and torch.cuda.is_available():
@@ -40,6 +50,7 @@ class BroadcastGemmaWrapper(torch.nn.Module, Disposable):
         self._rank = dist.get_rank(broadcast_group)
         self._dtype = dtype
         self._device = device
+        self._coordinator = coordinator
 
     def encode(self, prompts: list[str]) -> list[tuple[tuple[torch.Tensor, ...], torch.Tensor]]:
         """Encode a batch of prompts to per-prompt hidden states; implemented by subclasses."""
@@ -86,6 +97,7 @@ class BroadcastGemmaWrapper(torch.nn.Module, Disposable):
         return self._broadcast_str(result)
 
     def _broadcast_str(self, value: str | None) -> str:
+        self._wait_for_src()
         obj_list: list[str | None] = [value]
         dist.broadcast_object_list(obj_list, src=self._src_rank, group=self._group)
         result = obj_list[0]
@@ -99,6 +111,7 @@ class BroadcastGemmaWrapper(torch.nn.Module, Disposable):
         src_rank: int,
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         """Broadcast hidden states + attention mask via NCCL from ``src_rank``."""
+        self._wait_for_src(*(hidden_states or ()), attention_mask)
         if self._rank == src_rank:
             meta = [{"hs_shapes": [h.shape for h in hidden_states], "mask_shape": attention_mask.shape}]
         else:
@@ -118,3 +131,14 @@ class BroadcastGemmaWrapper(torch.nn.Module, Disposable):
         dist.broadcast(attention_mask, src=src_rank, group=self._group)
 
         return hidden_states, attention_mask
+
+    def _wait_for_src(self, *src_outputs: torch.Tensor | None) -> None:
+        """Hold the other ranks on the host until the source rank has computed ``src_outputs``."""
+        if self._coordinator is None:
+            return
+        if self._rank != self._src_rank:
+            self._coordinator.wait_for_signal_change(poll_interval=0.001, timeout=_SRC_WAIT_TIMEOUT_S)
+            return
+        for device in {t.device for t in src_outputs if t is not None and t.is_cuda}:
+            torch.cuda.synchronize(device)
+        self._coordinator.notify()

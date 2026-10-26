@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterator, Sequence
 from multiprocessing import SimpleQueue
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -21,12 +22,12 @@ import torch.distributed as dist
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.loader.registry import ModelRegistry
 from ltx_core.model.transformer.compiling import CompilationConfig
-from ltx_core.model.video_vae import get_video_chunks_number
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.multigpu.transformer.attention import AttentionManager
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.quantization.fp8_cast import build_policy as _build_fp8_cast_policy
 from ltx_core.tiling import DimensionTilingConfig, TileCountConfig, balanced_tile_split
+from ltx_pipelines.chunks import ChunkConfig, split_decoded_chunks
 from ltx_pipelines.distilled import DistilledPipeline
 from ltx_pipelines.multigpu.controller import MGPUController
 from ltx_pipelines.multigpu.gemma_builders import AccelerateGemmaBuilder
@@ -34,7 +35,9 @@ from ltx_pipelines.multigpu.runner import MGPURunner
 from ltx_pipelines.multigpu.sp_builder import SequenceParallelBuilder
 from ltx_pipelines.multigpu.vae_builders import DistributedDecoderBuilder
 from ltx_pipelines.multigpu.weight_tracker import TransformerWeightTracker
-from ltx_pipelines.utils.media_io import HDRColorSpace, encode_video, resolve_hdr_color_space, vae_dtype_for_hdr
+from ltx_pipelines.utils.args import markers_from_args
+from ltx_pipelines.utils.helpers import get_device
+from ltx_pipelines.utils.media_io import EXRColorSpace, encode_video, resolve_hdr_color_space, vae_dtype_for_hdr
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.types import DEFAULT_AUTO_DURATION, AutoDuration
 
@@ -135,6 +138,9 @@ class DistilledRunner(MGPURunner):
             vae_tiling=vae_tiling,
             driver_rank=_DRIVER_RANK,
             registry=registry,
+            # The driver concatenates the decoded clip on one device anyway, so assembling it
+            # in more temporal batches only adds a copy of the canvas.
+            num_temporal_batches=1,
         )
 
         self._pipeline = pipeline
@@ -153,53 +159,79 @@ class DistilledRunner(MGPURunner):
         images: list[Any] | None = None,
         enhance_prompt: bool = False,
         enhance_static_cache: bool = False,
-        hdr: HDRColorSpace | None = None,
+        hdr: EXRColorSpace | None = None,
         generated_keyframes: int | Sequence[int] = 0,
+        decode_with_keyframes: bool = False,
+        chunk_config: ChunkConfig | None = None,
+        marker_root_path: str | None = None,
     ) -> Iterator[str | None]:
         # The pipeline raises ValueError on invalid input (symmetric across ranks); the controller
         # catches that and turns it into a recoverable RunnerError. Anything else is fatal.
         hdr = resolve_hdr_color_space(images=images or [], hdr=hdr)
+        video_marker, audio_marker = markers_from_args(
+            SimpleNamespace(marker_root_path=marker_root_path),
+            device=get_device(),
+            color_space=hdr,
+        )
         vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
-        result = self._pipeline(
-            prompt=prompt,
-            seed=seed,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            images=images or [],
-            vae_dtype=vae_dtype,
-            color_space=hdr,
-            tiling_config=None,
-            enhance_prompt=enhance_prompt,
-            enhance_static_cache=enhance_static_cache,
-            generated_keyframes=generated_keyframes,
-        )
-        if dist.get_rank() != _DRIVER_RANK:
-            yield None  # workers: nothing to encode
-            return
-        encode_video(
-            video=result.video,
-            fps=frame_rate,
-            audio=result.audio,
-            output_path=output_path,
-            video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
-            color_space=hdr,
-        )
-        yield output_path
+        # One transformer for both passes of every chunk instead of a build per call. Under DEFER the SP
+        # builder's builds stay assigned anyway, so holding one for the whole job costs no memory.
+        with self._pipeline.stage.resident():
+            chunks, _, _ = self._pipeline.stream_chunks(
+                prompt=prompt,
+                seed=seed,
+                height=height,
+                width=width,
+                frame_rate=frame_rate,
+                images=images or [],
+                num_frames=num_frames,
+                vae_dtype=vae_dtype,
+                tiling_config=None,
+                enhance_prompt=enhance_prompt,
+                enhance_static_cache=enhance_static_cache,
+                color_space=hdr,
+                generated_keyframes=generated_keyframes,
+                decode_with_keyframes=decode_with_keyframes,
+                chunk_config=chunk_config,
+            )
+            is_driver = dist.get_rank() == _DRIVER_RANK
+            if not is_driver:
+                for _ in chunks:
+                    pass
+            else:
+                video, audio, audio_sampling_rate = split_decoded_chunks(chunks)
+                encode_video(
+                    video=video,
+                    fps=frame_rate,
+                    audio=audio,
+                    output_path=output_path,
+                    video_chunks_number=1,
+                    color_space=hdr,
+                    audio_sampling_rate=audio_sampling_rate,
+                    video_marker=video_marker,
+                    audio_marker=audio_marker,
+                )
+        yield output_path if is_driver else None
 
 
 if __name__ == "__main__":
     from ltx_pipelines.utils.args import (
+        add_chunk_layout_args,
         add_generated_keyframes_arg,
+        add_keyframe_decode_arg,
+        chunk_config_from_args,
         default_2_stage_distilled_arg_parser,
         resolve_cli_params,
     )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     params = resolve_cli_params(distilled=True)
-    parser = add_generated_keyframes_arg(
-        default_2_stage_distilled_arg_parser(params=params, supports_auto_duration=True)
+    parser = add_chunk_layout_args(
+        add_keyframe_decode_arg(
+            add_generated_keyframes_arg(
+                default_2_stage_distilled_arg_parser(params=params, supports_auto_duration=True)
+            )
+        )
     )
     args = parser.parse_args()
 
@@ -227,6 +259,9 @@ if __name__ == "__main__":
             enhance_static_cache=args.enhance_static_cache,
             hdr=args.hdr,
             generated_keyframes=args.num_generated_keyframes,
+            decode_with_keyframes=args.decode_with_keyframes,
+            chunk_config=chunk_config_from_args(args),
+            marker_root_path=args.marker_root_path,
         ):
             pass  # drive the job to completion; the runner writes the file as a side effect
     finally:

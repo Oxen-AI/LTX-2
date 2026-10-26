@@ -13,11 +13,15 @@ vector per axis. That keeps the RoPE call and the slot tables batch-independent.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
-from typing import Sequence
+from typing import NamedTuple, Sequence
 
 import torch
 from einops import rearrange
+
+from ltx_core.devices import upload_from_host
+from ltx_core.types import HostDeviceTensorPair
 
 #: Keyframe planes visible to one video query (and video frames visible to one keyframe
 #: query). Fixed at 2 upstream -- its backward kernel hardcodes at most two slots.
@@ -110,35 +114,71 @@ class DecodeKeyframes:
         return int(self.latents.shape[2])
 
 
+class KeyframePlanes(NamedTuple):
+    """Where a keyframe plane stack sits in time and which planes are live.
+    Each field is a :class:`~ltx_core.types.HostDeviceTensorPair`: the attention kernels read the
+    device tensor, and everything that picks planes or builds plane tables reads the host one, so a
+    decode never reads plane metadata back from the device.
+    Attributes:
+        times: ``(P,)`` float32 plane position in *this stage's* temporal units and *local to
+            the current tile* -- the same origin the video stream's RoPE uses. Both streams
+            must share one origin or the joint softmax sees wrong offsets.
+        valid: ``(P,)`` bool. Invalid planes are masked out of every softmax and their
+            activations are re-zeroed after each upsample.
+    """
+
+    times: HostDeviceTensorPair
+    valid: HostDeviceTensorPair
+
+    @classmethod
+    def on_device(cls, times: torch.Tensor, valid: torch.Tensor, device: torch.device) -> KeyframePlanes:
+        """The planes on ``device`` with their host mirror; host inputs are uploaded without waiting."""
+        return cls(HostDeviceTensorPair.on_device(times, device), HostDeviceTensorPair.on_device(valid, device))
+
+
 @dataclass(frozen=True)
 class KeyframeStream:
     """The keyframe half of the dual stream at one decoder stage.
     Attributes:
         x: ``(B, P, H, W, C)`` channels-last activations. ``H``/``W`` always match the
             video stream at the same stage; ``P`` is invariant across the whole decode.
-        times: ``(P,)`` float32 plane position in *this stage's* temporal units and
-            *local to the current tile* -- the same origin the video stream's RoPE uses.
-            Both streams must share one origin or the joint softmax sees wrong offsets.
-        valid: ``(P,)`` bool. Invalid planes are masked out of every softmax and their
-            activations are re-zeroed after each upsample.
+        planes: the planes' :class:`KeyframePlanes`, on ``x``'s device with their host mirror.
     """
 
     x: torch.Tensor
-    times: torch.Tensor
-    valid: torch.Tensor
+    planes: KeyframePlanes
+
+    @classmethod
+    def from_host(cls, x: torch.Tensor, times: torch.Tensor, valid: torch.Tensor) -> KeyframeStream:
+        """A stream on ``x``'s device; host ``times`` / ``valid`` are uploaded without waiting for it.
+        Device inputs are read back once here, so later plane selection stays on the host.
+        """
+        return cls(x=x, planes=KeyframePlanes.on_device(times, valid, x.device))
 
     def masked(self) -> KeyframeStream:
         """Re-zero invalid planes' activations (channels-last plane axis)."""
-        return KeyframeStream(x=self.x * self.valid[None, :, None, None, None], times=self.times, valid=self.valid)
+        return dataclasses.replace(self, x=self.x * self.planes.valid.device_tensor[None, :, None, None, None])
 
     def select_planes(self, keep: torch.Tensor) -> KeyframeStream:
-        """Subset the plane axis, keeping ``x``/``times``/``valid`` in step.
+        """Subset the plane axis, keeping ``x`` and both copies of the planes in step.
         ``keep`` is a ``(P,)`` bool mask. Used by tiled decode, which gives each tile only the
-        planes near it -- see :func:`planes_for_tile`.
+        planes near it -- see :func:`planes_for_tile`. The selection is made on the host and the
+        device side follows by uploaded indices, so a host ``keep`` never waits for the device
+        (a device one is read back to size the result).
         """
         if keep.shape != (self.num_planes,):
             raise ValueError(f"keep must be ({self.num_planes},) bool, got {tuple(keep.shape)}")
-        return KeyframeStream(x=self.x[:, keep], times=self.times[keep], valid=self.valid[keep])
+        keep_host = keep.cpu()
+        index_host = keep_host.nonzero().flatten()
+        index = upload_from_host(index_host, self.x.device)
+        times, valid = self.planes
+        return KeyframeStream(
+            x=self.x.index_select(1, index),
+            planes=KeyframePlanes(
+                HostDeviceTensorPair(times.host_tensor[keep_host], times.device_tensor.index_select(0, index)),
+                HostDeviceTensorPair(valid.host_tensor[keep_host], valid.device_tensor.index_select(0, index)),
+            ),
+        )
 
     def crop_spatial(self, height: slice, width: slice) -> KeyframeStream:
         """Crop H/W with the *same* slices the video stream's tile used.
@@ -146,7 +186,13 @@ class KeyframeStream:
         reads as ghosting rather than as an obvious failure -- the same hazard as the spatial
         padding rule.
         """
-        return KeyframeStream(x=self.x[:, :, height, width, :], times=self.times, valid=self.valid)
+        return dataclasses.replace(self, x=self.x[:, :, height, width, :])
+
+    def with_times(self, times: torch.Tensor) -> KeyframeStream:
+        """The same planes with ``times`` for another stage or origin (a host tensor is uploaded without waiting)."""
+        return dataclasses.replace(
+            self, planes=self.planes._replace(times=HostDeviceTensorPair.on_device(times, self.x.device))
+        )
 
     @property
     def num_planes(self) -> int:

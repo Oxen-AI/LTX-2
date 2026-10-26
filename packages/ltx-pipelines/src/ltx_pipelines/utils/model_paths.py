@@ -172,7 +172,18 @@ def model_paths_from_namespace(namespace: argparse.Namespace) -> ModelPaths:
             duration_head_path=split_values["duration_head_path"],
         )
 
-    if monolith_ckpt is None or gemma_root is None:
+    if monolith_ckpt is None:
+        raise SystemExit(
+            "Provide either monolith args (--checkpoint-path or --distilled-checkpoint-path "
+            "+ --gemma-root) or one or more split pack flags "
+            "(--transformer-path, --text-encoder-path, --audio-vae-path, "
+            "--duration-head-path). --video-vae-path fills the video VAE slot in either mode."
+        )
+
+    # Parsers that declare ``--gemma-root`` (basic_arg_parser) must supply it in monolith
+    # mode. HDR ACEScct CLIs omit the flag entirely and use precomputed embeddings —
+    # ``gemma_root`` stays ``None`` (see ``ModelPaths.from_monolith``).
+    if gemma_root is None and hasattr(namespace, "gemma_root"):
         raise SystemExit(
             "Provide either monolith args (--checkpoint-path or --distilled-checkpoint-path "
             "+ --gemma-root) or one or more split pack flags "

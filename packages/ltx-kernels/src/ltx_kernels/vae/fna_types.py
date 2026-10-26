@@ -28,6 +28,9 @@ TILE_K = TILER_N128[2]
 assert TILE_N == M, "attention_tile indexes an N=TILE_N key tile by lane (0..M-1)"
 EPS = 1e-6
 HD = 64  # head_dim; fixed by the DiffVAE attention
+# A head is one K-stage of an A operand, so a runtime head index reaches its channels by
+# shifting the operand view whole stages (``fna_smem._alias``) with static slice coordinates.
+assert HD == TILE_K, "per-head operand views assume one head per K-stage"
 
 # Warpgroups per CTA -- 128 threads, four warps, the tcgen05 scheduling unit. Both
 # kernels hold all 512 TMEM columns, so they are pinned to one CTA per SM and the only
@@ -44,10 +47,15 @@ HEAD_COLS = HD // NUM_WARPGROUPS
 HEADS_PER_TILE = TILE_N // HD  # heads in one N=128 projection tile
 # Warpgroups sharing a head. Two warpgroups gives one, so the Q/K RMSNorms and RoPE
 # stay register-local; four gives two, and they then need a partial reduction over the
-# pair (``head_sum2``) and a channel-ranged RoPE. Both are written generically, so the
-# two-warpgroup build is the ``WARPGROUPS_PER_HEAD == 1`` special case of the same code.
+# pair (``head_sum2``) and a channel-ranged RoPE. ``head_sum2`` and the K/V pass are
+# written generically, so the two-warpgroup build is the ``WARPGROUPS_PER_HEAD == 1``
+# special case of the same code.
 WARPGROUPS_PER_HEAD = NUM_WARPGROUPS // HEADS_PER_TILE
 assert HEADS_PER_TILE * WARPGROUPS_PER_HEAD == NUM_WARPGROUPS, "NUM_WARPGROUPS must be a multiple of TILE_N // HD"
+# The other row passes -- the query pass, the residual and AdaLN passes, the P and MLP
+# hidden fills -- are one code copy for all warpgroups: each reaches its ``ACC_COLS``
+# chunk through an operand view shifted by whole K-stages, so a chunk must be one stage.
+assert ACC_COLS == TILE_K, "warpgroup-agnostic row passes need one K-stage per warpgroup chunk"
 # One cooperative-copy step moves a whole ``_KRUN`` run per thread, so both ends of
 # the copy vectorise: 32B from global (2x LDG.E.128) and one swizzled-slice store.
 VEC = 16  # bf16 elements per thread per cooperative-copy step

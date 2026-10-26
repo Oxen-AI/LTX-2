@@ -22,6 +22,8 @@ in the kernel:
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from ltx_core.model.video_vae.transformer.attention import (
@@ -33,6 +35,9 @@ from ltx_core.model.video_vae.transformer.dsl_kernels.attn import (
     na_dsl_available,
     require_softmax_bound,
 )
+
+if TYPE_CHECKING:
+    from ltx_core.model.video_vae.keyframes import KeyframePlanes
 
 
 @torch.library.custom_op("ltx_core::na_attention_joint_dsl", mutates_args=())
@@ -57,9 +62,14 @@ def na_attention_joint_dsl(  # noqa: PLR0913 -- a custom_op schema takes only fl
     from ltx_kernels.vae import run_na_attention_bound  # noqa: PLC0415
     from ltx_kernels.vae.keyframe_slots import nearest_keyframe_slots  # noqa: PLC0415
 
+    from ltx_core.devices import upload_from_host  # noqa: PLC0415
+
     planes = int(keyframe_q.shape[1])
-    keep = keyframe_valid.nonzero().flatten()
-    live_times = keyframe_times.index_select(0, keep)
+    # Plane selection and slot tables are host work; free when the times and validity arrive on
+    # the host, one read of each otherwise.
+    keep_host = keyframe_valid.detach().cpu().nonzero().flatten()
+    live_times = keyframe_times.detach().cpu().index_select(0, keep_host)
+    keep = upload_from_host(keep_host, q.device)
     video_out, keyframe_out = run_na_attention_bound(
         q,
         k,
@@ -143,13 +153,14 @@ class DSLJointAttention(JointNAAttentionCallable):
         keyframe_q: torch.Tensor,
         keyframe_k: torch.Tensor,
         keyframe_v: torch.Tensor,
-        keyframe_times: torch.Tensor,
-        keyframe_valid: torch.Tensor,
+        keyframe_planes: KeyframePlanes,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from ltx_core.model.video_vae.keyframes import KEYFRAME_CONTEXT_SLOTS  # noqa: PLC0415
 
         if not self._available or not dsl_joint_supported(attn, q):
-            return self._fallback(attn, q, k, v, keyframe_q, keyframe_k, keyframe_v, keyframe_times, keyframe_valid)
+            return self._fallback(attn, q, k, v, keyframe_q, keyframe_k, keyframe_v, keyframe_planes)
+        # The op builds its plane tables on the host, so it gets the planes' host tensors.
+        keyframe_times, keyframe_valid = keyframe_planes.times.host_tensor, keyframe_planes.valid.host_tensor
         dtype = keyframe_v.dtype
         return na_attention_joint_dsl(
             q.to(dtype=dtype),

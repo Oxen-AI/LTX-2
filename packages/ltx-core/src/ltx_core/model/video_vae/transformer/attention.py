@@ -13,16 +13,25 @@ from typing import TYPE_CHECKING, Protocol
 import torch
 from torch import nn
 
-from ltx_core.model.video_vae.transformer.det_attn_rope import det_qkv_rope, det_qkv_rope_at_times
+from ltx_core.model.video_vae.transformer.det_attn_rope import (
+    det_project_qkv_eager,
+    det_project_qkv_lean,
+    det_qkv_rope,
+    det_qkv_rope_at_times,
+    det_rope_qk_,
+    linear_into_phase_buffer,
+)
+from ltx_core.model.video_vae.transformer.det_rms_norm import DetRMSNorm
 from ltx_core.model.video_vae.transformer.qkv import QKVProjections
 from ltx_core.model.video_vae.transformer.rope_math import (
     DEFAULT_ABS_ROPE_NUM_TILES,
+    AbsRopeTableCache,
     default_rope_dim_split,
     rope_inv_freqs,
 )
 
 if TYPE_CHECKING:
-    from ltx_core.model.video_vae.keyframes import KeyframeStream
+    from ltx_core.model.video_vae.keyframes import KeyframePlanes, KeyframeStream
 
 try:
     import natten
@@ -59,7 +68,8 @@ class JointNAAttentionCallable(Protocol):
     Same conventions as :class:`NAAttentionCallable` -- Q/K/V already normed, scaled and
     absolutely RoPE'd -- with a second stream shaped ``(B, P, H, W, NH, HD)`` whose plane
     axis sits in video's temporal slot. Both streams' RoPE must share one origin, so
-    ``keyframe_times`` are tile-local. Returns one output per stream.
+    ``keyframe_planes.times`` are tile-local. Backends that build plane tables on the host read the
+    planes' host tensors; the others read the device ones. Returns one output per stream.
     NATTEN and the CuTe DSL kernel cannot express a joint window, so this is a separate
     slot from ``attention_function`` rather than a widening of it: it keeps the shipping
     keyframe-less hot path untouched, and it is immune to the install-order hazard that
@@ -75,8 +85,7 @@ class JointNAAttentionCallable(Protocol):
         keyframe_q: torch.Tensor,
         keyframe_k: torch.Tensor,
         keyframe_v: torch.Tensor,
-        keyframe_times: torch.Tensor,
-        keyframe_valid: torch.Tensor,
+        keyframe_planes: KeyframePlanes,
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -146,6 +155,8 @@ class NeighborhoodAttention3D(nn.Module):
         self.rope_base = rope_base
         self.rope_num_tiles = DEFAULT_ABS_ROPE_NUM_TILES
         self.rope_compute_dtype = torch.float32
+        # The decode scope's abs-RoPE table cache while one is open (see ``abs_rope_table_cache``).
+        self.rope_table_cache: AbsRopeTableCache | None = None
         # Kept for the chunked opaque residual (string arg); callable is the swap surface.
         self.natten_backend: str | None = None
         self.attention_function: NAAttentionCallable = NattenAttention()
@@ -159,8 +170,8 @@ class NeighborhoodAttention3D(nn.Module):
 
         self.qkv = QKVProjections(dim)
         self.proj = nn.Linear(dim, dim, bias=True)
-        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6)
-        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6)
+        self.q_norm = DetRMSNorm(head_dim, eps=1e-6)
+        self.k_norm = DetRMSNorm(head_dim, eps=1e-6)
 
         # W-chunking configuration (consumed by ``chunked.attn``).
         self.w_chunks = 1  # 1 = no chunking
@@ -186,7 +197,12 @@ class NeighborhoodAttention3D(nn.Module):
                 f"got (T,H,W)=({t},{h},{w}) vs kernel={self.kernel_size}"
             )
 
-        q, k, v = det_qkv_rope(self, x)
+        if torch.compiler.is_compiling():
+            q, k, v = det_qkv_rope(self, x)
+        else:
+            # Eager: norms (and Q's scale) and RoPE in place on the fresh projections; same values.
+            q, k, v = det_project_qkv_eager(self, x)
+            q, k = det_rope_qk_(self, q.contiguous(), k.contiguous())
         # natten's CUTLASS kernel silently produces wrong output if inputs are non-contiguous.
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         out = self.attention_function(self, q, k, v)
@@ -210,8 +226,17 @@ class NeighborhoodAttention3D(nn.Module):
         batch, t, h, w, _ = x.shape
         planes = keyframes.x.shape[1]
 
-        q, k, v = det_qkv_rope(self, x)
-        keyframe_q, keyframe_k, keyframe_v = det_qkv_rope_at_times(self, keyframes.x, keyframes.times)
+        eager = not torch.compiler.is_compiling()
+        if eager:
+            # Projections in workspace phase buffers, norms, scale and RoPE in place; same values.
+            q, k, v = det_project_qkv_lean(self, x)
+            del x
+            q, k = det_rope_qk_(self, q, k)
+        else:
+            q, k, v = det_qkv_rope(self, x)
+        keyframe_q, keyframe_k, keyframe_v = det_qkv_rope_at_times(
+            self, keyframes.x, keyframes.planes.times.device_tensor
+        )
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         keyframe_q = keyframe_q.contiguous()
         keyframe_k = keyframe_k.contiguous()
@@ -225,10 +250,12 @@ class NeighborhoodAttention3D(nn.Module):
             keyframe_q,
             keyframe_k,
             keyframe_v,
-            keyframes.times,
-            keyframes.valid,
+            keyframes.planes,
         )
-        out = self.proj(out.reshape(batch, t, h, w, self.dim))
+        # Q/K/V are dead once the attention has run; three volumes need not stay live across the projection.
+        del q, k, v, keyframe_q, keyframe_k, keyframe_v
+        out = out.reshape(batch, t, h, w, self.dim)
+        out = linear_into_phase_buffer(self.proj, out) if eager else self.proj(out)
         keyframe_out = self.proj(keyframe_out.reshape(batch, planes, h, w, self.dim))
         return out, dataclasses.replace(keyframes, x=keyframe_out)
 

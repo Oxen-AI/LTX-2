@@ -28,7 +28,7 @@ from ltx_core.block_streaming.utils import (
 from ltx_core.block_streaming.wrapper import BlockStreamingWrapper
 from ltx_core.devices import synchronize_device
 from ltx_core.loader.fuse_loras import FuseRule, bf16_fuse_rule, fuse_lora_weights
-from ltx_core.loader.helpers import create_meta_model, load_state_dict, read_model_config, read_model_metadata
+from ltx_core.loader.helpers import LazyModelMetadata, create_meta_model, load_state_dict
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import (
     LoraPathStrengthAndSDOps,
@@ -107,6 +107,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         self._blocks_attr = blocks_attr
         self._blocks_prefix = blocks_prefix
         self._cpu_slots_count = cpu_slots_count
+        self._metadata = LazyModelMetadata(model_path, self._model_loader)
 
     @property
     def model_class_configurator(self) -> type[ModelConfigurator[ModelType]]:
@@ -161,6 +162,10 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         # Block weights live in fixed GPU/CPU slots that are reused across builds.
         return True
 
+    @property
+    def builds_per_shape(self) -> bool:
+        return False
+
     def with_sd_ops(self, sd_ops: SDOps | None) -> Self:
         clone = copy.copy(self)
         clone._model_sd_ops = sd_ops
@@ -192,11 +197,11 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
 
     def model_config(self) -> dict:
         """Read model configuration from the checkpoint metadata."""
-        return read_model_config(self.model_path, self.model_loader)
+        return self.model_metadata().get("config", {})
 
     def model_metadata(self) -> dict:
         """Read the full checkpoint metadata (including sibling keys beyond ``config``)."""
-        return read_model_metadata(self.model_path, self.model_loader)
+        return self._metadata.get()
 
     def meta_model(self, metadata: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:
         """Create a model on the meta device and apply module operations."""

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 
 import torch
 
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.components.noisers import GaussianNoiser
-from ltx_core.components.patchifiers import AudioPatchifier
-from ltx_core.conditioning import AudioConditionByReferenceLatent
+from ltx_core.conditioning import ConditioningItem
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
 from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
@@ -24,14 +25,39 @@ from ltx_core.model.video_vae import (
 )
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.types import AudioLatentShape, VideoPixelShape
+from ltx_core.types import VideoPixelShape
+from ltx_pipelines.chunks import (
+    Chunk,
+    ChunkConfig,
+    DecodedChunk,
+    MakeAudioConditionings,
+    MakeVideoConditionings,
+    SequentialVideoFrameSource,
+    decode_chunks,
+    denoise_chunks,
+    generate_uniform_chunks,
+    pipeline_output_from_chunks,
+    replace_audio_conditionings,
+    spatially_upsample_chunks,
+    split_decoded_chunks,
+)
+from ltx_pipelines.chunks.conditionings import (
+    assert_image_frames_in_clip,
+    audio_reference_conditionings_for_chunk,
+    image_conditionings_for_chunk,
+    reference_video_conditionings_for_chunk,
+)
 from ltx_pipelines.iclora_utils import (
-    append_ic_lora_reference_video_conditionings,
+    patchify_audio_reference_latent,
     read_lora_reference_downscale_factor,
 )
 from ltx_pipelines.utils.args import (
-    ImageConditioningInput,
+    add_chunk_layout_args,
+    add_generated_keyframes_arg,
+    add_keyframe_decode_arg,
+    chunk_config_from_args,
     dubit_arg_parser,
+    markers_from_args,
     resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
@@ -44,23 +70,49 @@ from ltx_pipelines.utils.blocks import (
     VideoUpsampler,
 )
 from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, STAGE_2_DISTILLED_SIGMAS
-from ltx_pipelines.utils.denoisers import SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
+    assert_generated_keyframes_request,
     assert_resolution,
-    combined_image_conditionings,
     ensure_tiling_config,
     get_device,
     snap_frames_to_grid,
     tiling_scale_factors_for_vae,
 )
-from ltx_pipelines.utils.media_io import (
-    HDRColorSpace,
-    decode_audio_from_file,
-    encode_video,
-    get_videostream_metadata,
-)
+from ltx_pipelines.utils.media_io import EXRColorSpace, decode_audio_from_file, encode_video, get_videostream_metadata
 from ltx_pipelines.utils.model_paths import ModelPaths
-from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, PipelineOutput
+from ltx_pipelines.utils.types import (
+    ImageConditioningInput,
+    LoadedImageConditioning,
+    OffloadMode,
+    PipelineOutput,
+    VideoAudio,
+)
+
+__all__ = ["DubItPipeline", "main", "patchify_dubit_audio_reference_latent"]
+
+patchify_dubit_audio_reference_latent = patchify_audio_reference_latent
+
+
+@dataclass(frozen=True)
+class _DubItRunContext:
+    """Setup snapshot for :meth:`DubItPipeline.stream_chunks`, built by :meth:`DubItPipeline._prepare_run`."""
+
+    generator: torch.Generator
+    noiser: GaussianNoiser
+    dtype: torch.dtype
+    vae_dtype: torch.dtype
+    images: list[LoadedImageConditioning]
+    video_context: torch.Tensor
+    audio_context: torch.Tensor
+    num_frames: int
+    frame_rate: float
+    tiling_config: TilingConfig
+    stage_1_width: int
+    stage_1_height: int
+    ref_audio_latent: torch.Tensor
+    reference_video_path: str
+    reference_strength: float
+    chunk_config: ChunkConfig
 
 
 class DubItPipeline:
@@ -144,50 +196,132 @@ class DubItPipeline:
         )
         self.reference_downscale_factor = read_lora_reference_downscale_factor(ic_lora.path)
 
-    def _create_stage_conditionings(
-        self,
-        images: list[ImageConditioningInput],
-        reference_video_path: str,
-        reference_strength: float,
-        height: int,
-        width: int,
-        num_frames: int,
-        video_encoder: VideoEncoder,
-        encode_tiling: TilingConfig | None,
-        color_space: HDRColorSpace | None = None,
-    ) -> list:
-        conditionings = combined_image_conditionings(
-            images=images,
-            height=height,
-            width=width,
-            video_encoder=video_encoder,
-            dtype=self.dtype,
-            device=self.device,
-            color_space=color_space,
-        )
-        append_ic_lora_reference_video_conditionings(
-            conditionings,
-            [(reference_video_path, reference_strength)],
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            video_encoder=video_encoder,
-            dtype=self.dtype,
-            device=self.device,
-            reference_downscale_factor=self.reference_downscale_factor,
-            conditioning_attention_strength=1.0,
-            conditioning_attention_mask=None,
-            tiling_config=encode_tiling,
-            color_space=color_space,
-        )
-        return conditionings
-
     def _encode_reference_audio_vae_latent(self, video_path: str) -> torch.Tensor:
         audio = decode_audio_from_file(video_path, self.device)
         if audio is None:
             msg = f"No audio stream found in {video_path}"
             raise ValueError(msg)
         return self.audio_conditioner(lambda enc: vae_encode_audio(audio, enc, None))
+
+    def _prepare_run(  # noqa: PLR0913
+        self,
+        *,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        images: list[ImageConditioningInput],
+        color_space: EXRColorSpace | None,
+        reference_video_path: str,
+        reference_strength: float,
+        enhance_prompt: bool,
+        enhance_static_cache: bool,
+        vae_dtype: torch.dtype | None,
+        tiling_config: TilingConfig | AutoTiling | None,
+        generated_keyframes: int | Sequence[int] = 0,
+        decode_with_keyframes: bool = False,
+        chunk_config: ChunkConfig | None = None,
+    ) -> _DubItRunContext:
+        """Validate inputs, encode prompts/reference, and resolve frame count / tiling before chunk planning."""
+        enhance_prompt_image = images[0].path if images else None
+        images = self.image_conditioner.load_conditionings(images, color_space)
+        assert_resolution(height=height, width=width, is_two_stage=True)
+        assert_generated_keyframes_request(decode_with_keyframes, generated_keyframes, self.stage)
+
+        meta = get_videostream_metadata(reference_video_path)
+        num_frames = snap_frames_to_grid(meta.frames)
+        frame_rate = float(meta.fps)
+
+        if chunk_config is None:
+            chunk_config = ChunkConfig(chunk_pixel_frames=num_frames, next_video_carry_frames=0)
+
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        noiser = GaussianNoiser(generator=generator)
+        resolved_vae_dtype = self.dtype if vae_dtype is None else vae_dtype
+
+        (ctx_p,) = self.prompt_encoder(
+            [prompt],
+            enhance_first_prompt=enhance_prompt,
+            enhance_static_cache=enhance_static_cache,
+            enhance_prompt_image=enhance_prompt_image,
+        )
+        video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
+
+        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
+        resolved_tiling_config = ensure_tiling_config(
+            tiling_config,
+            scale_factors=scale_factors,
+            vae_checkpoint_path=self.video_decoder.checkpoint_path,
+            video_shape=VideoPixelShape(
+                batch=1,
+                frames=min(num_frames, chunk_config.chunk_pixel_frames),
+                height=height,
+                width=width,
+                fps=frame_rate,
+            ),
+            diffvae_optimization=self.video_decoder.diffvae_optimization,
+            device=self.device,
+            keyframes=decode_with_keyframes,
+        )
+        ref_audio_latent = self._encode_reference_audio_vae_latent(reference_video_path)
+        return _DubItRunContext(
+            generator=generator,
+            noiser=noiser,
+            dtype=self.dtype,
+            vae_dtype=resolved_vae_dtype,
+            images=images,
+            video_context=video_context,
+            audio_context=audio_context,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            tiling_config=resolved_tiling_config,
+            stage_1_width=width // 2,
+            stage_1_height=height // 2,
+            ref_audio_latent=ref_audio_latent,
+            reference_video_path=reference_video_path,
+            reference_strength=reference_strength,
+            chunk_config=chunk_config,
+        )
+
+    def _video_conditionings(
+        self,
+        images: list[LoadedImageConditioning],
+        num_frames: int,
+        reference_video_path: str,
+        reference_strength: float,
+        color_space: EXRColorSpace | None,
+        frame_source: SequentialVideoFrameSource,
+    ) -> MakeVideoConditionings:
+        assert_image_frames_in_clip(images, num_frames)
+
+        def make(chunk: Chunk) -> list[ConditioningItem]:
+            if chunk.video is None:
+                return []
+
+            def encode(enc: VideoEncoder) -> list[ConditioningItem]:
+                items = [
+                    *image_conditionings_for_chunk(chunk, images=images, video_encoder=enc),
+                    *reference_video_conditionings_for_chunk(
+                        chunk,
+                        video_conditioning=[(reference_video_path, reference_strength)],
+                        video_encoder=enc,
+                        downscale_factor=self.reference_downscale_factor,
+                        encode_tiling=TileSizeConfig.default(),
+                        color_space=color_space,
+                        frame_sources={reference_video_path: frame_source},
+                    ),
+                ]
+                return items
+
+            return self.image_conditioner(encode)
+
+        return make
+
+    def _audio_conditionings(self, *, latent: torch.Tensor | None, fps: float) -> MakeAudioConditionings:
+        def make(chunk: Chunk) -> list[ConditioningItem]:
+            return audio_reference_conditionings_for_chunk(chunk, latent=latent, fps=fps)
+
+        return make
 
     @torch.inference_mode()
     def __call__(  # noqa: PLR0913
@@ -205,159 +339,154 @@ class DubItPipeline:
         tiling_config: TilingConfig | AutoTiling | None = AUTO_TILING,
         stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
-        color_space: HDRColorSpace | None = None,
+        color_space: EXRColorSpace | None = None,
+        chunk_config: ChunkConfig | None = None,
+        generated_keyframes: int | Sequence[int] = 0,
+        decode_with_keyframes: bool = False,
     ) -> PipelineOutput:
-        images = self.image_conditioner.resolve_crf(images)
-        assert_resolution(height=height, width=width, is_two_stage=True)
-
-        meta = get_videostream_metadata(reference_video_path)
-        num_frames = snap_frames_to_grid(meta.frames)
-        frame_rate = float(meta.fps)
-
-        generator = torch.Generator(device=self.device).manual_seed(seed)
-        noiser = GaussianNoiser(generator=generator)
-        if vae_dtype is None:
-            vae_dtype = self.dtype
-
-        (ctx_p,) = self.prompt_encoder(
-            [prompt],
-            enhance_first_prompt=enhance_prompt,
-            enhance_static_cache=enhance_static_cache,
-            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
-        )
-        video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
-
-        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
-        tiling_config = ensure_tiling_config(
-            tiling_config,
-            scale_factors=scale_factors,
-            vae_checkpoint_path=self.video_decoder.checkpoint_path,
-            video_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate),
-            diffvae_optimization=self.video_decoder.diffvae_optimization,
-            device=self.device,
-        )
-
-        stage_1_output_shape = VideoPixelShape(
-            batch=1,
-            frames=num_frames,
-            width=width // 2,
-            height=height // 2,
-            fps=frame_rate,
-        )
-        encode_tiling = TileSizeConfig.default()
-
-        def build_image_conditionings(output_shape: VideoPixelShape) -> list:
-            return self.image_conditioner(
-                lambda enc: self._create_stage_conditionings(
-                    images=images,
-                    reference_video_path=reference_video_path,
-                    reference_strength=reference_strength,
-                    height=output_shape.height,
-                    width=output_shape.width,
-                    num_frames=num_frames,
-                    video_encoder=enc,
-                    encode_tiling=encode_tiling,
-                    color_space=color_space,
-                )
-            )
-
-        def build_audio_ref_conditioning(audio_latent: torch.Tensor) -> AudioConditionByReferenceLatent:
-            ref_patch, ref_pos = patchify_dubit_audio_reference_latent(
-                audio_latent,
-                negative_positions=True,
-                device=self.device,
-            )
-            return AudioConditionByReferenceLatent(ref_patch, ref_pos, strength=1.0)
-
-        stage_1_conditionings = build_image_conditionings(stage_1_output_shape)
-
-        ref_vae = self._encode_reference_audio_vae_latent(reference_video_path)
-        audio_conditionings = [build_audio_ref_conditioning(ref_vae)]
-
-        stage_1_sigmas_tensor = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
-        video_state, audio_state = self.stage(
-            denoiser=SimpleDenoiser(video_context, audio_context),
-            sigmas=stage_1_sigmas_tensor,
-            noiser=noiser,
-            width=stage_1_output_shape.width,
-            height=stage_1_output_shape.height,
-            frames=num_frames,
-            fps=frame_rate,
-            video=ModalitySpec(
-                context=video_context,
-                conditionings=stage_1_conditionings,
-            ),
-            audio=ModalitySpec(
-                context=audio_context,
-                conditionings=audio_conditionings,
-            ),
-        )
-
-        s1_audio_latent = audio_state.latent.clone()
-
-        upscaled_video_latent = self.upsampler(video_state.latent[:1])
-        stage_2_sigmas_tensor = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
-        stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
-        stage_2_conditionings = build_image_conditionings(stage_2_output_shape)
-
-        stage_2_audio_conditionings = [build_audio_ref_conditioning(s1_audio_latent)]
-
-        video_state, _audio_unused = self.stage(
-            denoiser=SimpleDenoiser(video_context, audio_context),
-            sigmas=stage_2_sigmas_tensor,
-            noiser=noiser,
-            width=width,
+        chunks, num_frames, tiling_config = self.stream_chunks(
+            prompt=prompt,
+            seed=seed,
             height=height,
-            frames=num_frames,
-            fps=frame_rate,
-            video=ModalitySpec(
-                context=video_context,
-                conditionings=stage_2_conditionings,
-                noise_scale=stage_2_sigmas_tensor[0].item(),
-                initial_latent=upscaled_video_latent,
-            ),
-            audio=ModalitySpec(
-                context=audio_context,
-                conditionings=stage_2_audio_conditionings,
-                frozen=True,
-                noise_scale=0.0,
-                initial_latent=s1_audio_latent,
-            ),
+            width=width,
+            images=images,
+            reference_video_path=reference_video_path,
+            reference_strength=reference_strength,
+            enhance_prompt=enhance_prompt,
+            enhance_static_cache=enhance_static_cache,
+            vae_dtype=vae_dtype,
+            tiling_config=tiling_config,
+            stage_1_sigmas=stage_1_sigmas,
+            stage_2_sigmas=stage_2_sigmas,
+            color_space=color_space,
+            chunk_config=chunk_config,
+            generated_keyframes=generated_keyframes,
+            decode_with_keyframes=decode_with_keyframes,
+        )
+        return pipeline_output_from_chunks(chunks, num_frames=num_frames, tiling_config=tiling_config)
+
+    def stream_chunks(  # noqa: PLR0913
+        self,
+        prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        images: list[ImageConditioningInput],
+        reference_video_path: str,
+        reference_strength: float = 1.0,
+        enhance_prompt: bool = False,
+        enhance_static_cache: bool = False,
+        vae_dtype: torch.dtype | None = None,
+        tiling_config: TilingConfig | AutoTiling | None = AUTO_TILING,
+        stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
+        stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
+        color_space: EXRColorSpace | None = None,
+        chunk_config: ChunkConfig | None = None,
+        generated_keyframes: int | Sequence[int] = 0,
+        decode_with_keyframes: bool = False,
+    ) -> tuple[Iterator[DecodedChunk], int, TilingConfig]:
+        """Generate a dubbed clip as a stream of decoded chunks.
+        ``chunk_config=None`` plans a single chunk covering the snapped clip.
+        Stage 2 freezes stage-1 audio and uses it as the audio-reference tokens.
+        """
+        ctx = self._prepare_run(
+            prompt=prompt,
+            seed=seed,
+            height=height,
+            width=width,
+            images=images,
+            color_space=color_space,
+            reference_video_path=reference_video_path,
+            reference_strength=reference_strength,
+            enhance_prompt=enhance_prompt,
+            enhance_static_cache=enhance_static_cache,
+            vae_dtype=vae_dtype,
+            tiling_config=tiling_config,
+            generated_keyframes=generated_keyframes,
+            decode_with_keyframes=decode_with_keyframes,
+            chunk_config=chunk_config,
         )
 
-        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
-        decoded_audio = self.audio_decoder(s1_audio_latent)
-        return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config, None, video_state.latent)
+        stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
+        stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
 
+        target = VideoPixelShape(
+            batch=1,
+            frames=ctx.num_frames,
+            height=ctx.stage_1_height,
+            width=ctx.stage_1_width,
+            fps=ctx.frame_rate,
+        )
+        # Lazy stage-1 → upsample → stage-2 pulls one chunk through both resolutions before
+        # the next, so lookback still holds the window for the full-res encode.
+        frame_source = SequentialVideoFrameSource(ctx.reference_video_path, self.device)
+        make_video = self._video_conditionings(
+            ctx.images,
+            ctx.num_frames,
+            ctx.reference_video_path,
+            ctx.reference_strength,
+            color_space,
+            frame_source=frame_source,
+        )
+        chunks = generate_uniform_chunks(
+            target=target,
+            context=VideoAudio(video=ctx.video_context, audio=ctx.audio_context),
+            device=self.device,
+            dtype=ctx.dtype,
+            config=ctx.chunk_config,
+            video_scale_factors=self.stage.video_scale_factors,
+            make_video_conditionings=make_video,
+            make_audio_conditionings=self._audio_conditionings(latent=ctx.ref_audio_latent, fps=ctx.frame_rate),
+            generated_keyframes=generated_keyframes,
+        )
+        base = denoise_chunks(
+            chunks,
+            self.stage,
+            sigmas=stage_1_sigmas,
+            noiser=ctx.noiser,
+            fps=ctx.frame_rate,
+        )
+        upscaled = spatially_upsample_chunks(base, self.upsampler)
+        stage_2_input = replace_audio_conditionings(
+            upscaled,
+            self._audio_conditionings(latent=None, fps=ctx.frame_rate),
+        )
+        refined = denoise_chunks(
+            stage_2_input,
+            self.stage,
+            sigmas=stage_2_sigmas,
+            noiser=ctx.noiser,
+            fps=ctx.frame_rate,
+            freeze_audio=True,
+        )
 
-def patchify_dubit_audio_reference_latent(
-    vae_latents: torch.Tensor,
-    *,
-    negative_positions: bool,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Patchify audio VAE latents and build RoPE positions (optional negative shift for reference)."""
-    patchifier = AudioPatchifier(patch_size=1)
-    patchified = patchifier.patchify(vae_latents)
-    b, c, _t, mel_bins = vae_latents.shape
-    seq_len = patchified.shape[1]
-    latent_coords = patchifier.get_patch_grid_bounds(
-        output_shape=AudioLatentShape(batch=b, channels=c, frames=seq_len, mel_bins=mel_bins),
-        device=device,
-    )
-    positions = latent_coords.to(dtype=torch.float32)
-    if negative_positions:
-        aud_dur = positions[:, :, -1, 1].max().item()
-        positions = positions - aud_dur - 0.04
-    return patchified, positions
+        def decoded() -> Iterator[DecodedChunk]:
+            try:
+                yield from decode_chunks(
+                    refined,
+                    self.video_decoder,
+                    self.audio_decoder,
+                    fps=ctx.frame_rate,
+                    tiling_config=ctx.tiling_config,
+                    generator=ctx.generator,
+                    dtype=ctx.vae_dtype,
+                    keyframes=decode_with_keyframes,
+                )
+            finally:
+                frame_source.close()
+
+        return (decoded(), ctx.num_frames, ctx.tiling_config)
 
 
 @torch.inference_mode()
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     params = resolve_cli_params(distilled=True)
-    parser = dubit_arg_parser(params=params)
+    parser = add_chunk_layout_args(
+        add_keyframe_decode_arg(add_generated_keyframes_arg(dubit_arg_parser(params=params)))
+    )
     args = parser.parse_args()
+    video_marker, audio_marker = markers_from_args(args, device=get_device())
 
     if not args.lora or len(args.lora) != 1:
         raise ValueError("Dub-It requires exactly one --lora (the Dub-It IC-LoRA).")
@@ -373,8 +502,8 @@ def main() -> None:
         diffvae_optimization=args.diffvae_optimization,
     )
     src = get_videostream_metadata(args.reference_video)
-    # Dub-It is SDR-only (no ``--hdr``); EXR references are rejected in arg validation.
-    result = pipeline(
+    chunk_config = chunk_config_from_args(args)
+    chunks, num_frames, tiling_config = pipeline.stream_chunks(
         prompt=args.prompt,
         seed=args.seed,
         height=args.height,
@@ -385,13 +514,31 @@ def main() -> None:
         tiling_config=AUTO_TILING,
         enhance_prompt=args.enhance_prompt,
         enhance_static_cache=args.enhance_static_cache,
+        chunk_config=chunk_config,
+        generated_keyframes=args.num_generated_keyframes,
+        decode_with_keyframes=args.decode_with_keyframes,
     )
+    if chunk_config is not None:
+        video, audio, audio_sampling_rate = split_decoded_chunks(chunks)
+        video_chunks_number = 1
+    else:
+        result = pipeline_output_from_chunks(
+            chunks,
+            num_frames=num_frames,
+            tiling_config=tiling_config,
+        )
+        video, audio, audio_sampling_rate = result.video, result.audio, None
+        video_chunks_number = get_video_chunks_number(result.num_frames, result.tiling_config)
     encode_video(
-        video=result.video,
-        fps=int(src.fps),
-        audio=result.audio,
+        video=video,
+        fps=src.fps,
+        audio=audio,
         output_path=args.output_path,
-        video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
+        video_chunks_number=video_chunks_number,
+        color_space=None,
+        audio_sampling_rate=audio_sampling_rate,
+        video_marker=video_marker,
+        audio_marker=audio_marker,
     )
 
 

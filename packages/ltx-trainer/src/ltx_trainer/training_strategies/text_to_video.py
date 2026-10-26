@@ -12,7 +12,7 @@ import torch
 from pydantic import Field
 from torch import Tensor
 
-from ltx_core.model.transformer.modality import Modality
+from ltx_core.model.transformer.modality import Modality, TokenTimesteps
 from ltx_trainer import logger
 from ltx_trainer.timestep_samplers import TimestepSampler
 from ltx_trainer.training_strategies.base_strategy import (
@@ -155,7 +155,7 @@ class TextToVideoStrategy(TrainingStrategy):
             enabled=True,
             sigma=sigmas,
             latent=noisy_video,
-            timesteps=video_timesteps,
+            timesteps=TokenTimesteps(video_timesteps),
             positions=video_positions,
             context=video_prompt_embeds,
             context_mask=prompt_attention_mask,
@@ -242,7 +242,7 @@ class TextToVideoStrategy(TrainingStrategy):
             enabled=True,
             latent=noisy_audio,
             sigma=sigmas,
-            timesteps=audio_timesteps,
+            timesteps=TokenTimesteps(audio_timesteps),
             positions=audio_positions,
             context=audio_prompt_embeds,
             context_mask=prompt_attention_mask,

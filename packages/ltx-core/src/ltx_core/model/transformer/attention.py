@@ -7,13 +7,7 @@ from typing import Protocol
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from ltx_core.model.transformer.ops import (
-    GatedAttentionCallable,
-    PreAttentionCallable,
-    PytorchGatedAttention,
-    PytorchPreAttention,
-)
-from ltx_core.model.transformer.rope import LTXRopeType
+from ltx_core.model.transformer.rope import LTXRopeType, apply_rotary_emb
 
 
 def _torch_default_sdpa_priority() -> list[SDPBackend]:
@@ -172,6 +166,13 @@ class FlashAttention3(AttentionCallable):
         return out
 
 
+def _flash_attention_4_output(result: torch.Tensor | tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """Normalize FA4 return value: tensor (current releases) or legacy (out, aux) tuple."""
+    if isinstance(result, tuple):
+        return result[0]
+    return result
+
+
 class FlashAttention4(AttentionCallable):
     label = "FlashAttention4"
 
@@ -192,7 +193,8 @@ class FlashAttention4(AttentionCallable):
 
         q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
 
-        out, _ = flash_attn_4_func(q.to(v.dtype), k.to(v.dtype), v)
+        result = flash_attn_4_func(q.to(v.dtype), k.to(v.dtype), v)
+        out = _flash_attention_4_output(result)
         out = out.reshape(b, -1, heads * dim_head)
         return out
 
@@ -366,8 +368,12 @@ class AttentionFunction(Enum):
         Every non-AUTOMATIC variant raises :class:`RuntimeError` when the backend
         isn't usable on this machine -- missing package or SDPA backend rejected
         on this hardware (e.g. cuDNN under ``torch.use_deterministic_algorithms``).
-        Opting in means "this kernel or fail loudly". ``AUTOMATIC`` returns the
-        cached :func:`automatic_attention` instance so every build shares one callable.
+        Opting in means "this kernel or fail loudly", with one exception: under the
+        ``ltx_kernels_inductor`` and ``ltx_kernels_eager`` compile backends, an unmasked
+        call from ``PYTORCH`` or an ``SDPA_*`` variant runs ``ltx_kernels::sdpa_select``,
+        which picks cuDNN or flash attention per shape regardless of the pinned backend.
+        ``AUTOMATIC`` returns the cached :func:`automatic_attention` instance so every
+        build shares one callable.
         """
         match self:
             case AttentionFunction.AUTOMATIC:
@@ -471,8 +477,6 @@ class AttentionOps:
     masked_attention_function: MaskedAttentionCallable = field(
         default_factory=lambda: MaskedAttentionFunction.AUTOMATIC.to_callable()
     )
-    preattention_function: PreAttentionCallable = field(default_factory=PytorchPreAttention)
-    gated_attention_function: GatedAttentionCallable = field(default_factory=PytorchGatedAttention)
 
 
 class Attention(torch.nn.Module):
@@ -493,8 +497,6 @@ class Attention(torch.nn.Module):
         self.rope_type = rope_type
         self.attention_function = ops.attention_function
         self.masked_attention_function = ops.masked_attention_function
-        self.preattention_function = ops.preattention_function
-        self.gated_attention_function = ops.gated_attention_function
 
         inner_dim = dim_head * heads
         context_dim = query_dim if context_dim is None else context_dim
@@ -563,7 +565,11 @@ class Attention(torch.nn.Module):
         else:
             q = self.to_q(x)
             k = self.to_k(context)
-            q, k = self.preattention_function(q, k, self, mask, pe, k_pe)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            if pe is not None:
+                q = apply_rotary_emb(q, pe, self.rope_type)
+                k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
             if mask is None:
                 out = self.attention_function(q, k, v, self.heads)  # (B, T, H*D)
             else:
@@ -574,6 +580,11 @@ class Attention(torch.nn.Module):
 
         # Apply per-head gating if enabled
         if self.to_gate_logits is not None:
-            out = self.gated_attention_function(x, out, self)
+            gate_logits = self.to_gate_logits(x)
+            b, t, _ = out.shape
+            out = out.view(b, t, self.heads, self.dim_head)
+            gates = 2.0 * torch.sigmoid(gate_logits)
+            out = out * gates.unsqueeze(-1)
+            out = out.view(b, t, self.heads * self.dim_head)
 
         return self.to_out(out)

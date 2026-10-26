@@ -77,10 +77,9 @@ what pipeline constructors take.
 - `ltx_pipelines.ti2vid_one_stage` - Single-stage text/image-to-video. ([docs](pipelines.md#3-ti2vidonestagepipeline), [source](../src/ltx_pipelines/ti2vid_one_stage.py))
 - `ltx_pipelines.t2a_one_stage` - Single-stage text-to-audio (audio-only output). ([docs](pipelines.md#11-t2aonestagepipeline), [source](../src/ltx_pipelines/t2a_one_stage.py))
 - `ltx_pipelines.ic_lora` - Video-to-video with IC-LoRA. ([docs](pipelines.md#5-iclorapipeline), [source](../src/ltx_pipelines/ic_lora.py))
-- `ltx_pipelines.keyframe_interpolation` - Keyframe interpolation. ([docs](pipelines.md#6-keyframeinterpolationpipeline), [source](../src/ltx_pipelines/keyframe_interpolation.py))
 - `ltx_pipelines.a2vid_two_stage` - Audio-to-video generation conditioned on an input audio. ([docs](pipelines.md#7-a2vidpipelinetwostage), [source](../src/ltx_pipelines/a2vid_two_stage.py))
 - `ltx_pipelines.retake` - Regenerate a time region of an existing video. ([docs](pipelines.md#8-retakepipeline), [source](../src/ltx_pipelines/retake.py))
-- `ltx_pipelines.hdr_ic_lora` - Video-to-video with HDR output (linear float via LogC3 inverse decode). ([docs](pipelines.md#9-hdriclorapipeline), [source](../src/ltx_pipelines/hdr_ic_lora.py))
+- `ltx_pipelines.hdr_ic_lora` - Video-to-video SDR→HDR: writes a BT.2020/HLG master plus an EXR sequence (`--exr-colorspace`, default ACEScg). ([docs](pipelines.md#9-hdriclorapipeline), [source](../src/ltx_pipelines/hdr_ic_lora.py))
 - `ltx_pipelines.dubit` - Dub-It / re-voicing with IC-LoRA and audio reference conditioning. ([docs](pipelines.md#10-dubitpipeline), [source](../src/ltx_pipelines/dubit.py))
 
 Use `--help` with any pipeline module to see all available options and parameters.
@@ -99,5 +98,7 @@ These flags are shared across the pipeline CLIs (they come from a common base pa
 - `--lora <path> [strength]` - apply a LoRA (repeatable; default strength 1.0).
 - `--enhance-prompt` - rewrite the prompt with the built-in enhancer before generation.
 - `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}` - on pipelines that accept image / video conditioning (not Dub-It, HDR IC-LoRA, or T2A): declare the source colour space for EXR stills / EXR-frame folders. Required whenever any EXR input is passed; omit for SDR. With `--hdr` set, encode writes half EXR frames plus a BT.2020/HLG master. See [HDR Support](hdr.md).
+- `--marker-root-path <dir>` - optional local `path/to/marking` pack for post-hoc VideoSeal (SDR pixels) and AudioSeal (stereo PCM). Requires `uv sync --extra videoseal --extra audioseal`. HDR encode skips video stamping and still stamps audio. See [VideoSeal marking](marking.md).
 - `--video-vae-path <path>` - video VAE `.safetensors` (encoder + decoder). Split: the `vae/` component. Monolith: optional override of the VAE bundled in `--checkpoint-path`/`--distilled-checkpoint-path`. When it is a diffusion VAE, decoding builds a `DiffusionVideoDecoder`, which for best performance requires the `natten` extra. See [Optimization Tips](optimization.md#diffusion-vae-decoder).
 - `--diffvae-optimization {chunked_eager,chunked_compile,combined_compile,blackwell_dsl}` - DiffVAE decode preset (ignored for convolutional VAEs). `blackwell_dsl` is the fast path on datacenter Blackwell.
+- `--chunk-pixel-frames` / `--chunk-carry-frames` - on `distilled`, `ti2vid_two_stages` (and their MGPU runners), `a2vid_two_stage`, and `dubit`: pass either flag to generate in windows instead of one full-clip chunk. Defaults are 97 pixel frames and 25-pixel carry when the other is set. Pixel frame counts must be on the causal grid (`8k+1`). Off-grid `--num-frames` is floored to the causal grid.

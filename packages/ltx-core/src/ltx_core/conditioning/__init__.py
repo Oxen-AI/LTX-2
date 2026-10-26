@@ -3,6 +3,7 @@
 from ltx_core.conditioning.exceptions import ConditioningError
 from ltx_core.conditioning.item import ConditioningItem
 from ltx_core.conditioning.types import (
+    AudioConditionByLatentIndex,
     AudioConditionByReferenceLatent,
     ConditioningItemAttentionStrengthWrapper,
     VideoConditionByKeyframeIndex,
@@ -13,6 +14,7 @@ from ltx_core.conditioning.types import (
 )
 
 __all__ = [
+    "AudioConditionByLatentIndex",
     "AudioConditionByReferenceLatent",
     "ConditioningError",
     "ConditioningItem",

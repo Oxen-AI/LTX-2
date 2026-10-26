@@ -5,6 +5,8 @@ Extracted from :mod:`ltx_kernels.vae.fna_attn_core`. Constants:
 
 # NOTE: no `from __future__ import annotations` -- cute.struct needs real types.
 
+from typing import Any, NamedTuple
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -113,6 +115,15 @@ def _tmem_store(acc, lane, regs, i=0, w=ACC_COLS):
     cute.copy(st, regs, dst[None, None, i])
 
 
+def _tmem_shift(acc, cols):
+    """``acc`` moved ``cols`` TMEM columns along, with its layout.
+    How a runtime index picks one of an evenly spaced run of accumulators -- a head's
+    ``acc_o``, an N-tile's ``acc_main`` -- without unrolling the loop that indexes it: a
+    TMEM address is a register, so ``cols`` may be a runtime value.
+    """
+    return cute.make_tensor(acc.iterator + cols, acc.layout)
+
+
 def _reg_shape(tiled_mma, acc, lane, n_cols, w=ACC_COLS):
     """Shape every register array must use: the TMEM copy's ``partition_D``.
     An identity tensor stands in for the destination -- it carries the layout without
@@ -168,43 +179,54 @@ def _mma_issue(
                 tcgen05.commit(mbar)
 
 
+class GemmJob(NamedTuple):
+    """One ``M=128`` GEMM of a :func:`gemm_tma` call: B from ``(tma_atom, m_b)`` against ``fr_a``.
+    ``fr_a2`` continues the reduction in a second A operand from K-tile ``a_split`` on, for a
+    reduction wider than one operand can hold. ``kt0`` / ``n_kt`` pick the K-tiles of B.
+    ``n_idx``, ``kt0`` and ``accumulate`` may be device values (a device loop's index and the
+    expressions built from it); the other counts are trace-time ints.
+    """
+
+    tma_atom: Any
+    m_b: Any
+    fr_a: Any
+    acc: Any
+    n_idx: Any
+    kt0: Any
+    n_kt: int
+    a_st: int
+    accumulate: Any
+    fr_a2: Any = None
+    a_split: int = 0
+
+
 @cute.jit
 def gemm_tma(
     kind: cutlass.Constexpr,
     storage,
-    tma_atom,
-    mB,
     sB,
-    frA,
-    acc,
-    n_idx,
-    kt0: cutlass.Constexpr,
-    n_kt: cutlass.Constexpr,
-    a_st: cutlass.Constexpr,
-    accumulate: cutlass.Constexpr,
     stage_bytes: cutlass.Constexpr,
-    frA2=None,
-    a_split: cutlass.Constexpr = 0,
+    jobs: cutlass.Constexpr,
+    num_stages: cutlass.Constexpr = 2,
 ):
-    """One ``M=128`` GEMM with the B operand streamed in by TMA.
+    """Independent ``M=128`` GEMMs with their B operands streamed in by TMA.
     A is already in SMEM (the kernel computes it); only B is fetched. The
-    ``PipelineTmaUmma`` cycles ``sB``'s two stages, so one call covers every K-tile of
-    a C-wide (or Hidd-wide) reduction with the next tile's copy in flight during the
-    current tile's MMA.
-    ``frA2`` continues the reduction in a second A operand from K-tile ``a_split`` on, for a
-    reduction wider than one operand can hold. It is not a convenience: standing up the two
-    pipelines and waiting out the accumulator costs more than the K-tiles themselves at
-    these shapes, and two *calls* would pay that fixed cost twice. ``kt`` is compile-time,
-    so the choice folds away.
+    ``PipelineTmaUmma`` cycles ``sB``'s ``num_stages`` stages over every job's K-tiles as
+    one sequence, keeping ``num_stages - 1`` copies -- the next job's first ones included --
+    in flight during the current tile's MMA, and the CTA waits for the accumulators once.
+    Standing up the two pipelines and that final wait cost more than the K-tiles
+    themselves at these shapes, which is why independent GEMMs share a call.
+    ``jobs`` is a trace-time tuple of :class:`GemmJob`.
     """
     tiled_mma = cute.make_tiled_mma(_mma_op(kind))
     tiler = _mma_tiler(kind)
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     if warp_idx == 0:
-        cpasync.prefetch_descriptor(tma_atom)
+        for job in jobs:
+            cpasync.prefetch_descriptor(job.tma_atom)
 
     ab_prod, ab_cons = pipeline.PipelineTmaUmma.create(
-        num_stages=2,
+        num_stages=num_stages,
         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
         consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
         tx_count=stage_bytes,
@@ -217,39 +239,57 @@ def gemm_tma(
         barrier_storage=storage.acc_mbar_ptr.data_ptr(),
     ).make_participants()
 
-    gB = cute.local_tile(mB, tiler, (0, n_idx, None), proj=(None, 1, 1))
-    tCgB = tiled_mma.get_slice(0).partition_B(gB)
-    tBsB, tBgB = cpasync.tma_partition(
-        tma_atom,
-        0,
-        cute.make_layout(1),
-        cute.group_modes(sB, 0, 3),
-        cute.group_modes(tCgB, 0, 3),
-    )
+    parts = []
+    for job in jobs:
+        gB = cute.local_tile(job.m_b, tiler, (0, job.n_idx, None), proj=(None, 1, 1))
+        tCgB = tiled_mma.get_slice(0).partition_B(gB)
+        parts.append(
+            cpasync.tma_partition(
+                job.tma_atom,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sB, 0, 3),
+                cute.group_modes(tCgB, 0, 3),
+            )
+        )
     frB = tiled_mma.make_fragment_B(sB)
-    n_kblk = cute.size(frA, mode=[2])
+    steps = [(j, kt) for j, job in enumerate(jobs) for kt in range(job.n_kt)]
 
-    tiled_mma.set(tcgen05.Field.ACCUMULATE, accumulate)
+    tiled_mma.set(tcgen05.Field.ACCUMULATE, jobs[0].accumulate)
     if warp_idx == 0:
         acc_empty = acc_prod.acquire_and_advance()
-        # One-deep prefetch: K-tile k+1's copy is issued before the wait on k, so
-        # sB's two stages actually overlap TMA with MMA.
-        e = ab_prod.acquire_and_advance()
-        cute.copy(tma_atom, tBgB[(None, kt0)], tBsB[(None, e.index)], tma_bar_ptr=e.barrier)
-        for kt in cutlass.range_constexpr(n_kt):
-            if kt + 1 < n_kt:
+        # ``num_stages - 1`` copies ahead: step i+look's copy is issued before the wait on
+        # step i, so sB's stages actually overlap TMA with MMA.
+        look = num_stages - 1
+        for i in cutlass.range_constexpr(min(look, len(steps))):
+            pj, pkt = steps[i]
+            pre = ab_prod.acquire_and_advance()
+            cute.copy(
+                jobs[pj].tma_atom,
+                parts[pj][1][(None, jobs[pj].kt0 + pkt)],
+                parts[pj][0][(None, pre.index)],
+                tma_bar_ptr=pre.barrier,
+            )
+        for i in cutlass.range_constexpr(len(steps)):
+            if cutlass.const_expr(i + look < len(steps)):
+                nj, nkt = steps[i + look]
                 nxt = ab_prod.acquire_and_advance()
                 cute.copy(
-                    tma_atom,
-                    tBgB[(None, kt0 + kt + 1)],
-                    tBsB[(None, nxt.index)],
+                    jobs[nj].tma_atom,
+                    parts[nj][1][(None, jobs[nj].kt0 + nkt)],
+                    parts[nj][0][(None, nxt.index)],
                     tma_bar_ptr=nxt.barrier,
                 )
+            j, kt = steps[i]
+            job = jobs[j]
+            if cutlass.const_expr(j > 0 and kt == 0):
+                tiled_mma.set(tcgen05.Field.ACCUMULATE, job.accumulate)
             f = ab_cons.wait_and_advance()
-            src = frA if cutlass.const_expr(a_split == 0 or kt < a_split) else frA2
-            a_kt = a_st + kt if cutlass.const_expr(a_split == 0 or kt < a_split) else kt - a_split
-            for kb in cutlass.range_constexpr(n_kblk):
-                cute.gemm(tiled_mma, acc, src[None, None, kb, a_kt], frB[None, None, kb, f.index], acc)
+            first_operand = job.a_split == 0 or kt < job.a_split
+            src = job.fr_a if cutlass.const_expr(first_operand) else job.fr_a2
+            a_kt = job.a_st + kt if cutlass.const_expr(first_operand) else kt - job.a_split
+            for kb in cutlass.range_constexpr(cute.size(job.fr_a, mode=[2])):
+                cute.gemm(tiled_mma, job.acc, src[None, None, kb, a_kt], frB[None, None, kb, f.index], job.acc)
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
             f.release()
         acc_empty.commit()

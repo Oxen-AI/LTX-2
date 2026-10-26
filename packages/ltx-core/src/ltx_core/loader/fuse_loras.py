@@ -4,6 +4,7 @@ from typing import NamedTuple
 
 import torch
 
+from ltx_core.devices import allow_async_transfer
 from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
 
 
@@ -196,9 +197,10 @@ def _products_for_sd_key(
     prefix = key[: -len(".weight")]
     key_a = f"{prefix}.lora_A.weight"
     key_b = f"{prefix}.lora_B.weight"
+    non_blocking = allow_async_transfer(device)
     for lsd, coef in lora_sd_and_strengths:
         if key_a not in lsd.sd or key_b not in lsd.sd:
             continue
-        a = lsd.sd[key_a].to(device=device, dtype=dtype, non_blocking=True)
-        b = lsd.sd[key_b].to(device=device, dtype=dtype, non_blocking=True)
+        a = lsd.sd[key_a].to(device=device, dtype=dtype, non_blocking=non_blocking)
+        b = lsd.sd[key_b].to(device=device, dtype=dtype, non_blocking=non_blocking)
         yield LoraProduct(a, b, coef)

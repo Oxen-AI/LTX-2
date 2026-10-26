@@ -17,11 +17,16 @@ MGPUController(
     num_gpus: int | None = None,      # GPUs 0..num_gpus-1 (default: all visible)
     devices: Sequence[int] | None = None,  # place on specific physical GPUs, e.g. [2, 3]
     logs_specs: LogsSpecs | None = None,
+    cpu_threads_per_rank: int | None = 8,  # intra-op CPU threads per rank (None: torch's default)
 )
 ```
 
 `num_gpus` and `devices` are mutually exclusive. `devices=[2, 3]` puts rank r on
 `cuda:devices[r]`, so two controllers can share one machine on disjoint GPU sets.
+
+`cpu_threads_per_rank` sets every rank's intra-op CPU threads with `torch.set_num_threads`;
+`None` leaves torch's default. Ranks run only small host tensor ops, which a pool as wide as
+the machine stalls (tens to hundreds of ms per op on a 176-CPU host).
 
 Lifecycle:
 

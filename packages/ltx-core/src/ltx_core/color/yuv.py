@@ -1,27 +1,48 @@
 """GPU RGB→YUV420 packing for PyAV video encode (SDR 8-bit and HDR 10-bit).
 Shared by ltx-pipelines and ltx-trainer. Runs between the VAE decoder (float RGB
 chunks) and encode / HLG paths, bypassing pyav's CPU-side libswscale.
-``FrameConverter`` also carries codec metadata (pixel format, colour space,
-colour range).
+RGB→Y'CbCr matrices come from ``colour-science``. 4:2:0 subsampling and
+I420 / planar packing stay here (not provided by colour).
 """
 
 from __future__ import annotations
 
 import enum
+import functools
 
+import colour
 import torch
+
+from ltx_core.devices import upload_from_host
 
 
 class ColorSpace(enum.Enum):
-    """YUV color space standard."""
+    """YUV color space standard (FFmpeg ``AVCOL_SPC_*`` + colour-science weights)."""
 
     BT_709 = "bt709"
     BT_2020_NCL = "bt2020ncl"
 
     @property
     def av_colorspace(self) -> int:
-        """FFmpeg ``AVCOL_SPC_*`` constant for ``codec_context.colorspace``."""
-        return _AV_COLORSPACE[self]
+        """FFmpeg ``AVCOL_SPC_*`` for ``codec_context.colorspace``."""
+        match self:
+            case ColorSpace.BT_709:
+                return 1  # AVCOL_SPC_BT709
+            case ColorSpace.BT_2020_NCL:
+                return 9  # AVCOL_SPC_BT2020_NCL
+
+    @property
+    def _weights_name(self) -> str:
+        match self:
+            case ColorSpace.BT_709:
+                return "ITU-R BT.709"
+            case ColorSpace.BT_2020_NCL:
+                return "ITU-R BT.2020"
+
+    @property
+    def rgb_to_ycbcr_matrix(self) -> torch.Tensor:
+        """Float RGB→Y'CbCr (full range, no code levels), float32 3x3."""
+        return _RGB_TO_YCBCR[self]
 
 
 class ColorRange(enum.Enum):
@@ -32,8 +53,12 @@ class ColorRange(enum.Enum):
 
     @property
     def av_color_range(self) -> int:
-        """FFmpeg ``AVCOL_RANGE_*`` constant for ``codec_context.color_range``."""
-        return _AV_COLOR_RANGE[self]
+        """FFmpeg ``AVCOL_RANGE_*`` for ``codec_context.color_range``."""
+        match self:
+            case ColorRange.MPEG:
+                return 1  # AVCOL_RANGE_MPEG (limited)
+            case ColorRange.JPEG:
+                return 2  # AVCOL_RANGE_JPEG (full)
 
 
 class PixelFormat(enum.Enum):
@@ -48,35 +73,23 @@ class PixelFormat(enum.Enum):
         return self.value
 
 
-_AV_COLORSPACE = {
-    ColorSpace.BT_709: 1,  # AVCOL_SPC_BT709
-    ColorSpace.BT_2020_NCL: 9,  # AVCOL_SPC_BT2020_NCL
-}
+def _rgb_to_ycbcr_matrix(weights_name: str) -> torch.Tensor:
+    """Float RGB→Y'CbCr from colour-science (``matrix_YCbCr`` inverted)."""
+    ycbcr_to_rgb = torch.as_tensor(
+        colour.matrix_YCbCr(colour.WEIGHTS_YCBCR[weights_name], is_legal=False, is_int=False),
+        dtype=torch.float64,
+    )
+    return torch.linalg.inv(ycbcr_to_rgb).to(torch.float32)
 
-_AV_COLOR_RANGE = {
-    ColorRange.MPEG: 1,  # AVCOL_RANGE_MPEG (limited)
-    ColorRange.JPEG: 2,  # AVCOL_RANGE_JPEG (full)
-}
 
-_KR_2020, _KG_2020, _KB_2020 = 0.2627, 0.6780, 0.0593
-_COLOR_SPACE_MATRICES = {
-    ColorSpace.BT_709: torch.tensor(
-        [
-            [0.2126, 0.7152, 0.0722],
-            [-0.1146, -0.3854, 0.5],
-            [0.5, -0.4542, -0.0458],
-        ],
-        dtype=torch.float32,
-    ),
-    ColorSpace.BT_2020_NCL: torch.tensor(
-        [
-            [_KR_2020, _KG_2020, _KB_2020],
-            [-_KR_2020 / 1.8814, -_KG_2020 / 1.8814, 0.5],
-            [0.5, -_KG_2020 / 1.4746, -_KB_2020 / 1.4746],
-        ],
-        dtype=torch.float32,
-    ),
-}
+# Built once; ``ColorSpace.rgb_to_ycbcr_matrix`` reads from here.
+_RGB_TO_YCBCR = {cs: _rgb_to_ycbcr_matrix(cs._weights_name) for cs in ColorSpace}
+
+
+@functools.lru_cache(maxsize=16)
+def _device_rgb_to_ycbcr_matrix(color_space: ColorSpace, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """``color_space``'s matrix on ``device`` in ``dtype``, uploaded once without waiting for the device."""
+    return upload_from_host(color_space.rgb_to_ycbcr_matrix.to(dtype=dtype), device)
 
 
 # cuBLAS GEMM dims are int32. PyTorch folds ``(F, H*W, 3) @ (3, 3)`` into one
@@ -111,13 +124,14 @@ def frames_per_yuv_gemm(height: int, width: int) -> int:
 
 
 def rgb_to_yuv(image: torch.Tensor, color_space: ColorSpace) -> torch.Tensor:
-    """RGB ``[0, 1]`` ``(*, 3, H, W)`` → YUV ``(*, 3, H, W)``.
-    Long clips are converted in frame chunks of size ``< (2**31 - 1) // H // W``
-    so each 3x3 GEMM stays inside cuBLAS int32. When chunking, YUV is written
-    back over the RGB storage; otherwise chunks are concatenated.
+    """RGB ``[0, 1]`` ``(*, 3, H, W)`` → YUV ``(*, 3, H, W)`` (float, no code levels).
+    Matrix from colour-science. Long clips are converted in frame chunks of size
+    ``< (2**31 - 1) // H // W`` so each 3x3 GEMM stays inside cuBLAS int32.
+    When chunking, YUV is written back over the RGB storage; otherwise chunks
+    are concatenated. (``colour.RGB_to_YCbCr`` is NumPy-only and not used here.)
     """
     _require_rgb_chw(image)
-    mat = _COLOR_SPACE_MATRICES[color_space].to(device=image.device, dtype=image.dtype)
+    mat = _device_rgb_to_ycbcr_matrix(color_space, image.device, image.dtype)
     orig_shape = image.shape
     height, width = orig_shape[-2], orig_shape[-1]
     frames = image.reshape(-1, 3, height, width)
@@ -160,22 +174,23 @@ def apply_color_range_(
     *,
     bits: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Scale Y/UV to 8- or 10-bit code levels in-place.
-    MPEG uses ``(219 * E' + 16) * 2^(bits-8)`` for Y and
-    ``(224 * E' + 128) * 2^(bits-8)`` for Cb/Cr.
+    """Scale float Y/UV to 8- or 10-bit code levels in-place.
+    MPEG (limited): Y ``(219·E'+16)·2^(bits-8)``, Cb/Cr ``(224·E'+128)·2^(bits-8)``.
+    JPEG (full): Y ``E'·(2^bits-1)``, Cb/Cr ``(E'+0.5)·(2^bits-1)``.
     """
     if bits not in (8, 10):
         raise ValueError(f"Unsupported bit depth: {bits}")
     factor = 1 << (bits - 8)
-    if color_range == ColorRange.MPEG:
-        y.mul_(219 * factor).add_(16 * factor)
-        uv.mul_(224 * factor).add_(128 * factor)
-    elif color_range == ColorRange.JPEG:
-        max_code = (1 << bits) - 1
-        y.mul_(max_code)
-        uv.add_(0.5).mul_(max_code)
-    else:
-        raise ValueError(f"Unsupported color range: {color_range}")
+    match color_range:
+        case ColorRange.MPEG:
+            y.mul_(219 * factor).add_(16 * factor)
+            uv.mul_(224 * factor).add_(128 * factor)
+        case ColorRange.JPEG:
+            max_code = (1 << bits) - 1
+            y.mul_(max_code)
+            uv.add_(0.5).mul_(max_code)
+        case _:
+            raise ValueError(f"Unsupported color range: {color_range}")
     return y, uv
 
 
@@ -233,15 +248,6 @@ def yuv420_planes_u16(y: torch.Tensor, uv: torch.Tensor) -> tuple[torch.Tensor, 
     return y16, u16, v16
 
 
-def _rgb_uint8_fn_(frames: torch.Tensor) -> torch.Tensor:
-    return frames.clamp_(0.0, 1.0).mul_(255.0).to(torch.uint8).movedim(-3, -1)
-
-
-def _yuv420p_bt709_fn_(frames: torch.Tensor) -> torch.Tensor:
-    y, uv = rgb_to_yuv420(frames, ColorSpace.BT_709, ColorRange.MPEG)
-    return pack_i420(y, uv)
-
-
 class FrameConverter(enum.Enum):
     """Converts ``[*, C, H, W]`` float ``[0, 1]`` frames for encode.
     Carries encoding metadata so the caller can tag the output stream.
@@ -256,9 +262,10 @@ class FrameConverter(enum.Enum):
     def __call__(self, frames: torch.Tensor) -> torch.Tensor:
         match self:
             case FrameConverter.RGB24:
-                return _rgb_uint8_fn_(frames)
+                return frames.clamp_(0.0, 1.0).mul_(255.0).to(torch.uint8).movedim(-3, -1)
             case FrameConverter.YUV420P_BT709:
-                return _yuv420p_bt709_fn_(frames)
+                y, uv = rgb_to_yuv420(frames, ColorSpace.BT_709, ColorRange.MPEG)
+                return pack_i420(y, uv)
 
     @property
     def pixel_format(self) -> PixelFormat:

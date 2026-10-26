@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ltx_core.model.video_vae.ops import rms_norm_uint32_safe
 from ltx_core.model.video_vae.transformer.swiglu import (
     SwiGLUTileSpec,
     _fused_gate_up_swiglu_triton,
@@ -87,7 +88,7 @@ def _chunked_residual_modulated_impl(
         n = end - start
         xc = x_flat[start:end]
         y = y_buf[:n]
-        y.copy_(F.rms_norm(xc, (dim,), norm_weight, eps))
+        y.copy_(rms_norm_uint32_safe(xc, (dim,), norm_weight, eps))
         y.mul_(1.0 + s).add_(sh)
 
         ws = workspace[:n]

@@ -12,13 +12,17 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
 import torch
 import torch.utils._pytree as pytree
 
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig
+from ltx_core.model.transformer.transformer_args import AdaLNTimestepEmbedding
+from ltx_core.types import HostDeviceTensorPair
 
 if TYPE_CHECKING:
     # torch imports this under TYPE_CHECKING too (a runtime top-level import cycles).
@@ -31,9 +35,25 @@ _BlockLoopFn = Callable[
     "tuple[TransformerArgs | None, TransformerArgs | None]",
 ]
 _ShapeKey = tuple[tuple[int, ...], ...]
-# One capture identity: input shapes plus the block's perturbation graph signature (what the block
-# specialises on), so a perturbed pass keys to -- and recaptures -- its own graph.
-_CaptureKey = tuple[_ShapeKey, Hashable]
+# One capture identity: input shapes, the block's perturbation graph signature (what the block
+# specialises on), so a perturbed pass keys to -- and recaptures -- its own graph, and the
+# enclosing `capture_key_scope`'s key.
+_CaptureKey = tuple[_ShapeKey, Hashable, Hashable]
+
+_scope_key: ContextVar[Hashable] = ContextVar("cudagraph_capture_scope_key", default=None)
+
+
+@contextmanager
+def capture_key_scope(key: Hashable) -> Iterator[None]:
+    """Add ``key`` to the capture identity of every :class:`CudaGraphRunner` call inside the scope.
+    For host state the block loop branches on that its input shapes do not carry, such as the
+    sequence-parallel padding layout: calls under different keys capture and replay their own graphs.
+    """
+    token = _scope_key.set(key)
+    try:
+        yield
+    finally:
+        _scope_key.reset(token)
 
 
 @dataclasses.dataclass
@@ -132,6 +152,14 @@ class _InputBufferPool:
             return static
         if isinstance(value, tuple):
             return tuple(self.copy_value_to_buffer(f"{field}.{i}", t, tokens) for i, t in enumerate(value))
+        if isinstance(value, AdaLNTimestepEmbedding):
+            return dataclasses.replace(
+                value,
+                **{
+                    f.name: self.copy_value_to_buffer(f"{field}.{f.name}", getattr(value, f.name), tokens)
+                    for f in dataclasses.fields(value)
+                },
+            )
         return value
 
     def copy_args_to_buffers(self, args: TransformerArgs) -> TransformerArgs:
@@ -153,7 +181,9 @@ class _InputBufferPool:
     def copy_perturbations_to_buffers(self, perturbations: BatchedPerturbationConfig) -> BatchedPerturbationConfig:
         static_block_masks = self.copy_value_to_buffer("block_masks", perturbations.block_masks, tokens=None)
         assert isinstance(static_block_masks, torch.Tensor)
-        return BatchedPerturbationConfig.from_masks(static_block_masks, perturbations.block_masks_cpu)
+        return BatchedPerturbationConfig.from_masks(
+            HostDeviceTensorPair(host_tensor=perturbations.block_masks_cpu, device_tensor=static_block_masks)
+        )
 
 
 class CudaGraphRunner:
@@ -227,11 +257,12 @@ class CudaGraphRunner:
     def _cache_key(
         self, video: TransformerArgs | None, audio: TransformerArgs | None, perturbations: BatchedPerturbationConfig
     ) -> _CaptureKey:
-        """Capture identity: input shapes + the block's perturbation graph signature. Keying on the
-        signature makes a pass recapture exactly when it would recompile (and no more) -- the perturbed
-        pass no longer silently replays the clean same-shape graph."""
+        """Capture identity: input shapes + the block's perturbation graph signature + the enclosing
+        :func:`capture_key_scope` key. Keying on the signature makes a pass recapture exactly when it
+        would recompile (and no more) -- the perturbed pass no longer silently replays the clean
+        same-shape graph."""
         shape = _shape_key(video, audio, perturbations.block_masks)
-        return shape, self._block_input_processor.graph_signature(perturbations)
+        return shape, self._block_input_processor.graph_signature(perturbations), _scope_key.get()
 
     @staticmethod
     def _configure_shared_input_pool(pool: _InputBufferPool | None, max_tokens: int) -> _InputBufferPool:

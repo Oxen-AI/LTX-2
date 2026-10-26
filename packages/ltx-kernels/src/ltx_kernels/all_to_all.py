@@ -3,8 +3,8 @@ The C++ kernels are exposed via ``torch.library.custom_op`` so that
 ``torch.compile`` (and CUDA Graph capture under ``mode="reduce-overhead"``)
 can trace through them without a graph break. Each :class:`All2All`
 instance registers itself in a class-level registry indexed by an integer
-``comm_id``; the custom op takes that id plus an input tensor and dispatches
-to the appropriate C++ runtime.
+``comm_id``; the custom op takes that id, an input tensor, and the instance's
+IPC buffer, and dispatches to the appropriate C++ runtime.
 """
 
 import math
@@ -16,58 +16,96 @@ import torch.distributed as dist
 from all2all_cpp import All2All as All2AllCpp
 from torch.library import custom_op
 
-# Output shapes are derived symbolically from the input tensor's shape under
-# the assumption of *uniform* sharding (caller pads up-front so
-# `total_tokens % world_size == 0`). `world_size` travels through the op as an int
-# so it enters the traced graph: the fake needs it for the output shape, and since
-# it is constant per process the Dynamo guard it installs never triggers a
-# within-run recompile -- it only keys the compile cache by world size, so a graph
-# compiled under one GPU count is never replayed under another. Per-rank token
-# counts, which do vary per call, stay in the C++ runtime state (`set_rank_tokens`)
-# and never travel through the op.
+# Output shapes and kernel offsets are derived from the input tensor under uniform
+# sharding. Callers pad before sharding, so every rank has the same token count.
+# Each op writes its result into the instance's local IPC buffer, which it takes as a
+# mutated argument, and returns nothing; All2All returns a view of that buffer. Returning
+# the view from the op instead would declare storage the compiler may reuse for other
+# tensors, while the next op on the same instance, from any rank, overwrites it.
 
 
-@custom_op("ltx_kernels::send_recv_heads", mutates_args=(), device_types="cuda")
-def _send_recv_heads_op(
-    x: torch.Tensor,
-    comm_id: int,
-    world_size: int,  # noqa: ARG001
-    copy_out: bool,
-) -> torch.Tensor:
-    # copy_out=False returns a view into the IPC buffer (zero-copy). Safe under
-    # cudagraph_trees because the IPC buffer is cudaMalloc'd inside All2All, not
-    # in the static graph pool, so it isn't subject to graph-pool aliasing.
-    return All2All._runtime_registry[comm_id].send_recv_heads(x, copy_out)
+@custom_op("ltx_kernels::send_recv_heads", mutates_args=("buffer",), device_types="cuda")
+def _send_recv_heads_op(x: torch.Tensor, buffer: torch.Tensor, comm_id: int) -> None:  # noqa: ARG001
+    All2All._runtime_registry[comm_id].send_recv_heads(x, False)
 
 
 @_send_recv_heads_op.register_fake
-def _send_recv_heads_fake(
-    x: torch.Tensor,
-    comm_id: int,  # noqa: ARG001
-    world_size: int,
-    copy_out: bool,  # noqa: ARG001
-) -> torch.Tensor:
-    return x.new_empty((x.shape[0], x.shape[1] * world_size, x.shape[2] // world_size, x.shape[3]))
+def _send_recv_heads_fake(x: torch.Tensor, buffer: torch.Tensor, comm_id: int) -> None:  # noqa: ARG001
+    return None
 
 
-@custom_op("ltx_kernels::gather_heads", mutates_args=(), device_types="cuda")
-def _gather_heads_op(
-    x: torch.Tensor,
-    comm_id: int,
-    world_size: int,  # noqa: ARG001
-    copy_out: bool,
-) -> torch.Tensor:
-    return All2All._runtime_registry[comm_id].gather_heads(x, copy_out)
+@custom_op("ltx_kernels::gather_heads", mutates_args=("buffer",), device_types="cuda")
+def _gather_heads_op(x: torch.Tensor, buffer: torch.Tensor, comm_id: int) -> None:  # noqa: ARG001
+    All2All._runtime_registry[comm_id].gather_heads(x, False)
 
 
 @_gather_heads_op.register_fake
-def _gather_heads_fake(
+def _gather_heads_fake(x: torch.Tensor, buffer: torch.Tensor, comm_id: int) -> None:  # noqa: ARG001
+    return None
+
+
+@custom_op("ltx_kernels::rope_send_recv_heads", mutates_args=("buffer",), device_types="cuda")
+def _rope_send_recv_heads_op(
     x: torch.Tensor,
+    weights: torch.Tensor,
+    cos_freqs: torch.Tensor,
+    sin_freqs: torch.Tensor,
+    eps: float,
+    buffer: torch.Tensor,  # noqa: ARG001
+    comm_id: int,
+    barrier: bool = True,
+) -> None:
+    All2All._runtime_registry[comm_id].rope_send_recv_heads(x, sin_freqs, cos_freqs, weights, eps, barrier)
+
+
+@_rope_send_recv_heads_op.register_fake
+def _rope_send_recv_heads_fake(
+    x: torch.Tensor,  # noqa: ARG001
+    weights: torch.Tensor,  # noqa: ARG001
+    cos_freqs: torch.Tensor,  # noqa: ARG001
+    sin_freqs: torch.Tensor,  # noqa: ARG001
+    eps: float,  # noqa: ARG001
+    buffer: torch.Tensor,  # noqa: ARG001
     comm_id: int,  # noqa: ARG001
-    world_size: int,
-    copy_out: bool,  # noqa: ARG001
-) -> torch.Tensor:
-    return x.new_empty((x.shape[0], x.shape[1] // world_size, x.shape[2] * world_size, x.shape[3]))
+    barrier: bool = True,  # noqa: ARG001
+) -> None:
+    return None
+
+
+@custom_op("ltx_kernels::linear_send_recv_heads", mutates_args=("buffer",), device_types="cuda")
+def _linear_send_recv_heads_op(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    buffer: torch.Tensor,  # noqa: ARG001
+    comm_id: int,
+    barrier: bool = True,
+) -> None:
+    All2All._runtime_registry[comm_id].linear_send_recv_heads(x, weight, bias, barrier)
+
+
+@_linear_send_recv_heads_op.register_fake
+def _linear_send_recv_heads_fake(
+    x: torch.Tensor,  # noqa: ARG001
+    weight: torch.Tensor,  # noqa: ARG001
+    bias: torch.Tensor,  # noqa: ARG001
+    buffer: torch.Tensor,  # noqa: ARG001
+    comm_id: int,  # noqa: ARG001
+    barrier: bool = True,  # noqa: ARG001
+) -> None:
+    return None
+
+
+@custom_op("ltx_kernels::exchange_barrier", mutates_args=("buffers",), device_types="cuda")
+def _exchange_barrier_op(buffers: list[torch.Tensor], comm_id: int) -> None:  # noqa: ARG001
+    # ``buffers`` are the exchanges this barrier completes: declaring them mutated orders every read of
+    # them after it.
+    All2All._runtime_registry[comm_id].exchange_barrier()
+
+
+@_exchange_barrier_op.register_fake
+def _exchange_barrier_fake(buffers: list[torch.Tensor], comm_id: int) -> None:  # noqa: ARG001
+    return None
 
 
 class All2All:
@@ -133,10 +171,7 @@ class All2All:
         dist.all_gather_object(ipc_handles, local_ipc_handle, group)
 
         self.runtime.sync(ipc_handles)
-
-    def set_rank_tokens(self, rank_num_tokens: list[int]) -> None:
-        """Sets per-rank token counts on the C++ runtime."""
-        self.runtime.set_rank_tokens(rank_num_tokens)
+        self._buffer = self.runtime.local_buffer()
 
     def set_timeout_seconds(self, seconds: float) -> None:
         """Set the all2all barrier (deadlock-detection) timeout, in seconds.
@@ -154,9 +189,13 @@ class All2All:
             x: Input tensor of shape [batch, tokens, heads, head_dim].
             copy_out: If True, copy result to a new tensor instead of using buffer.
         Returns:
-            Output tensor with redistributed heads.
+            Output tensor with redistributed heads. Unless ``copy_out``, a view of the IPC
+            buffer that the next call on this instance overwrites.
         """
-        return torch.ops.ltx_kernels.send_recv_heads(x, self._comm_id, self.world_size, copy_out)
+        torch.ops.ltx_kernels.send_recv_heads(x, self._buffer, self._comm_id)
+        batch, tokens, heads, head_dim = x.shape
+        out = self._buffer[: x.numel()].view(batch, tokens * self.world_size, heads // self.world_size, head_dim)
+        return out.clone() if copy_out else out
 
     def gather_heads(self, x: torch.Tensor, *, copy_out: bool = False) -> torch.Tensor:
         """Gather heads back to original distribution (reverse All2All).
@@ -164,9 +203,13 @@ class All2All:
             x: Input tensor with distributed heads.
             copy_out: If True, copy result to a new tensor instead of using buffer.
         Returns:
-            Output tensor with gathered heads.
+            Output tensor with gathered heads. Unless ``copy_out``, a view of the IPC buffer
+            that the next call on this instance overwrites.
         """
-        return torch.ops.ltx_kernels.gather_heads(x, self._comm_id, self.world_size, copy_out)
+        torch.ops.ltx_kernels.gather_heads(x, self._buffer, self._comm_id)
+        batch, tokens, heads, head_dim = x.shape
+        out = self._buffer[: x.numel()].view(batch, tokens // self.world_size, heads * self.world_size, head_dim)
+        return out.clone() if copy_out else out
 
     def allgather(self, x: torch.Tensor, *, copy_out: bool = False) -> torch.Tensor:
         """Allgather operation across all ranks.

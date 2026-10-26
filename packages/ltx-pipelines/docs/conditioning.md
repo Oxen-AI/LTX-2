@@ -4,15 +4,27 @@ Pipelines use different conditioning methods from [`ltx-core`](../../ltx-core/) 
 
 ## Image Conditioning
 
-All pipelines support image conditioning, but with different methods:
+Stills are passed as [`ImageConditioningInput`](../src/ltx_pipelines/utils/types.py) values with an
+[`ImageReplace`](../src/ltx_pipelines/utils/types.py) or [`ImageGuide`](../src/ltx_pipelines/utils/types.py)
+binding. [`image_conditionings()`](../src/ltx_pipelines/utils/helpers.py) encodes each still and
+emits the matching core conditioning item (`VideoConditionByLatentIndex` or
+`VideoConditionByKeyframeIndex`).
 
-- **Replacing Latents** ([`image_conditionings_by_replacing_latent`](../src/ltx_pipelines/utils/helpers.py)):
-  - Replaces the latent at a specific frame with the encoded image
-  - Strong control over specific frames
+`ImageConditioningInput` is a pixel-space API: every `frame_idx` is a zero-based index on the
+decoded output video's frame timeline, never an index into the VAE latent. This applies equally to
+`ImageConditioningInput.at()`, `.replace()`, `.guide()`, `ImageReplace`, `ImageGuide`, and the
+`--image` (optional trailing `replace` / `guide` binding keyword) CLI flags. Chunking and temporal rebasing also
+map these values in pixel space.
 
-- **Guiding Latents** ([`image_conditionings_by_adding_guiding_latent`](../src/ltx_pipelines/utils/helpers.py)):
-  - Adds the image as a guiding signal rather than replacing
-  - Better for smooth interpolation between keyframes
+`ImageGuide` accepts any frame in the clip. `ImageReplace` must point to the start of a causal VAE
+latent: pixel frame `0`, or `1 + 8 * k` (`1`, `9`, `17`, ...). The pipeline converts that
+pixel-frame index to a latent index only when it creates the core conditioning item:
+
+```python
+opening = ImageConditioningInput.replace("opening.png", frame_idx=0, strength=1.0)
+later_replacement = ImageConditioningInput.replace("later.png", frame_idx=9, strength=1.0)
+guide = ImageConditioningInput.guide("guide.png", frame_idx=80, strength=0.8)
+```
 
 ## Video Conditioning
 
@@ -52,9 +64,11 @@ and invents new ones per tile during temporal rounds.
 
 **Usage.** Pass `generated_keyframes` to `__call__`: an `int` requests that many evenly spaced
 interior keyframes (both endpoints excluded), a sequence gives explicit frame indices. On the CLI the
-flag is `--num-generated-keyframes N` (default `0`, off). It is opt-in per pipeline rather than a
-shared flag, so only the CLIs listed above advertise it — `DFRPipeline` derives its own slot
-positions and does not accept it.
+flag is `--num-generated-keyframes N` (default `0`, off). Pass `decode_with_keyframes=True` (CLI:
+`--decode-with-keyframes`) to decode through the keyframe-aware DiffVAE path using those slots as
+anchors. It is opt-in per pipeline rather than a shared flag, so only the CLIs listed above
+advertise both flags -- `DFRPipeline` derives its own slot positions, always keyframe-decodes, and
+does not accept either flag.
 
 **Reading the keyframes back.** Generated keyframes land in `LatentState.generated_keyframes` with
 shape `(B, C, K, H, W)`. Decode each one as a standalone single-frame clip: a K-frame causal decode

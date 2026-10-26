@@ -1,5 +1,5 @@
 """Colour transforms, primaries, YUV packing, and HLG encode.
-VAE working-space helpers (``HDRTransfer``, ``TransferEncoding``) live in
+VAE working-space helpers (``to_acescct_working_space``, ``to_hdr_linear``, ``TransferEncoding``) live in
 :mod:`ltx_core.hdr` — import them from there. This package does not re-export
 hdr symbols (that would cycle: ``hdr`` imports ``color.primaries``).
 """

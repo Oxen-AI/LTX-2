@@ -6,6 +6,7 @@ geometry/schedule/mask pieces that tiling uses.
 from __future__ import annotations
 
 import itertools
+import logging
 import math
 from dataclasses import dataclass
 from typing import List, Literal, Sequence, Tuple
@@ -29,6 +30,8 @@ from ltx_core.tiling import (
     untiled_mask_1d,
 )
 from ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors
+
+logger = logging.getLogger(__name__)
 
 ResizeAxisMode = Literal["repeat_last", "symmetric"]
 
@@ -65,12 +68,13 @@ class _StageFiveBudget:
 #     the fusion it holds several live full-volume intermediates instead of one Inductor buffer,
 #     measured as 11 -> 15.
 #   - BLACKWELL_DSL: the CuTe kernel has its own joint entry point, so the fused path serves
-#     keyframes too and nothing changes.
+#     keyframes too, but the keyframe decode's eager det blocks and its keyframe planes raise the
+#     measured working set to 4.0 (2.5 leaves a streamed multi-GPU decode out of memory warm).
 _BUDGET_BY_MODE: dict[DiffVAEMode, _StageFiveBudget] = {
     DiffVAEMode.COMBINED_COMPILE: _StageFiveBudget(coef=11, coef_keyframes=15, reserve_bytes=2 * _GIB),
     DiffVAEMode.CHUNKED_COMPILE: _StageFiveBudget(coef=7, coef_keyframes=5, reserve_bytes=2 * _GIB),
     DiffVAEMode.CHUNKED_EAGER: _StageFiveBudget(coef=5, coef_keyframes=5, reserve_bytes=1 * _GIB),
-    DiffVAEMode.BLACKWELL_DSL: _StageFiveBudget(coef=2.5, coef_keyframes=2.5, reserve_bytes=2 * _GIB),
+    DiffVAEMode.BLACKWELL_DSL: _StageFiveBudget(coef=2.5, coef_keyframes=4.0, reserve_bytes=2 * _GIB),
 }
 _DEFAULT_ELEMENT_SIZE: int = 2  # bf16 features → fp16 accumulator / bf16 stage-5
 _ACCUMULATOR_CHANNELS: int = 3  # RGB pixel blend buffer (decoder out_channels)
@@ -303,7 +307,7 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
     production bf16 features use fp16 accumulators (2), matching
     :func:`accumulator_element_size`. Stage-5 uses the same element size x
     ``stage5_channels`` x ``coef``, which :func:`stage5_mem_coef` reads off the
-    mode and ``keyframes`` (11 / 7 / 5 / 2.5 by mode; 15 / 5 / 5 / 2.5 with a
+    mode and ``keyframes`` (11 / 7 / 5 / 2.5 by mode; 15 / 5 / 5 / 4.0 with a
     keyframe stream, which runs eager blocks).
     Args beyond the geometry:
         keyframes: this decode carries a keyframe stream (joint attention, eager blocks).
@@ -411,6 +415,17 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
 
     scored.sort()
     _waste, _vol, _ntiles, tile_t, tile_h, tile_w = scored[0]
+    logger.info(
+        "DiffVAE AUTO tiling: %df x %dx%d (overlap T=%d HW=%d) mode=%s keyframes=%s free_bytes=%d",
+        tile_t,
+        tile_h,
+        tile_w,
+        overlap_t,
+        overlap_hw,
+        mode.value,
+        keyframes,
+        int(free_bytes),
+    )
     return TileSizeConfig(
         frames=DimensionSizeConfig(tile_size=tile_t, overlap=overlap_t),
         height=DimensionSizeConfig(tile_size=tile_h, overlap=overlap_hw),

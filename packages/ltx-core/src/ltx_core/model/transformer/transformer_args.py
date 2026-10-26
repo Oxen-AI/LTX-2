@@ -44,12 +44,34 @@ def apply_keyframes_absolute_embedding(
 
 
 @dataclass(frozen=True)
+class AdaLNTimestepEmbedding:
+    """Projected AdaLN timesteps and the token index that selects their rows.
+    Transformer blocks consume ``modulation`` and carry ``embedding`` to the model
+    output head, which applies the final scale and shift.
+    Compact-table indices have the batch offset folded in and address the first two
+    dimensions of any projected table passed to ``gather``.
+    """
+
+    modulation: torch.Tensor
+    embedding: torch.Tensor
+    token_indices: torch.Tensor | None = None
+
+    def gather(self, values: torch.Tensor) -> torch.Tensor:
+        """Expand a compact table to one row per token."""
+        if self.token_indices is None:
+            return values
+        return values.reshape(-1, *values.shape[2:])[self.token_indices]
+
+    def per_token_embedding(self) -> torch.Tensor:
+        return self.gather(self.embedding)
+
+
+@dataclass(frozen=True)
 class TransformerArgs:
     x: torch.Tensor
     context: torch.Tensor
     context_mask: torch.Tensor
-    timesteps: torch.Tensor
-    embedded_timestep: torch.Tensor
+    timestep_embedding: AdaLNTimestepEmbedding
     positional_embeddings: tuple[torch.Tensor, torch.Tensor]
     cross_positional_embeddings: tuple[torch.Tensor, torch.Tensor] | None
     cross_scale_shift_timestep: torch.Tensor | None
@@ -226,14 +248,13 @@ class TransformerArgsPreprocessor:
         # Convert [0, 1] attention mask to additive log-space bias:
         #   1.0 -> log(1.0) = 0.0  (no bias, full attention)
         #   0.0 -> finfo.min        (fully masked)
+        # Must stay elementwise: boolean indexing would sync the host on every forward.
         finfo = torch.finfo(x_dtype)
-        eps = finfo.tiny
-
-        bias = torch.full_like(attention_mask, finfo.min, dtype=x_dtype)
-        positive = attention_mask > 0
-        if positive.any():
-            bias[positive] = torch.log(attention_mask[positive].clamp(min=eps)).to(x_dtype)
-
+        bias = torch.where(
+            attention_mask > 0,
+            torch.log(attention_mask.clamp(min=finfo.tiny)).to(x_dtype),
+            torch.full_like(attention_mask, finfo.min, dtype=x_dtype),
+        )
         return bias.unsqueeze(1)  # (B, 1, T_q, T_k) for head broadcast
 
     def _prepare_positional_embeddings(
@@ -269,8 +290,15 @@ class TransformerArgsPreprocessor:
         x = apply_keyframes_absolute_embedding(x, modality.keyframes_mask, self.keyframes_embedding_provider)
         batch_size = x.shape[0]
         timestep, embedded_timestep = self._prepare_timestep(
-            modality.timesteps, self.adaln, batch_size, modality.latent.dtype
+            modality.timesteps.values, self.adaln, batch_size, modality.latent.dtype
         )
+        timestep_indices = modality.timesteps.indices
+        if timestep_indices is not None:
+            # Fold the batch into the index so a consumer resolves batch and value with one
+            # gather over the table flattened to (B * K, ...). Every consumer of
+            # `AdaLNTimestepEmbedding` reads them in that flattened form.
+            batch_offsets = torch.arange(batch_size, device=x.device, dtype=torch.int32)
+            timestep_indices = timestep_indices + batch_offsets[:, None] * timestep.shape[1]
         prompt_timestep = None
         if self.prompt_adaln is not None:
             prompt_timestep, _ = self._prepare_timestep(
@@ -291,8 +319,7 @@ class TransformerArgsPreprocessor:
             x=x,
             context=context,
             context_mask=attention_mask,
-            timesteps=timestep,
-            embedded_timestep=embedded_timestep,
+            timestep_embedding=AdaLNTimestepEmbedding(timestep, embedded_timestep, timestep_indices),
             positional_embeddings=pe,
             cross_positional_embeddings=None,
             cross_scale_shift_timestep=None,
@@ -356,7 +383,7 @@ class MultiModalTransformerArgsPreprocessor:
             return transformer_args
 
         if cross_modality.sigma.numel() > 1:
-            if cross_modality.sigma.shape[0] != modality.timesteps.shape[0]:
+            if cross_modality.sigma.shape[0] != modality.timesteps.values.shape[0]:
                 raise ValueError("Cross modality sigma must have the same batch size as the modality")
             if cross_modality.sigma.ndim != 1:
                 raise ValueError("Cross modality sigma must be a 1D tensor")
@@ -371,7 +398,7 @@ class MultiModalTransformerArgsPreprocessor:
         )
 
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
-            modality_timesteps=modality.timesteps,
+            modality_timesteps=modality.timesteps.values,
             cross_modality_sigma=cross_modality.sigma,
             timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
             batch_size=transformer_args.x.shape[0],

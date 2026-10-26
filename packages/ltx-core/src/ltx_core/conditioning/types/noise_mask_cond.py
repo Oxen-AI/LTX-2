@@ -22,7 +22,7 @@ class TemporalRegionMask(ConditioningItem):
 
     def apply_to(self, latent_state: LatentState, latent_tools: LatentTools) -> LatentState:
         coords = latent_tools.patchifier.get_patch_grid_bounds(
-            latent_tools.target_shape, device=latent_state.denoise_mask.device
+            latent_tools.target_shape, device=latent_state.denoise_mask.tensor.device
         )
         if isinstance(latent_tools.target_shape, AudioLatentShape):
             # Audio: patchifier get_patch_grid_bounds returns seconds
@@ -38,8 +38,8 @@ class TemporalRegionMask(ConditioningItem):
         t_start, t_end = t_boundaries.unbind(dim=-1)  # [B, N]
         in_region = (t_end > self.start_time) & (t_start < self.end_time)
         state = latent_state.clone()
-        mask_val = in_region.to(state.denoise_mask.dtype)
-        if state.denoise_mask.dim() == 3:
+        mask_val = in_region.to(state.denoise_mask.tensor.dtype)
+        if state.denoise_mask.tensor.dim() == 3:
             mask_val = mask_val.unsqueeze(-1)
-        state.denoise_mask.copy_(mask_val)
+        state.denoise_mask.tensor.copy_(mask_val)
         return state

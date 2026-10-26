@@ -97,7 +97,7 @@ def extend_keyframes_mask(
     if existing is None and not marked:
         return None
     if existing is None:
-        existing = torch.zeros_like(latent_state.denoise_mask)
+        existing = torch.zeros_like(latent_state.denoise_mask.tensor, device=latent_state.latent.device)
     new = torch.ones if marked else torch.zeros
     pad = new(
         (existing.shape[0], num_new_tokens, existing.shape[2]),

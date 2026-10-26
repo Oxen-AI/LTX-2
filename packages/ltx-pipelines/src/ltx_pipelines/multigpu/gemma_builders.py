@@ -15,6 +15,7 @@ dispatch hooks. The outer wrapper is not cached.
 from __future__ import annotations
 
 import copy
+import itertools
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -24,8 +25,10 @@ import torch.distributed as dist
 from accelerate import dispatch_model
 from transformers import AutoModelForImageTextToText
 
+from ltx_core.loader.helpers import assign_state_dict
 from ltx_core.loader.primitives import BuilderProtocol, StateDict
 from ltx_core.loader.registry import Registry, module_registry_key
+from ltx_core.multigpu.broadcast import BroadcastCoordinator
 from ltx_core.multigpu.gemma.accelerate_wrapper import AccelerateGemmaWrapper
 from ltx_core.multigpu.gemma.loader import load_gemma_with_device_map
 from ltx_core.text_encoders.gemma import gemma_model_config
@@ -35,6 +38,9 @@ if TYPE_CHECKING:
     from typing_extensions import Self
 
 logger = logging.getLogger(__name__)
+
+# Numbers this process's builders in construction order, which every rank shares, to give each its own store key.
+_builder_ids = itertools.count()
 
 
 def _assign_non_persistent(model: torch.nn.Module, non_persistent_sd: dict[str, torch.Tensor]) -> None:
@@ -69,6 +75,9 @@ class AccelerateGemmaBuilder(BuilderProtocol):
     Conforms to the builder interface expected by ``PromptEncoder``:
     ``build(device, dtype) -> model``.  Non-source ranks get a lightweight
     :class:`AccelerateGemmaWrapper` that receives embeddings via broadcast.
+    Every rank must construct its builders in the same order (in ``setup``, before any job): each
+    gets its own :class:`BroadcastCoordinator`, keyed by construction order, which it hands to every
+    wrapper it builds.
     """
 
     def __init__(
@@ -88,6 +97,10 @@ class AccelerateGemmaBuilder(BuilderProtocol):
         self._src_rank = src_rank
         self._is_src = dist.get_rank() == src_rank
         self._dtype = dtype
+        store = dist.distributed_c10d.PrefixStore(
+            f"ltx_gemma_broadcast/{next(_builder_ids)}/", dist.distributed_c10d._get_default_store()
+        )
+        self._coordinator = BroadcastCoordinator(store=store, is_driver=self._is_src)
         # Cached on the src rank after first build (non-tensor objects).
         self._config: object | None = None
         self._hf_device_map: dict[str, int | str] | None = None
@@ -133,6 +146,7 @@ class AccelerateGemmaBuilder(BuilderProtocol):
             src_rank=dist.get_group_rank(self._broadcast_group, self._src_rank),
             dtype=dtype,
             device=device,
+            coordinator=self._coordinator,
         )
 
     def _build_encoder(self, dtype: torch.dtype) -> LTXGemmaTextEncoder:
@@ -147,7 +161,7 @@ class AccelerateGemmaBuilder(BuilderProtocol):
                     "registry must outlive the builder."
                 )
             encoder = cached_model  # type: ignore[assignment]
-            encoder.model.load_state_dict(cached_sd.sd, strict=False, assign=True)
+            assign_state_dict(encoder.model, cached_sd.sd)
             encoder.dtype = dtype
             return encoder
 

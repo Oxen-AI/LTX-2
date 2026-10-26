@@ -105,18 +105,12 @@ class VideoLatentPatchifier(Patchifier):
         # Shape becomes (3, grid_f, grid_h, grid_w)
         patch_starts = torch.stack(grid_coords, dim=0)
 
-        # Create a tensor containing the size of a single patch:
-        # (frame_patch_size, height_patch_size, width_patch_size).
-        # Reshape to (3, 1, 1, 1) to enable broadcasting when adding to the start coordinates.
-        patch_size_delta = torch.tensor(
-            self._patch_size,
-            device=patch_starts.device,
-            dtype=patch_starts.dtype,
-        ).view(3, 1, 1, 1)
-
-        # Calculate end coordinates: start + patch_size
+        # Calculate end coordinates: start + patch_size, per axis with Python-int patch sizes so
+        # no host-built tensor is copied to the device.
         # Shape becomes (3, grid_f, grid_h, grid_w)
-        patch_ends = patch_starts + patch_size_delta
+        patch_ends = torch.stack(
+            [start + size for start, size in zip(grid_coords, self._patch_size, strict=True)], dim=0
+        )
 
         # Stack start and end coordinates together along the last dimension
         # Shape becomes (3, grid_f, grid_h, grid_w, 2), where the last dimension is [start, end]
@@ -150,18 +144,17 @@ def get_pixel_coords(
         causal_fix: When True, rewrites the temporal axis of the first frame so causal VAEs
             that treat frame zero differently still yield non-negative timestamps.
     """
-    # Broadcast the VAE scale factors so they align with the `(batch, axis, patch, bound)` layout.
-    # Axis 1 of `latent_coords` is ordered (frame/time, height, width) — match that explicitly by
-    # pulling fields from the NamedTuple rather than relying on tuple iteration order.
-    broadcast_shape = [1] * latent_coords.ndim
-    broadcast_shape[1] = -1  # axis dimension corresponds to (frame/time, height, width)
-    scale_tensor = torch.tensor(
-        [scale_factors.time, scale_factors.height, scale_factors.width],
-        device=latent_coords.device,
-    ).view(*broadcast_shape)
-
-    # Apply per-axis scaling to convert latent bounds into pixel-space coordinates.
-    pixel_coords = latent_coords * scale_tensor
+    # Axis 1 of `latent_coords` is ordered (frame/time, height, width) -- match that explicitly by
+    # pulling fields from the NamedTuple rather than relying on tuple iteration order. The factors
+    # stay Python ints: a host-built factor tensor would be a blocking copy to the device.
+    pixel_coords = torch.stack(
+        [
+            latent_coords[:, 0] * scale_factors.time,
+            latent_coords[:, 1] * scale_factors.height,
+            latent_coords[:, 2] * scale_factors.width,
+        ],
+        dim=1,
+    )
 
     if causal_fix:
         # VAE temporal stride for the very first frame is 1 instead of `scale_factors.time`.

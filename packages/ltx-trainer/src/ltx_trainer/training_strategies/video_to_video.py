@@ -11,7 +11,7 @@ import torch
 from pydantic import Field
 from torch import Tensor
 
-from ltx_core.model.transformer.modality import Modality
+from ltx_core.model.transformer.modality import Modality, TokenTimesteps
 from ltx_trainer import logger
 from ltx_trainer.timestep_samplers import TimestepSampler
 from ltx_trainer.training_strategies.base_strategy import (
@@ -208,7 +208,7 @@ class VideoToVideoStrategy(TrainingStrategy):
             enabled=True,
             latent=combined_latents,
             sigma=sigmas,
-            timesteps=timesteps,
+            timesteps=TokenTimesteps(timesteps),
             positions=positions,
             context=prompt_embeds,
             context_mask=prompt_attention_mask,

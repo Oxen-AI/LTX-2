@@ -7,6 +7,7 @@ TMA/UMMA helpers can stay focused. Constants: :mod:`ltx_kernels.vae.fna_types`.
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.nvgpu import cpasync
 
 from ltx_kernels.vae.fna_types import ACC, HD, IO, VEC, VEC_ROWS, M
 
@@ -27,8 +28,11 @@ def _fill_a_chunk(sA, row, vals, c0, n):
     """Write ``vals`` into channels ``[c0, c0+n)`` of A-operand row ``row``.
     ``c0`` and ``n`` must be compile-time and multiples of ``_KRUN``: a dynamic
     coordinate loses the slice's static alignment and ``autovec_copy`` falls back to
-    scalar stores. That is why callers spell the warpgroup split as a constexpr loop
-    over ``g`` guarded by ``wg == g`` rather than as an arithmetic offset.
+    scalar stores. A runtime offset that is a whole K-stage -- a warpgroup's chunk, a
+    head, a loop-carried chunk index -- goes into the view instead (:func:`_alias` with
+    a runtime ``off``), so ``c0`` stays static. A sub-stage split, such as a
+    ``HEAD_COLS`` half of a head, still needs a constexpr loop over ``g`` guarded by
+    ``wg == g``.
     """
     frag = cute.make_rmem_tensor(cute.make_layout(_KRUN), IO)
     for k in range(n // _KRUN):
@@ -172,6 +176,39 @@ def _store_v_row(frag, sV, key, st_off):
     cute.autovec_copy(frag, sV[((None, key % 64 % 16), 0, key % 64 // 16, st_off + key // 64)])
 
 
+# Cooperative cp.async staging of a KV tile: four lanes per key row, one ``_KRUN`` (32 B) each,
+# so a warp moves eight whole 128 B rows per instruction pair and no lane holds a row in
+# registers. A run goes as its two 16 B halves -- cp.async's widest -- split with
+# ``zipped_divide``, the form that stays correct on the swizzled operand.
+_CP_LANES_PER_ROW = HD // _KRUN
+_CP_ROWS_PER_PASS = M // _CP_LANES_PER_ROW
+_CP_HALF = _KRUN // 2
+
+
+def _cp_kv_rows(src, base, rowtab, tab, kvrm, dst, st, lane, v_major: bool):
+    """``cp.async`` one head's ``M`` key rows of a KV tile into a K or V operand stage.
+    ``rowtab[tab, key]`` is the source row of key ``key`` (see ``panel_key_row``), so a lane
+    copies rows other lanes own. ``v_major`` picks the MN-major V layout over K-major K.
+    The copies join the thread's open cp.async group; the caller commits and waits.
+    """
+    atom = cute.make_copy_atom(cpasync.CopyG2SOp(), IO, num_bits_per_copy=_CP_HALF * 16)
+    run = lane % _CP_LANES_PER_ROW
+    for p in range(M // _CP_ROWS_PER_PASS):
+        key = p * _CP_ROWS_PER_PASS + lane // _CP_LANES_PER_ROW
+        row = base + rowtab[tab, key] * kvrm
+        if v_major:
+            krow = dst[((None, key % 64 % 16), 0, key % 64 // 16, st + key // 64)]
+            drun = cute.zipped_divide(krow, cute.make_layout(_KRUN))[None, run]
+        else:
+            drun = dst[((key, None), 0, run, st)]
+        halves = cute.zipped_divide(drun, cute.make_layout(_CP_HALF))
+        for h in range(_KRUN // _CP_HALF):
+            src_half = cute.make_tensor(
+                _row_vec_ptr(src, row, run * _KRUN + h * _CP_HALF, HD), cute.make_layout(_CP_HALF)
+            )
+            cute.copy(atom, src_half, halves[None, h])
+
+
 def _store_head_row(dst, row, vals, n=HD, c0: int = 0):
     """Write ``n`` accumulator values to ``dst[row, c0:c0+n]``, vectorised.
     ``dst`` rows are always ``HD`` wide; ``c0``/``n`` let a warpgroup that owns only
@@ -187,14 +224,18 @@ def _store_head_row(dst, row, vals, n=HD, c0: int = 0):
         )
 
 
-def _alias(buf, layout, off: int = 0):
+def _alias(buf, layout, off=0):
     """A UMMA-operand view over ``buf``'s storage, ``off`` elements in.
     tcgen05 wants the swizzle on the pointer rather than folded into the layout, so
     the composed layout is split apart here the way ``SmemAllocator.allocate_tensor``
     would have done it. Re-asserting the alignment matters: adding an offset drops a
     pointer's static alignment and a swizzled operand needs its 128 bytes back.
+    ``buf`` must be raw (unswizzled) storage. ``off`` may be a runtime value, and must
+    then be a whole number of K-stages (``M * TILE_K`` elements): the swizzle only
+    permutes address bits below a stage, so the shifted view swizzles exactly like the
+    unshifted one and its stage ``s`` is the unshifted view's stage ``s + off / (M * TILE_K)``.
     """
-    ptr = buf.iterator if off == 0 else (buf.iterator + off).align(128)
+    ptr = buf.iterator if isinstance(off, int) and off == 0 else (buf.iterator + off).align(128)
     return cute.make_tensor(cute.recast_ptr(ptr, layout.inner, dtype=IO), layout.outer)
 
 

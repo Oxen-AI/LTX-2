@@ -1,7 +1,8 @@
-"""Store-based broadcast signaling between the relay rank and workers.
+"""Store-based broadcast signaling between a driver rank and workers.
 Workers poll an incrementing counter in the process group's store instead of
-blocking directly on a collective, so an idle fleet doesn't trip the NCCL
-watchdog timeout while waiting for the next job.
+blocking directly on a collective. An idle worker therefore neither trips the
+NCCL watchdog timeout nor keeps an NCCL receive kernel spinning on its GPU
+while the driver is still producing what it will broadcast.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ import torch.distributed as dist
 
 
 class BroadcastCoordinator:
-    """Coordinates broadcast signaling between the relay and workers via a distributed store.
+    """Coordinates broadcast signaling between the driver and workers via a distributed store.
     Uses an incrementing counter to signal when a broadcast is ready. Workers
     poll for counter changes to avoid NCCL timeout issues during idle periods.
     The counter wraps at a large value to prevent overflow.
@@ -24,7 +25,7 @@ class BroadcastCoordinator:
         """Initialize the broadcast coordinator.
         Args:
             store: Distributed store (TCPStore, PrefixStore, etc.) for coordination across ranks.
-            is_driver: Whether this rank is the relay (signals broadcasts).
+            is_driver: Whether this rank is the driver (signals broadcasts).
         """
         self.store = store
         self.is_driver = is_driver
@@ -45,23 +46,36 @@ class BroadcastCoordinator:
         Raises:
             RuntimeError: If called on a non-driver rank.
         """
-        if not self.is_driver:
-            raise RuntimeError("broadcast_context can only be called on driver rank")
-        self.signal = (self.signal + 1) % self.signal_max
-        self.store.set(self.broadcast_key, str(self.signal))
+        self.notify()
         yield
 
-    def wait_for_signal_change(self, poll_interval: float = 0.01) -> None:
-        """Wait until the signal changes from the last seen value (worker only).
+    def notify(self) -> None:
+        """Increment the signal counter so workers waiting on it proceed (driver only).
+        Raises:
+            RuntimeError: If called on a non-driver rank.
+        """
+        if not self.is_driver:
+            raise RuntimeError("only the driver rank can signal a broadcast")
+        self.signal = (self.signal + 1) % self.signal_max
+        self.store.set(self.broadcast_key, str(self.signal))
+
+    def wait_for_signal_change(self, poll_interval: float = 0.01, timeout: float | None = None) -> None:
+        """Wait for the driver's next signal (worker only).
+        Each call consumes exactly one signal. If the driver has signaled several times since
+        the previous call, this returns at once and the next call consumes the next signal, so
+        a worker that polls late never skips one.
         Args:
             poll_interval: Seconds to sleep between polls (default: 0.01).
+            timeout: Seconds to wait before raising; ``None`` waits indefinitely.
+        Raises:
+            TimeoutError: If no new signal arrives within ``timeout``.
         """
-        while True:
-            current = self.get_current_signal()
-            if current != self.last_seen_signal:
-                self.last_seen_signal = current
-                return
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.get_current_signal() == self.last_seen_signal:
+            if deadline is not None and time.monotonic() > deadline:
+                raise TimeoutError(f"no broadcast signal from the driver within {timeout} s")
             time.sleep(poll_interval)
+        self.last_seen_signal = (self.last_seen_signal + 1) % self.signal_max
 
     def get_current_signal(self) -> int:
         """Get the current signal value from the store."""

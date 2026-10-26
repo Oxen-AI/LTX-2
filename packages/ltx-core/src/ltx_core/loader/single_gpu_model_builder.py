@@ -9,11 +9,13 @@ from torch import nn
 
 from ltx_core.loader.fuse_loras import FuseRule, apply_loras, bf16_fuse_rule
 from ltx_core.loader.helpers import (
+    LazyModelMetadata,
     as_path_list,
+    assign_state_dict,
     create_meta_model,
     load_state_dict,
-    read_model_config,
-    read_model_metadata,
+    module_tensors,
+    to_device,
 )
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import (
@@ -37,6 +39,8 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 def _check_uninitialized(model: nn.Module) -> list[str]:
     """Return names of any parameters/buffers still on meta device."""
+    if not any(t.is_meta for t in module_tensors(model)):
+        return []
     names = []
     for name, param in model.named_parameters():
         if str(param.device) == "meta":
@@ -95,7 +99,7 @@ def _load_model_weights(
         sd = model_sd.sd
         if dtype is not None:
             sd = _cast_floating_sd(sd, dtype)
-        meta_model.load_state_dict(sd, strict=False, assign=True)
+        assign_state_dict(meta_model, sd)
         return
 
     lora_state_dicts = [load_state_dict([lora.path], loader, registry, lora_load_device, lora.sd_ops) for lora in loras]
@@ -116,7 +120,7 @@ def _load_model_weights(
     fused_sd = final_sd.sd
     if dtype is not None:
         fused_sd = _cast_floating_sd(fused_sd, dtype)
-    meta_model.load_state_dict(fused_sd, strict=False, assign=True)
+    assign_state_dict(meta_model, fused_sd)
 
 
 class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType], LoRAAdaptableProtocol):
@@ -164,6 +168,7 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         self._registry = registry if registry is not None else ModelRegistry(cache_models=True, cache_weights=False)
         self._lora_load_device = lora_load_device if lora_load_device is not None else torch.device("cpu")
         self._fuse_rule = fuse_rule
+        self._metadata = LazyModelMetadata(model_path, self._model_loader)
 
     @property
     def model_sd_ops(self) -> SDOps | None:
@@ -184,6 +189,10 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     @property
     def keeps_gpu_resident_weights(self) -> bool:
         # Registry may retain a CPU SD; each build H2Ds into fresh GPU storages.
+        return False
+
+    @property
+    def builds_per_shape(self) -> bool:
         return False
 
     @property
@@ -242,10 +251,10 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         return clone
 
     def model_config(self) -> dict:
-        return read_model_config(self._model_path, self._model_loader)
+        return self.model_metadata().get("config", {})
 
     def model_metadata(self) -> dict:
-        return read_model_metadata(self._model_path, self._model_loader)
+        return self._metadata.get()
 
     def meta_model(self, metadata: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:
         struct_key = module_registry_key(
@@ -291,4 +300,4 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         if uninitialized:
             logger.warning(f"Uninitialized parameters or buffers: {uninitialized}")
             return meta_model
-        return meta_model.to(device)
+        return to_device(meta_model, device)

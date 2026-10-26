@@ -24,9 +24,11 @@ import torch
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 
-from ltx_kernels.vae.fna_gemm import _mma_issue, _tmem_load, _tmem_store
+from ltx_kernels.vae.fna_gemm import _mma_issue, _tmem_load, _tmem_shift, _tmem_store
 from ltx_kernels.vae.fna_geometry import at_most, flatten_3d, unflatten_3d
 from ltx_kernels.vae.fna_smem import (
+    _alias,
+    _cp_kv_rows,
     _fill_a_chunk,
     _load_head_row,
     _publish_smem,
@@ -41,6 +43,7 @@ from ltx_kernels.vae.fna_types import (
     LOG2E,
     NUM_WARPGROUPS,
     THREADS,
+    TILE_K,
     WARPGROUPS_PER_HEAD,
     M,
 )
@@ -338,13 +341,20 @@ def attention_tile(
     NKV: cutlass.Constexpr,
     sel=None,
     window_hi=None,
+    rowtab=None,
+    copy_bars=None,
 ):
     """Windowed NA over one query tile's halo panel, for ``NHG`` heads.
     Args:
         frags: ``(frQ, frK, frP, frV)`` -- the four MMA operand fragments.
-        smem: ``(sK, sV, sP)`` -- K and V double-buffered, P single.
+        smem: ``(sK, sV, sP_own)`` -- K and V double-buffered, and this warpgroup's view
+            of the single P buffer: ``sP`` shifted by ``wg`` K-stages
+            (:func:`~ltx_kernels.vae.fna_smem._alias`), so the P fill is one copy for every
+            warpgroup.
         acc_qk: two TMEM Q@K accumulators; the pipeline alternates between them.
-        acc_o: ``NHG`` TMEM attention-output accumulators, live for the whole loop.
+        acc_o: ``NHG`` TMEM attention-output accumulators, live for the whole loop. They
+            must be ``HD`` columns apart: the head loop reaches head ``nh``'s as
+            ``acc_o[0]`` shifted by ``nh * HD``.
         bars: ``(qkbar, pvbar)`` MMA completion barriers, re-initialised per tile.
         m_sm: ``[lane, nh]`` fixed softmax offsets, from the caller's ``||q||`` pass.
         l_sm: ``[lane, wg, nh]`` softmax denominators, accumulated per warpgroup.
@@ -372,6 +382,14 @@ def attention_tile(
             ``None`` is NATTEN's inward shift, ``[lt0, lt0 + kt)`` etc., and traces to the
             byte-identical pre-keyframe code. The two agree only in the interior, so the
             choice belongs to the caller's operator, not to this function.
+        rowtab: optional ``(2, M)`` Int32 SMEM table. Given, K/V tiles go global -> SMEM by
+            cooperative ``cp.async`` (:func:`~ltx_kernels.vae.fna_smem._cp_kv_rows`) instead of
+            through ``kvfrag``: each lane publishes its key's source row in the table, a step
+            ahead, and the copy of step ``s+2``'s K (``s+1``'s V) is issued as soon as its
+            buffer frees. ``None`` traces the register path.
+        copy_bars: with ``rowtab``, three SMEM mbarriers -- ``K full`` per buffer and
+            ``P/V full`` -- that replace the two CTA barriers per step: the threads that
+            wrote an operand fence and arrive, and only the MMA-issuing warp waits.
     A keyframe tail is this same call with ``PT=1`` and ``kt=1``: ``panel_key_row`` then
     reduces to ``flatten_3d(plane, ...)`` and the mask's ``rdt`` test to ``0 <= 0 < 1``, so
     a spatial-only window over one keyframe plane needs no separate code. Because the
@@ -385,9 +403,10 @@ def attention_tile(
     for *its own* Q@K, issued a whole step earlier, and before returning it issues
     P@V(s) and Q@K(s+1) and stages step s+1's K/V row into the other SMEM buffer. So
     a step's source read, its P@V and the next step's Q@K all run underneath the
-    current softmax, and only the softmax is on the critical path. Both buffer
-    indices are ``nh % 2``, compile-time because ``NHG`` is even, which keeps every
-    SMEM slice statically aligned and every barrier phase constant.
+    current softmax, and only the softmax is on the critical path. The heads are walked
+    a pair at a time by a device loop, and both buffer indices are the head's place in
+    its pair -- compile-time, because ``NHG`` is even -- which keeps every SMEM slice
+    statically aligned.
     K and V are staged by warpgroups 0 and 1 respectively -- two arms of the same
     ``wg`` test, which costs nothing (the arms already diverge at the store, K being
     K-major and V MN-major) and lets the NA caller pass its own two tensors. A
@@ -395,7 +414,7 @@ def attention_tile(
     NVVM backend, not the frontend.
     """
     frQ, frK, frP, frV = frags
-    sK, sV, sP = smem
+    sK, sV, sP_own = smem
     qkbar, pvbar = bars
     k_src, v_src = kv_src
     k_base, v_base = kv_base
@@ -417,18 +436,41 @@ def attention_tile(
     # Re-initialised per query tile: each barrier then sees exactly ``2 * NKV`` waits
     # in the loop (plus one after it for barrier 0, which retires the pipeline's
     # trailing Q@K), so the phase a given ``nh`` waits on never depends on ``kv``.
+    # Every warp must have finished polling the previous tile's barriers before warp 0
+    # resets them: a warp still waiting on a re-initialised barrier never sees the phase
+    # it expects, and the persistent grid spins forever.
+    cute.arch.sync_threads()
     if warp_i == 0:
         with cute.arch.elect_one():
             cute.arch.mbarrier_init(qkbar.iterator, 1)
             cute.arch.mbarrier_init(qkbar.iterator + 1, 1)
             cute.arch.mbarrier_init(pvbar.iterator, 1)
+            if cutlass.const_expr(copy_bars is not None):
+                cute.arch.mbarrier_init(copy_bars.iterator, THREADS // 2)
+                cute.arch.mbarrier_init(copy_bars.iterator + 1, THREADS // 2)
+                cute.arch.mbarrier_init(copy_bars.iterator + 2, THREADS)
     cute.arch.mbarrier_init_fence()
     cute.arch.sync_threads()
 
     key_row = panel_key_row(0, lane, panel, N_KEYS, PANEL_HW, PW)
+    if cutlass.const_expr(rowtab is not None):
+        # Prologue: K of steps 0 and 1 and V of step 0 in flight, step 0's landed.
+        rowtab[0, lane] = key_row
+        rowtab[1, lane] = panel_key_row(1, lane, panel, N_KEYS, PANEL_HW, PW)
+        cute.arch.sync_threads()
+        if wg == 0:
+            _cp_kv_rows(k_src, k_base, rowtab, 0, KVRM, sK, 0, lane, False)
+            cute.arch.cp_async_commit_group()
+            _cp_kv_rows(k_src, k_base + kv_hstride, rowtab, 0, KVRM, sK, 1, lane, False)
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(1)
+        elif wg == 1:
+            _cp_kv_rows(v_src, v_base, rowtab, 0, KVRM, sV, 0, lane, True)
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
     # Prologue: fill buffer 0 with step (0, 0), leave step (0, 1) in registers, and
     # put Q@K(0, 0) in flight.
-    if wg == 0:
+    elif wg == 0:
         _load_head_row(k_src, k_base + key_row * KVRM, kvfrag)
         _store_k_row(kvfrag, sK, lane, 0)
         _load_head_row(k_src, k_base + kv_hstride + key_row * KVRM, kvfrag)
@@ -494,95 +536,159 @@ def attention_tile(
         # Whatever filled the K/V source wrote every panel token exactly once, so this
         # is a straight gather -- no per-query projection, norm or RoPE.
         next_key_row = panel_key_row(kv + 1, lane, panel, N_KEYS, PANEL_HW, PW)
-        for nh in cutlass.range_constexpr(NHG):
-            # Buffer this step owns, and the one the next step will own. ``kv`` is a
-            # runtime value -- the KV loop is a real device loop -- so the buffer
-            # index has to come from ``nh`` alone, which is what keeps every SMEM
-            # slice statically aligned. ``NHG`` is even, so ``nh % 2`` is the flat
-            # step's parity.
-            bf = nh % 2
-            nf = 1 - bf
-            # Wait phases. ``pvbar`` is waited once per step, so its phase is the step
-            # parity. ``qkbar[bf]`` is waited every second step, so its phase advances
-            # by ``NHG / 2`` per KV tile: a constant when that is even, one runtime
-            # AND when it is not.
-            qk_ph = (cutlass.Int32(kv) * (NHG // 2) + nh // 2) % 2
-            # Stage the *next* step's K, start the fetch two steps out, then issue the
-            # next step's Q@K -- all before touching this step's scores. That ordering
-            # is the point: Q@K(s+1) enters the MMA queue one full softmax before step
-            # s+1 waits on it, and the global load has a full step to land. Issuing it
-            # after the softmax measures within noise of no pipeline at all.
-            # sK[nf] currently holds K(s-1), whose Q@K was waited on last step, so it
-            # is free; sV[nf] is not, which is why V is staged further down, behind
-            # its own P@V barrier.
-            if wg == 0:
-                _store_k_row(kvfrag, sK, lane, nf)
-                if cutlass.const_expr(nh + 2 < NHG):
-                    _load_head_row(k_src, k_base + (nh + 2) * kv_hstride + key_row * KVRM, kvfrag)
+        # Defined on both paths: the staged regions below capture it even where it is unused.
+        tab = kv % 2
+        if cutlass.const_expr(rowtab is not None):
+            # Read first by step (kv, NHG-2)'s copy, which several barriers follow; the
+            # slot's previous rows (tile kv-1) were last read before this tile began.
+            rowtab[1 - tab, lane] = next_key_row
+            if cutlass.const_expr(copy_bars is not None):
+                # The per-step barriers are gone, so the table needs its own.
+                cute.arch.sync_threads()
+        # Heads go a pair at a time through a device loop, so the step body is traced once
+        # per buffer parity ``j`` rather than once per head. The runtime head reaches only
+        # source rows, ``m_sm``/``l_sm`` indices, the Q operand's stage and TMEM addresses;
+        # every SMEM slice index below is ``j`` or a constant, which keeps them statically
+        # aligned.
+        n_pairs = NHG // 2
+        for hp in cutlass.range(n_pairs):
+            # The look-ahead steps wrap into the next KV tile only from the last pair: their
+            # head drops by ``NHG`` and their key rows are the next tile's.
+            last = cutlass.Int32(1) if hp == n_pairs - 1 else cutlass.Int32(0)
+            ld_row = key_row + (next_key_row - key_row) * last
+            ld_tab = tab + (1 - 2 * tab) * last
+            for j in cutlass.range_constexpr(2):
+                nh = hp * 2 + j
+                # Buffer this step owns, and the one the next step will own. ``kv`` and ``hp``
+                # are runtime values, so the buffer index has to come from ``j`` alone; with
+                # ``NHG`` even, ``j`` is the flat step's parity.
+                bf = j
+                nf = 1 - bf
+                # Wait phases. ``pvbar`` is waited once per step, so its phase is the step
+                # parity. ``qkbar[bf]`` is waited every second step, so its phase advances
+                # by ``NHG / 2`` per KV tile and by one per pair.
+                qk_ph = (cutlass.Int32(kv) * n_pairs + hp) % 2
+                # Head of the step one out (its Q operand and, on the cp.async path, its V and
+                # the table slot that V's rows sit in) and of the step two out (its K, and its
+                # V on the register path).
+                if cutlass.const_expr(j == 0):
+                    next_head = nh + 1
+                    next_tab = tab
                 else:
-                    _load_head_row(k_src, k_base + (nh + 2 - NHG) * kv_hstride + next_key_row * KVRM, kvfrag)
-            _publish_smem()
-            _mma_issue("n128", frQ, frK, acc_qk[nf], 1, (nh + 1) % NHG, nf, False, qkbar.iterator + nf)
-            # Now wait for *this* step's Q@K, issued one step ago.
-            cute.arch.mbarrier_wait(qkbar.iterator + bf, qk_ph)
-            # P@V(s-1) has drained, which frees both sP and the V buffer this step is
-            # about to stage into. The wait sits here rather than after the
-            # exponentials, where it would have more slack: moving it down measures
-            # worse, because the V store has to follow it and the global load that
-            # follows the store then loses a whole exp loop of latency hiding.
-            cute.arch.mbarrier_wait(pvbar.iterator, bf)
-            if wg == 1:
-                _store_v_row(kvfrag, sV, lane, 2 * nf)
-                if cutlass.const_expr(nh + 2 < NHG):
-                    _load_head_row(v_src, v_base + (nh + 2) * kv_hstride + key_row * KVRM, kvfrag)
+                    next_head = nh + 1 - NHG * last
+                    next_tab = ld_tab
+                ld_head = nh + 2 - NHG * last
+                # Stage the *next* step's K, start the fetch two steps out, then issue the
+                # next step's Q@K -- all before touching this step's scores. That ordering
+                # is the point: Q@K(s+1) enters the MMA queue one full softmax before step
+                # s+1 waits on it, and the global load has a full step to land. Issuing it
+                # after the softmax measures within noise of no pipeline at all.
+                # sK[nf] currently holds K(s-1), whose Q@K was waited on last step, so it
+                # is free; sV[nf] is not, which is why V is staged further down, behind
+                # its own P@V barrier.
+                if cutlass.const_expr(rowtab is not None):
+                    # K(s+1) was issued a step ago, as soon as sK[nf] freed.
+                    if wg == 0:
+                        cute.arch.cp_async_wait_group(0)
+                        if cutlass.const_expr(copy_bars is not None):
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            cute.arch.mbarrier_arrive(copy_bars.iterator + nf)
+                elif wg == 0:
+                    _store_k_row(kvfrag, sK, lane, nf)
+                    _load_head_row(k_src, k_base + ld_head * kv_hstride + ld_row * KVRM, kvfrag)
+                if cutlass.const_expr(copy_bars is not None):
+                    if warp_i == 0:
+                        cute.arch.mbarrier_wait(copy_bars.iterator + nf, qk_ph)
                 else:
-                    _load_head_row(v_src, v_base + (nh + 2 - NHG) * kv_hstride + next_key_row * KVRM, kvfrag)
-            # Softmax over this warpgroup's ``ACC_COLS`` score columns against a *fixed*
-            # row offset (the caller put ``||q|| * max||k||`` in ``m_sm``). Nothing
-            # here crosses the warpgroup boundary: no max, no max reduction, no
-            # rescale of the O accumulator, no denominator reduction. That deletes two
-            # CTA-wide barriers and a TMEM read-modify-write from every one of the
-            # ``NKV * NHG`` steps.
-            m_new = m_sm[lane, nh]
-            # One TMEM read. The chunk index may be a runtime value here because a
-            # TMEM address is a register either way; only SMEM slices need constexpr.
-            _tmem_load(acc_qk[bf], lane, areg, wg)
-            cute.arch.fence_view_async_tmem_load()
-            # sP still has to be written for a fully masked group (P@V reads all ``M``
-            # columns), but zeroing is far cheaper than 32 exps.
-            # The group is 32 keys because **only a warp-uniform skip pays**: a warp
-            # shares ``qt``, so a group whose panel rows all sit outside the query's dt
-            # window is skipped by the whole warp. Finer groups skip more often on
-            # paper, but ``lw0`` varies across a warp's lanes, so both arms issue and
-            # only the extra tests are real -- measured 9% slower per nibble.
-            sm4 = [ACC(0.0) for _ in range(4)]
-            for hb in cutlass.range_constexpr(NBW):
-                bw = mask[hb]
-                if bw != 0:
-                    for e in cutlass.range_constexpr(32):
-                        # Masking the *score* rather than the exponential keeps the ex2
-                        # and the running sum unconditional, so the sum splits across
-                        # four accumulators too. ex2 of -1e30 underflows to +0, which
-                        # is the point.
-                        v = areg[hb * 32 + e] * LOG2E - m_new
-                        if (bw >> e) & 1 == 0:
-                            v = ACC(-1.0e30)
-                        p = cute.math.exp2(v, fastmath=True)
-                        areg[hb * 32 + e] = p
-                        sm4[e % 4] = sm4[e % 4] + p
+                    _publish_smem()
+                _mma_issue("n128", frQ, frK, acc_qk[nf], 1, next_head, nf, False, qkbar.iterator + nf)
+                # Now wait for *this* step's Q@K, issued one step ago.
+                cute.arch.mbarrier_wait(qkbar.iterator + bf, qk_ph)
+                if cutlass.const_expr(rowtab is not None):  # noqa: SIM102 -- a staged ``if`` cannot share a constexpr test
+                    # Q@K(s) is done with sK[bf]: start K(s+2) into it.
+                    if wg == 0:
+                        _cp_kv_rows(k_src, k_base + ld_head * kv_hstride, rowtab, ld_tab, KVRM, sK, bf, lane, False)
+                        cute.arch.cp_async_commit_group()
+                if cutlass.const_expr(rowtab is None):
+                    # P@V(s-1) has drained, which frees both sP and the V buffer this step is
+                    # about to stage into. The wait sits here rather than after the
+                    # exponentials, where it would have more slack: moving it down measures
+                    # worse, because the V store has to follow it and the global load that
+                    # follows the store then loses a whole exp loop of latency hiding.
+                    cute.arch.mbarrier_wait(pvbar.iterator, bf)
+                    if wg == 1:
+                        _store_v_row(kvfrag, sV, lane, 2 * nf)
+                        _load_head_row(v_src, v_base + ld_head * kv_hstride + ld_row * KVRM, kvfrag)
+                # Softmax over this warpgroup's ``ACC_COLS`` score columns against a *fixed*
+                # row offset (the caller put ``||q|| * max||k||`` in ``m_sm``). Nothing
+                # here crosses the warpgroup boundary: no max, no max reduction, no
+                # rescale of the O accumulator, no denominator reduction. That deletes two
+                # CTA-wide barriers and a TMEM read-modify-write from every one of the
+                # ``NKV * NHG`` steps.
+                m_new = m_sm[lane, nh]
+                # One TMEM read. The chunk index may be a runtime value here because a
+                # TMEM address is a register either way; only SMEM slices need constexpr.
+                _tmem_load(acc_qk[bf], lane, areg, wg)
+                cute.arch.fence_view_async_tmem_load()
+                # sP still has to be written for a fully masked group (P@V reads all ``M``
+                # columns), but zeroing is far cheaper than 32 exps.
+                # The group is 32 keys because **only a warp-uniform skip pays**: a warp
+                # shares ``qt``, so a group whose panel rows all sit outside the query's dt
+                # window is skipped by the whole warp. Finer groups skip more often on
+                # paper, but ``lw0`` varies across a warp's lanes, so both arms issue and
+                # only the extra tests are real -- measured 9% slower per nibble.
+                sm4 = [ACC(0.0) for _ in range(4)]
+                for hb in cutlass.range_constexpr(NBW):
+                    bw = mask[hb]
+                    if bw != 0:
+                        for e in cutlass.range_constexpr(32):
+                            # Masking the *score* rather than the exponential keeps the ex2
+                            # and the running sum unconditional, so the sum splits across
+                            # four accumulators too. ex2 of -1e30 underflows to +0, which
+                            # is the point.
+                            v = areg[hb * 32 + e] * LOG2E - m_new
+                            if (bw >> e) & 1 == 0:
+                                v = ACC(-1.0e30)
+                            p = cute.math.exp2(v, fastmath=True)
+                            areg[hb * 32 + e] = p
+                            sm4[e % 4] = sm4[e % 4] + p
+                    else:
+                        for e in cutlass.range_constexpr(32):
+                            areg[hb * 32 + e] = ACC(0.0)
+                l_sm[lane, wg, nh] = l_sm[lane, wg, nh] + ((sm4[0] + sm4[1]) + (sm4[2] + sm4[3]))
+                if cutlass.const_expr(rowtab is not None):
+                    # P@V(s-1) still reads sP and V(s-1)'s buffer; its remaining time overlapped
+                    # the exponentials above. Then V(s+1) can start into the freed buffer.
+                    cute.arch.mbarrier_wait(pvbar.iterator, bf)
+                    if wg == 1:
+                        _cp_kv_rows(
+                            v_src, v_base + next_head * kv_hstride, rowtab, next_tab, KVRM, sV, 2 * nf, lane, True
+                        )
+                        cute.arch.cp_async_commit_group()
+                # Stage 0 of the shifted view is this warpgroup's own ``ACC_COLS`` chunk of sP.
+                _fill_a_chunk(sP_own, lane, areg, 0, ACC_COLS)
+                if cutlass.const_expr(rowtab is not None):  # noqa: SIM102 -- a staged ``if`` cannot share a constexpr test
+                    # V(s) was issued a step ago; V(s+1), issued above, may still be in flight.
+                    if wg == 1:
+                        cute.arch.cp_async_wait_group(1)
+                if cutlass.const_expr(copy_bars is not None):
+                    # Every thread wrote its P row (and wg1 its V copies): fence, count in, and
+                    # let only the issuing warp wait.
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.mbarrier_arrive(copy_bars.iterator + 2)
+                    if warp_i == 0:
+                        cute.arch.mbarrier_wait(copy_bars.iterator + 2, bf)
                 else:
-                    for e in cutlass.range_constexpr(32):
-                        areg[hb * 32 + e] = ACC(0.0)
-            l_sm[lane, wg, nh] = l_sm[lane, wg, nh] + ((sm4[0] + sm4[1]) + (sm4[2] + sm4[3]))
-            for g in cutlass.range_constexpr(NUM_WARPGROUPS):
-                if wg == g:
-                    _fill_a_chunk(sP, lane, areg, g * ACC_COLS, ACC_COLS)
-            # Publishes sP for the P@V below and the V buffer for the next step's.
-            _publish_smem()
-            _mma_issue("pv", frP, frV, acc_o[nh], 2, 0, 2 * bf, True, pvbar.iterator)
+                    # Publishes sP for the P@V below and the V buffer for the next step's.
+                    _publish_smem()
+                _mma_issue("pv", frP, frV, _tmem_shift(acc_o[0], nh * HD), 2, 0, 2 * bf, True, pvbar.iterator)
         key_row = next_key_row
         kv += 1
 
+    if cutlass.const_expr(rowtab is not None):
+        # The look-ahead copies past the last step land in buffers nothing reads; they still
+        # have to finish before the caller reuses the pool.
+        cute.arch.cp_async_wait_group(0)
     # Retire the pipeline. P@V is the last MMA of the last step, so its barrier proves
     # every accumulator is final -- and, being issued after it, that the trailing
     # Q@K's commit has landed too, which is what makes re-initialising the barriers
@@ -591,13 +697,15 @@ def attention_tile(
 
 
 @cute.jit
-def attn_epilogue(acc_o, l_sm, oreg, sO, lane, wg, NHG: cutlass.Constexpr):
-    """Divide the attention accumulators by the denominator, into ``sO``.
-    ``sO`` is an A-operand-shaped SMEM buffer whose channel ``nh * HD + d`` is head
-    ``nh``'s output: the fused kernel hands it ``sA`` and feeds the out-projection
-    straight from it, the NA kernel hands it a buffer it then scatters to global.
+def attn_epilogue(acc_o, l_sm, oreg, o_buf, o_layout, lane, wg, NHG: cutlass.Constexpr):
+    """Divide the attention accumulators by the denominator, into the operand ``sO``.
+    ``sO`` is the A-operand view ``o_layout`` over the raw storage ``o_buf``, and its
+    channel ``nh * HD + d`` is head ``nh``'s output: the fused kernel hands it ``sA`` and
+    feeds the out-projection straight from it, the NA kernel hands it a buffer it then
+    scatters to global. ``HD`` is one K-stage, so the device head loop reaches head
+    ``nh`` through a view shifted ``nh`` stages and every slice coordinate stays static.
     """
-    for nh in cutlass.range_constexpr(NHG):
+    for nh in cutlass.range(NHG):
         # Each warpgroup summed its own slice of every score row.
         lden = l_sm[lane, 0, nh]
         for g in cutlass.range_constexpr(1, NUM_WARPGROUPS):
@@ -605,12 +713,15 @@ def attn_epilogue(acc_o, l_sm, oreg, sO, lane, wg, NHG: cutlass.Constexpr):
         linv = ACC(0.0)
         if lden > ACC(0.0):
             linv = cute.arch.rcp_approx(lden)
+        _tmem_load(_tmem_shift(acc_o[0], nh * HD), lane, oreg, wg, HEAD_COLS)
+        for d in cutlass.range_constexpr(HEAD_COLS):
+            oreg[d] = oreg[d] * linv
+        s_head = _alias(o_buf, o_layout, nh * (M * TILE_K))
+        # A ``HEAD_COLS`` chunk is half a stage, not a whole one, so the warpgroup split
+        # stays a constexpr arm here.
         for g in cutlass.range_constexpr(NUM_WARPGROUPS):
             if wg == g:
-                _tmem_load(acc_o[nh], lane, oreg, g, HEAD_COLS)
-                for d in cutlass.range_constexpr(HEAD_COLS):
-                    oreg[d] = oreg[d] * linv
-                _fill_a_chunk(sO, lane, oreg, nh * HD + g * HEAD_COLS, HEAD_COLS)
+                _fill_a_chunk(s_head, lane, oreg, g * HEAD_COLS, HEAD_COLS)
 
 
 @cute.jit
@@ -619,9 +730,7 @@ def attn_zero_accumulators(acc_o, l_sm, oreg, lane, wg, NHG: cutlass.Constexpr):
     for d in cutlass.range_constexpr(HEAD_COLS):
         oreg[d] = ACC(0.0)
     for nh in cutlass.range_constexpr(NHG):
-        for g in cutlass.range_constexpr(NUM_WARPGROUPS):
-            if wg == g:
-                _tmem_store(acc_o[nh], lane, oreg, g, HEAD_COLS)
+        _tmem_store(acc_o[nh], lane, oreg, wg, HEAD_COLS)
         l_sm[lane, wg, nh] = ACC(0.0)
     cute.arch.fence_view_async_tmem_store()
     cute.arch.sync_threads()

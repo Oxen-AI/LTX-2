@@ -1,4 +1,4 @@
-"""HDR colour-space policy for pipelines (``HDRColorSpace`` + resolve helpers)."""
+"""EXR colour-space policy for pipelines."""
 
 from __future__ import annotations
 
@@ -7,17 +7,14 @@ from collections.abc import Iterable
 from pathlib import Path
 
 import torch
+from torch import Tensor
 
 from ltx_core.color.primaries import Primaries
-from ltx_core.hdr import HDRTransfer
+from ltx_core.hdr import srgb_eotf_to_linear, to_acescct_working_space, to_hdr_linear
 
 
-class HDRColorSpace(enum.Enum):
-    """Explicit HDR source / working colour space (CLI ``--hdr``).
-    ``None`` at call sites means SDR. Members:
-    * ``SRGB_LINEAR`` / ``ACESCG`` — scene-linear; compress via ACEScct on load.
-    * ``ACESCCT`` — already ACEScct log working codes; no load-time transfer.
-    """
+class EXRColorSpace(enum.Enum):
+    """Colour space of an EXR plate."""
 
     SRGB_LINEAR = "srgb_linear"
     ACESCG = "acescg"
@@ -26,42 +23,37 @@ class HDRColorSpace(enum.Enum):
     @property
     def is_log_working(self) -> bool:
         """True when the VAE signal is already ACEScct log (no load-time transfer)."""
-        return self is HDRColorSpace.ACESCCT
+        return self is EXRColorSpace.ACESCCT
 
     @property
     def source_primaries(self) -> Primaries:
         match self:
-            case HDRColorSpace.ACESCG | HDRColorSpace.ACESCCT:
-                return Primaries.ACESCG
+            case EXRColorSpace.ACESCG | EXRColorSpace.ACESCCT:
+                return Primaries.AP1
             case _:
                 return Primaries.REC709
 
-    @property
-    def transfer(self) -> HDRTransfer:
-        """Curve for the VAE working space (always defined; today always ACEScct).
-        Whether to *apply* it depends on the call site:
-        * load — compress only when not :attr:`is_log_working`
-        * EXR write — decompress only when writing linear EXR
-        * HLG — always decompress to Rec.709 linear
-        """
-        match self:
-            case HDRColorSpace.SRGB_LINEAR | HDRColorSpace.ACESCG | HDRColorSpace.ACESCCT:
-                return HDRTransfer.ACESCCT
-            case _:
-                raise ValueError(f"No transfer defined for {self!r}.")
 
-    def exr_output_tags(self) -> tuple[Primaries, str]:
-        """``(primaries, colorSpace_tag)`` for :func:`save_exr_tensor`."""
-        match self:
-            case HDRColorSpace.ACESCCT:
-                return Primaries.ACESCG, "ACEScct"
-            case HDRColorSpace.ACESCG:
-                return Primaries.ACESCG, "ACEScg"
-            case HDRColorSpace.SRGB_LINEAR:
-                return Primaries.REC709, "sRGB"
+def to_working_space(video: Tensor, current_colorspace: EXRColorSpace) -> Tensor:
+    """Map HDR float RGB of ``current_colorspace`` into ACEScct ``[0, 1]`` (channel-first)."""
+    if current_colorspace.is_log_working:
+        return video.float().clamp(0.0, 1.0)
+    return to_acescct_working_space(video.float(), source_primaries=current_colorspace.source_primaries)
 
 
-def vae_dtype_for_hdr(hdr: HDRColorSpace | None, default: torch.dtype) -> torch.dtype:
+def srgb_to_acescct(video: Tensor, *, gamma_encoded: bool) -> Tensor:
+    """Rec.709 float RGB → ACEScct ``[0, 1]``. ``gamma_encoded`` applies the sRGB EOTF first."""
+    if not video.is_floating_point():
+        raise ValueError(
+            f"srgb_to_acescct expects float RGB; got dtype={video.dtype}. Normalize integer pixels before calling."
+        )
+    video = video.float()
+    if gamma_encoded:
+        video = srgb_eotf_to_linear(video)
+    return to_acescct_working_space(video, source_primaries=Primaries.REC709)
+
+
+def vae_dtype_for_hdr(hdr: EXRColorSpace | None, default: torch.dtype) -> torch.dtype:
     """VAE decode dtype: float32 for HDR, else ``default`` (pipelines use bf16 today)."""
     return torch.float32 if hdr is not None else default
 
@@ -82,8 +74,8 @@ def _has_exr_input(
 def resolve_hdr_color_space(
     images: Iterable[object] = (),
     video_paths: Iterable[str | Path] = (),
-    hdr: HDRColorSpace | None = None,
-) -> HDRColorSpace | None:
+    hdr: EXRColorSpace | None = None,
+) -> EXRColorSpace | None:
     """Return the explicit ``--hdr`` value, or raise if EXR inputs lack it.
     ``None`` means SDR.
     """
@@ -94,10 +86,9 @@ def resolve_hdr_color_space(
 
 def decode_hdr_video(
     decoded_video: torch.Tensor,
-    transfer: HDRTransfer,
     out_primaries: Primaries = Primaries.REC709,
 ) -> torch.Tensor:
-    """VAE decode ``[F,H,W,C]`` in ``[0,1]`` → scene-linear HDR float32."""
+    """VAE decode ``[F,H,W,C]`` in ``[0,1]`` ACEScct → scene-linear HDR float32."""
     video = decoded_video.float().permute(3, 0, 1, 2).unsqueeze(0)
-    hdr = transfer.to_linear(video, out_primaries=out_primaries)
+    hdr = to_hdr_linear(video, out_primaries=out_primaries)
     return hdr[0].permute(1, 2, 3, 0).contiguous()

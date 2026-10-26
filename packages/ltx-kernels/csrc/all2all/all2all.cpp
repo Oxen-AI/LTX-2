@@ -61,12 +61,8 @@ All2All::All2All(int rank, int world_size, int num_tokens, int hidden_dim, int n
 
   // Calculate sizes for each region of the shared memory block
   int64_t ptrs_bytes = MAX_NUM_PEERS * sizeof(void *);
-  int64_t barrier_signal_bytes = MAX_NUM_PEERS * sizeof(int);
+  int64_t barrier_signal_bytes = kNumSignalSlots * sizeof(int);
   int64_t barrier_signal_ptrs_bytes = MAX_NUM_PEERS * sizeof(int *);
-
-  // Allocate GPU memory for token count arrays (used by kernels)
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&rank_tokens_gpu), sizeof(int) * MAX_NUM_PEERS));
-  CUDA_CHECK(cudaMalloc(reinterpret_cast<void **>(&prefix_rank_tokens_gpu), sizeof(int) * MAX_NUM_PEERS));
 
   // Allocate the main shared memory block and create IPC handle
   // Layout: [data_buffer | barrier_signals | buffer_ptrs | barrier_signal_ptrs]
@@ -119,8 +115,6 @@ void All2All::destroy() {
 
   // Free local GPU memory allocations
   CUDA_CHECK(cudaFree(buffer_ptrs[rank]));
-  CUDA_CHECK(cudaFree(rank_tokens_gpu));
-  CUDA_CHECK(cudaFree(prefix_rank_tokens_gpu));
   destroyed = true;
 }
 
@@ -162,42 +156,9 @@ pybind11::bytearray All2All::get_local_ipc_handle() const {
   return {ipc_handlers[rank].reserved, CUDA_IPC_HANDLE_SIZE};
 }
 
-/**
- * Configures token distribution across ranks for the current batch.
- *
- * This method computes prefix sums needed by the kernels to calculate source
- * and destination offsets. It must be called before any communication operation
- * when the token distribution changes between batches.
- *
- * Example: For rank_num_tokens = {128, 96, 128, 64}
- *   - rank_tokens = {128, 96, 128, 64}
- *   - prefix_rank_tokens = {0, 128, 224, 352}
- *   - total_tokens = 416
- */
-void All2All::set_rank_tokens(const std::vector<int> &rank_num_tokens) {
-  EP_HOST_ASSERT(static_cast<int>(rank_num_tokens.size()) == world_size);
-
-  // Initialize prefix sums to zero
-  for (int i = 0; i < world_size; i++) {
-    prefix_rank_tokens[i] = 0;
-  }
-
-  // Compute prefix sums (exclusive scan)
-  for (int i = 0; i < world_size; i++) {
-    rank_tokens[i] = rank_num_tokens[i];
-    if (i > 0) {
-      prefix_rank_tokens[i] = prefix_rank_tokens[i - 1] + rank_tokens[i - 1];
-    }
-  }
-
-  // Total tokens is the sum of all rank tokens
-  total_tokens = prefix_rank_tokens[world_size - 1] + rank_tokens[world_size - 1];
-
-  // Copy to GPU for kernel access
-  CUDA_CHECK(cudaMemcpy(rank_tokens_gpu, rank_tokens, sizeof(int) * MAX_NUM_PEERS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(
-      cudaMemcpy(prefix_rank_tokens_gpu, prefix_rank_tokens, sizeof(int) * MAX_NUM_PEERS, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaDeviceSynchronize());
+at::Tensor All2All::local_buffer() const {
+  return torch::from_blob(buffer_ptrs[rank], {num_elems},
+                          torch::TensorOptions().dtype(tensor_dtype).device(torch::kCUDA, rank));
 }
 
 /**
@@ -222,8 +183,8 @@ at::Tensor All2All::get_local_buffer_tensor(at::Tensor &x, int batch_size, int o
     return out_tensor;
   } else {
     // Return a view directly into the IPC buffer (zero-copy)
-    auto out_tensor = torch::from_blob(ptr, {batch_size, out_tokens, out_heads, head_size}, x.options());
-    return out_tensor;
+    int64_t numel = int64_t(batch_size) * int64_t(out_tokens) * int64_t(out_heads) * int64_t(head_size);
+    return local_buffer().narrow(0, 0, numel).view({batch_size, out_tokens, out_heads, head_size});
   }
 }
 
@@ -253,8 +214,8 @@ at::Tensor All2All::send_recv_heads(at::Tensor &x, bool copy_output) {
   int num_heads = x.size(2);
   int head_size = x.size(3);
 
-  // Output dimensions after redistribution
-  int out_tokens = total_tokens;          // All tokens from all ranks
+  // Sequence parallelism pads each rank to the same token count.
+  int out_tokens = num_tokens * world_size;
   int out_heads = num_heads / world_size; // Each rank gets 1/world_size of heads
 
   EP_HOST_ASSERT(int64_t(batch_size) * int64_t(out_tokens) * int64_t(out_heads) * int64_t(head_size) *
@@ -265,9 +226,9 @@ at::Tensor All2All::send_recv_heads(at::Tensor &x, bool copy_output) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   // Launch the All2All kernel
-  all2all_cuda::all2all_head_launch(buffer_ptrs_gpu, barrier_signal_ptrs_gpu, x.data_ptr(), prefix_rank_tokens_gpu,
-                                    rank, world_size, batch_size, total_tokens, num_tokens, num_heads, head_size,
-                                    stream, num_sms, tensor_dtype, timeout_cycles_);
+  all2all_cuda::all2all_head_launch(buffer_ptrs_gpu, barrier_signal_ptrs_gpu, x.data_ptr(), rank, world_size,
+                                    batch_size, out_tokens, num_tokens, num_heads, head_size, stream, num_sms,
+                                    tensor_dtype, timeout_cycles_);
 
   return get_local_buffer_tensor(x, batch_size, out_tokens, out_heads, head_size, copy_output, stream);
 }
@@ -296,11 +257,12 @@ at::Tensor All2All::gather_heads(at::Tensor &x, bool copy_output) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   int batch_size = x.size(0);
+  int total_tokens = x.size(1);
   int num_heads = x.size(2) * world_size; // Reconstruct total head count
   int head_size = x.size(3);
 
-  // Output dimensions: this rank's tokens with all heads
-  int out_tokens = rank_tokens[rank];
+  EP_HOST_ASSERT(total_tokens % world_size == 0);
+  int out_tokens = total_tokens / world_size;
   int out_heads = num_heads;
 
   EP_HOST_ASSERT(int64_t(batch_size) * int64_t(out_tokens) * int64_t(out_heads) * int64_t(head_size) *
@@ -308,9 +270,9 @@ at::Tensor All2All::gather_heads(at::Tensor &x, bool copy_output) {
                  tensor_bytes);
 
   // Launch the gather kernel
-  all2all_cuda::all2all_head_gather_launch(buffer_ptrs_gpu, barrier_signal_ptrs_gpu, x.data_ptr(), rank_tokens_gpu,
-                                           prefix_rank_tokens_gpu, rank, world_size, batch_size, total_tokens,
-                                           num_heads, head_size, stream, num_sms, tensor_dtype, timeout_cycles_);
+  all2all_cuda::all2all_head_gather_launch(buffer_ptrs_gpu, barrier_signal_ptrs_gpu, x.data_ptr(), rank, world_size,
+                                           batch_size, total_tokens, num_heads, head_size, stream, num_sms,
+                                           tensor_dtype, timeout_cycles_);
 
   return get_local_buffer_tensor(x, batch_size, out_tokens, out_heads, head_size, copy_output, stream);
 }
@@ -326,7 +288,7 @@ at::Tensor All2All::gather_heads(at::Tensor &x, bool copy_output) {
  *   Input:  [batch, local_seqlen, heads, head_size]  per GPU
  *   Output: [batch, total_seqlen, heads, head_size]  per GPU (identical on all GPUs)
  *
- * Each GPU's tokens are placed at offset prefix_rank_tokens[rank] in the output.
+ * Each GPU's tokens are placed at offset rank * local_seqlen in the output.
  */
 at::Tensor All2All::allgather(at::Tensor &x, bool copy_output) {
   // Validate input tensor properties
@@ -343,8 +305,7 @@ at::Tensor All2All::allgather(at::Tensor &x, bool copy_output) {
   int num_heads = x.size(2);
   int head_size = x.size(3);
 
-  // Output contains all tokens from all ranks
-  int out_tokens = total_tokens;
+  int out_tokens = seqlen * world_size;
   int out_heads = num_heads;
   int hidden_dim = num_heads * head_size;
 
@@ -353,11 +314,101 @@ at::Tensor All2All::allgather(at::Tensor &x, bool copy_output) {
                  tensor_bytes);
 
   // Launch the allgather kernel
-  all2all_cuda::allgather_launch(buffer_ptrs_gpu, barrier_signal_ptrs_gpu, x.data_ptr(), prefix_rank_tokens_gpu, rank,
-                                 world_size, batch_size, seqlen, hidden_dim, total_tokens, stream, num_sms,
-                                 tensor_dtype, timeout_cycles_);
+  all2all_cuda::allgather_launch(buffer_ptrs_gpu, barrier_signal_ptrs_gpu, x.data_ptr(), rank, world_size, batch_size,
+                                 seqlen, hidden_dim, out_tokens, stream, num_sms, tensor_dtype, timeout_cycles_);
 
   return get_local_buffer_tensor(x, batch_size, out_tokens, out_heads, head_size, copy_output, stream);
+}
+
+void All2All::rope_send_recv_heads(at::Tensor &x, at::Tensor &sin_freqs, at::Tensor &cos_freqs, at::Tensor &weights,
+                                   double eps, bool barrier) {
+  EP_HOST_ASSERT(x.dim() == 3 and x.scalar_type() == at::ScalarType::BFloat16);
+  EP_HOST_ASSERT(tensor_dtype == at::ScalarType::BFloat16);
+  EP_HOST_ASSERT(x.device().is_cuda() and x.device().index() == rank);
+  EP_HOST_ASSERT(weights.scalar_type() == at::ScalarType::BFloat16);
+  EP_HOST_ASSERT(cos_freqs.dim() == 4 and sin_freqs.dim() == 4);
+  // The kernel walks x and weights from one base pointer each, so a strided input is made contiguous,
+  // as ops/rms_norm_split_rope.cpp does for x.
+  if (!x.is_contiguous()) {
+    x = x.contiguous();
+  }
+  if (!weights.is_contiguous()) {
+    weights = weights.contiguous();
+  }
+  int b = x.size(0);
+  int s = x.size(1);
+  int h = x.size(2);
+  int n = cos_freqs.size(1);
+  EP_HOST_ASSERT(int64_t(b) * s * world_size * (h / world_size) * int64_t(elementSize(tensor_dtype)) <= tensor_bytes);
+
+  // Same freq-table handling as ops/rms_norm_split_rope.cpp: innermost dim contiguous, outer strides
+  // forwarded, a batch-shared table expanded (stride 0) rather than copied.
+  if (cos_freqs.stride(-1) != 1) {
+    cos_freqs = cos_freqs.contiguous();
+  }
+  if (sin_freqs.stride(-1) != 1) {
+    sin_freqs = sin_freqs.contiguous();
+  }
+  if (cos_freqs.size(0) == 1 && b > 1) {
+    cos_freqs = cos_freqs.expand({b, n, cos_freqs.size(2), cos_freqs.size(3)});
+  }
+  if (sin_freqs.size(0) == 1 && b > 1) {
+    sin_freqs = sin_freqs.expand({b, n, sin_freqs.size(2), sin_freqs.size(3)});
+  }
+
+  at::cuda::CUDAGuard device_guard{x.device()};
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  all2all_cuda::rope_scatter_heads_launch(x.data_ptr(), sin_freqs.data_ptr(), cos_freqs.data_ptr(), weights.data_ptr(),
+                                          static_cast<float>(eps), b, s, n, h, cos_freqs.stride(0), cos_freqs.stride(1),
+                                          cos_freqs.stride(2), sin_freqs.stride(0), sin_freqs.stride(1),
+                                          sin_freqs.stride(2), buffer_ptrs_gpu, barrier_signal_ptrs_gpu, rank,
+                                          world_size, timeout_cycles_, barrier, stream);
+}
+
+void All2All::linear_send_recv_heads(at::Tensor &x, at::Tensor &weight, at::Tensor &bias, bool barrier) {
+  // A blockwise-fp8 exchange quantizes in its own copy kernel; this path writes the GEMM's bf16 output.
+  EP_HOST_ASSERT(tensor_dtype == at::ScalarType::BFloat16);
+  EP_HOST_ASSERT(x.dim() == 3 and x.scalar_type() == tensor_dtype);
+  EP_HOST_ASSERT(weight.dim() == 2 and weight.scalar_type() == tensor_dtype);
+  EP_HOST_ASSERT(bias.dim() == 1 and bias.scalar_type() == tensor_dtype);
+  EP_HOST_ASSERT(x.device().is_cuda() and x.device().index() == rank);
+  int b = x.size(0);
+  int s = x.size(1);
+  int h = weight.size(0);
+  EP_HOST_ASSERT(h % world_size == 0);
+  int64_t cols = h / world_size;
+  int64_t total_tokens = int64_t(s) * world_size;
+  EP_HOST_ASSERT(int64_t(b) * total_tokens * cols * int64_t(elementSize(tensor_dtype)) <= tensor_bytes);
+
+  at::cuda::CUDAGuard device_guard{x.device()};
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto options = x.options();
+  // Peers first, so the NVLink-bound writes start as early as possible.
+  for (int step = 1; step <= world_size; step++) {
+    int target = (rank + step) % world_size;
+    auto w = weight.narrow(0, target * cols, cols);
+    auto bias_slice = bias.narrow(0, target * cols, cols);
+    for (int batch = 0; batch < b; batch++) {
+      int64_t offset = (int64_t(batch) * total_tokens + int64_t(rank) * s) * cols;
+      // A peer buffer is IPC-mapped into this device's address space; pinning the target device skips the
+      // pointer-owner lookup, which would report the peer.
+      auto out =
+          at::for_blob(static_cast<uint8_t *>(buffer_ptrs[target]) + offset * elementSize(tensor_dtype), {s, cols})
+              .options(options)
+              .target_device(x.device())
+              .make_tensor();
+      at::addmm_out(out, bias_slice, x.select(0, batch), w.t());
+    }
+  }
+  if (barrier) {
+    all2all_cuda::fused_barrier_launch(barrier_signal_ptrs_gpu, rank, world_size, timeout_cycles_, stream);
+  }
+}
+
+void All2All::exchange_barrier() {
+  at::cuda::CUDAGuard device_guard{static_cast<c10::DeviceIndex>(rank)};
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  all2all_cuda::fused_barrier_launch(barrier_signal_ptrs_gpu, rank, world_size, timeout_cycles_, stream);
 }
 
 } // namespace all2all
@@ -376,9 +427,6 @@ at::Tensor All2All::allgather(at::Tensor &x, bool copy_output) {
  *   handle = comm.get_local_ipc_handle()
  *   # ... gather handles via NCCL ...
  *   comm.sync(all_handles)
- *
- *   # Set token distribution
- *   comm.set_rank_tokens([128, 128, 128, 128])
  *
  *   # Perform operations
  *   output = comm.send_recv_heads(input_tensor, copy_output=False)
@@ -410,6 +458,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("get_local_ipc_handle", &ltx_kernels::all2all::All2All::get_local_ipc_handle,
            "Returns the IPC handle for this rank's buffer.")
       .def("sync", &ltx_kernels::all2all::All2All::sync, "Opens IPC mappings to all peer GPUs using gathered handles.")
+      .def("local_buffer", &ltx_kernels::all2all::All2All::local_buffer,
+           "Returns the local data buffer, which every operation writes its output into, as a flat tensor.")
       .def("destroy", &ltx_kernels::all2all::All2All::destroy,
            "Releases all GPU resources. Must be called before destruction.")
       .def("send_recv_heads", &ltx_kernels::all2all::All2All::send_recv_heads,
@@ -417,8 +467,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("gather_heads", &ltx_kernels::all2all::All2All::gather_heads,
            "Inverse All2All to gather heads back to original distribution.")
       .def("allgather", &ltx_kernels::all2all::All2All::allgather, "Gathers sequence tokens from all ranks.")
-      .def("set_rank_tokens", &ltx_kernels::all2all::All2All::set_rank_tokens,
-           "Sets token counts per rank for the current batch.")
+      .def("rope_send_recv_heads", &ltx_kernels::all2all::All2All::rope_send_recv_heads,
+           "Fused RMS-norm + split RoPE written straight into every rank's head-exchange buffer.")
+      .def("linear_send_recv_heads", &ltx_kernels::all2all::All2All::linear_send_recv_heads,
+           "Linear projection written straight into every rank's head-exchange buffer.")
+      .def("exchange_barrier", &ltx_kernels::all2all::All2All::exchange_barrier,
+           "Waits until every rank's earlier writes on this stream are visible to every rank.")
       .def("set_timeout_seconds", &ltx_kernels::all2all::All2All::set_timeout_seconds,
            "Sets the barrier timeout in seconds (converted to cycles via the device peak SM clock).");
 }

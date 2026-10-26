@@ -1,44 +1,32 @@
 """Implementation of blockwise FP8/FP6 quantization. Depends on ``ltx_kernels``.
-This module imports the compiled ``ltx_kernels.blockwise`` kernels at top level
-— without them built, simply importing this file raises :class:`ImportError`.
-The intended access path is through ``ltx_core.quantization.blockwise.__init__``
-which catches that and re-raises as a clean :class:`RuntimeError`. Do not import
-this module directly from non-quantization code.
+The ``ltx_kernels`` blockwise activation ops import lazily (without the compiled
+``ops_cpp`` / ``blockwise_cpp`` extensions), so this module probes those
+extensions explicitly at top level: without them built, importing this file
+raises :class:`ImportError`. The intended access path is through
+``ltx_core.quantization.blockwise.__init__`` which catches that and re-raises as
+a clean :class:`RuntimeError`. Do not import this module directly from
+non-quantization code.
 """
 
-from typing import Callable, ClassVar, List, NamedTuple, Protocol, Type
+from typing import Callable, NamedTuple, Protocol, Type
 
+import blockwise_cpp  # noqa: F401 -- import-time probe so the gate fires when the kernels are not built
+import ops_cpp  # noqa: F401 -- import-time probe so the gate fires when the kernels are not built
 import torch
-from ltx_kernels.blockwise.functional import (
-    blockwise_dequantize,
-    blockwise_quantize_adanorm_triton,
-    blockwise_quantize_rms_fma_triton,
-    fp6_blockwise_quantize_weights_torch,
-    fp6_pack_tensor,
-    fp6_unpack_tensor,
-    fp8_blockwise_quantize_weights_torch,
-    gated_attention_triton,
-    rms_norm_rope,
-    rms_norm_split_rope,
-)
 from ltx_kernels.blockwise.linear import BlockwiseFP6Linear, BlockwiseFP8Linear
+from ltx_kernels.blockwise.ops.fp6_pack import fp6_pack_tensor, fp6_unpack_tensor
+from ltx_kernels.blockwise.ops.quantize import (
+    blockwise_dequantize,
+    fp6_blockwise_quantize_weights_torch,
+    fp8_blockwise_quantize_weights_torch,
+)
 from torch import nn
 
 from ltx_core.loader.fuse_loras import FuseRule, bf16_fuse_rule
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import StateDict
 from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
-from ltx_core.model.model_protocol import ModelConfigurator
 from ltx_core.model.transformer import LTXModel
-from ltx_core.model.transformer.model_configurator import LTXModelConfigurator, LTXVideoOnlyModelConfigurator
-from ltx_core.model.transformer.ops import (
-    AdaZeroCallable,
-    GatedAttentionCallable,
-    PostSACallable,
-    PreAttentionCallable,
-)
-from ltx_core.model.transformer.rope import LTXRopeType
-from ltx_core.model.transformer.transformer import TransformerOpsConfig
 
 
 class FromLinearProtocol(Protocol):
@@ -179,81 +167,6 @@ def _create_bias_to_fp32_op(
 
 
 # ---------------------------------------------------------------------------
-# Q8 activation callables (formerly in model.transformer.ops)
-# ---------------------------------------------------------------------------
-
-
-class Q8KernelsPreAttention(PreAttentionCallable):
-    def __call__(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        attn_module: nn.Module,
-        mask: torch.Tensor | None,  # noqa: ARG002
-        pe: torch.Tensor | None,
-        k_pe: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if attn_module.rope_type == LTXRopeType.INTERLEAVED:
-            rope_func = rms_norm_rope
-        elif attn_module.rope_type == LTXRopeType.SPLIT:
-            rope_func = rms_norm_split_rope
-        else:
-            raise ValueError(f"Invalid rope type: {attn_module.rope_type}")
-
-        if pe is not None:
-            k_pe = k_pe if k_pe is not None else pe
-            q = rope_func(q, pe[0], pe[1], attn_module.q_norm.weight, False)
-            k = rope_func(k, k_pe[0], k_pe[1], attn_module.k_norm.weight, False)
-        else:
-            q = attn_module.q_norm(q)
-            k = attn_module.k_norm(k)
-        return q, k
-
-
-class Q8KernelsAdaZeroFunction(AdaZeroCallable):
-    def __call__(
-        self,
-        x: torch.Tensor,
-        eps: float,  # noqa: ARG002
-        scale: torch.Tensor,
-        shift: torch.Tensor,
-    ) -> torch.Tensor:
-        return blockwise_quantize_adanorm_triton(x, None, scale, shift, torch.float8_e4m3fn, 1.0)
-
-
-class Q8KernelsPostSAFunction(PostSACallable):
-    def __call__(
-        self,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        norm_weights: torch.Tensor | None,  # noqa: ARG002
-        eps: float,  # noqa: ARG002
-        gate: torch.Tensor,
-    ) -> List[torch.Tensor]:
-        # Dequantize the fused result: the cross-attention AdaLN path applies a BF16
-        # scale/shift, which cannot operate on the (fp8, scales) payload.
-        normed_fp8 = blockwise_quantize_rms_fma_triton(x, y, gate)
-        return x, blockwise_dequantize(normed_fp8)
-
-
-class Q8KernelsGatedAttention(GatedAttentionCallable):
-    def __call__(
-        self,
-        x: torch.Tensor,
-        attn_out: torch.Tensor,
-        attn_module: nn.Module,
-    ) -> torch.Tensor:
-        # Self-attention path: ``x`` arrives as the ``(fp8, scales)`` tuple
-        # produced by Q8KernelsAdaZeroFunction. Cross-attention path
-        # (apply_cross_attention_adaln) feeds plain BF16, so dequantize only
-        # when needed.
-        if isinstance(x, tuple):
-            x = blockwise_dequantize(x)
-        gate_logits = attn_module.to_gate_logits(x)
-        return gated_attention_triton(attn_out, gate_logits)
-
-
-# ---------------------------------------------------------------------------
 # Fuse rules
 # ---------------------------------------------------------------------------
 
@@ -264,14 +177,14 @@ _BLOCK = 128
 def _blockwise_dequantize_2d(weight_fp8: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
     """Dequantize a 2D blockwise-FP8 weight ``[out, in]`` with per-block scale
     ``[out//128, in//128]`` to BF16.
-    ``ltx_kernels.blockwise.blockwise_dequantize`` is built for 3D activations where
+    ``ltx_kernels.blockwise.ops.quantize.blockwise_dequantize`` is built for 3D activations where
     scales are ``[b*s, in//128]`` — one row per token. Weights are block-
     quantized along the row dim too, so we expand the row axis 128x via
     ``repeat_interleave`` and reuse the kernel.
     """
     out_features, in_features = weight_fp8.shape
     scales_per_row = weight_scale.repeat_interleave(_BLOCK, dim=0)
-    return blockwise_dequantize((weight_fp8.unsqueeze(0), scales_per_row)).view(out_features, in_features)
+    return blockwise_dequantize(weight_fp8.unsqueeze(0), scales_per_row).view(out_features, in_features)
 
 
 def _blockwise_fp8_fuse(
@@ -335,45 +248,6 @@ def _blockwise_fp6_fuse(
         key: new_packed.to(device=weight.device),
         scale_key: new_scale.to(device=weight.device),
     }
-
-
-# ---------------------------------------------------------------------------
-# Configurators (TransformerOpsConfig with Q8 activation callables)
-# ---------------------------------------------------------------------------
-
-
-def _build_blockwise_ops_config() -> TransformerOpsConfig:
-    return TransformerOpsConfig.from_functions(
-        preattention=Q8KernelsPreAttention(),
-        gated_attention=Q8KernelsGatedAttention(),
-        ada_zero=Q8KernelsAdaZeroFunction(),
-        post_sa=Q8KernelsPostSAFunction(),
-    )
-
-
-# FP6 is weight-only; activation ops match FP8.
-_BLOCKWISE_OPS = _build_blockwise_ops_config()
-
-
-class BlockwiseFP8LTXModelConfigurator(ModelConfigurator[LTXModel]):
-    BASE: ClassVar[type[ModelConfigurator[LTXModel]]] = LTXModelConfigurator
-    OPS: ClassVar[TransformerOpsConfig] = _BLOCKWISE_OPS
-
-    @classmethod
-    def from_metadata(cls, metadata: dict) -> LTXModel:
-        return cls.BASE.from_metadata(metadata, ops=cls.OPS)
-
-
-class BlockwiseFP8LTXVideoOnlyModelConfigurator(BlockwiseFP8LTXModelConfigurator):
-    BASE = LTXVideoOnlyModelConfigurator
-
-
-class BlockwiseFP6LTXModelConfigurator(BlockwiseFP8LTXModelConfigurator):
-    pass
-
-
-class BlockwiseFP6LTXVideoOnlyModelConfigurator(BlockwiseFP8LTXVideoOnlyModelConfigurator):
-    pass
 
 
 # ---------------------------------------------------------------------------

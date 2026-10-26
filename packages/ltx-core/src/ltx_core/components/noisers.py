@@ -30,7 +30,7 @@ class GaussianNoiser(Noiser):
     def __call__(self, latent_state: LatentState, noise_scale: float = 1.0) -> LatentState:
         noise = self._sample_noise(latent_state)
         latent = torch.lerp(latent_state.latent.float(), noise.float(), noise_scale)
-        latent = torch.lerp(latent_state.clean_latent.float(), latent, latent_state.denoise_mask)
+        latent = torch.lerp(latent_state.clean_latent.float(), latent, latent_state.denoise_mask.tensor)
         return replace(
             latent_state,
             latent=latent.to(latent_state.latent.dtype),

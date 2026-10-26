@@ -23,7 +23,12 @@ from pathlib import Path
 import typer
 from decode_latents import LatentsDecoder
 from process_captions import compute_captions_embeddings
-from process_videos import (
+from rich.console import Console
+
+from ltx_trainer import logger
+from ltx_trainer.gpu_utils import free_gpu_memory_context
+from ltx_trainer.model_loader import read_video_scale_factors, resolve_video_vae_path
+from ltx_trainer.process_videos import (
     compute_audio_latents,
     compute_audio_masks,
     compute_latents,
@@ -32,11 +37,6 @@ from process_videos import (
     detect_dataset_columns,
     parse_resolution_buckets,
 )
-from rich.console import Console
-
-from ltx_trainer import logger
-from ltx_trainer.gpu_utils import free_gpu_memory_context
-from ltx_trainer.model_loader import read_video_scale_factors, resolve_video_vae_path
 
 console = Console()
 

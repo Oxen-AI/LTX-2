@@ -152,13 +152,13 @@ The `configs/` directory is documented in two places that both contain a trainin
 **Model Interface (Modality-based):**
 
 ```python
-from ltx_core.model.transformer.modality import Modality
+from ltx_core.model.transformer.modality import Modality, TokenTimesteps
 
 video = Modality(
     enabled=True,
     latent=video_latents,  # [B, seq_len, 128] patchified latent tokens
     sigma=sigma,  # [B,] current noise level (per-batch)
-    timesteps=video_timesteps,  # [B, seq_len] per-token timestep embeddings
+    timesteps=TokenTimesteps(video_timesteps),  # [B, seq_len] per-token timesteps (dense form)
     positions=video_positions,  # [B, 3, seq_len, 2] positional coordinates
     context=video_embeds,  # text conditioning embeddings
     context_mask=None,  # optional attention mask for text context
@@ -167,7 +167,7 @@ audio = Modality(
     enabled=True,
     latent=audio_latents,
     sigma=sigma,
-    timesteps=audio_timesteps,
+    timesteps=TokenTimesteps(audio_timesteps),
     positions=audio_positions,  # [B, 1, seq_len, 2]
     context=audio_embeds,
     context_mask=None,
@@ -548,21 +548,23 @@ If you do need a new strategy:
 
 ```python
 from dataclasses import replace
-from ltx_core.model.transformer.modality import Modality
+from ltx_core.model.transformer.modality import Modality, TokenTimesteps
 
 # Create modality — all fields except enabled and masks are required
 video = Modality(
     enabled=True,
     latent=latents,  # [B, seq_len, 128]
     sigma=sigma,  # [B,] — the per-batch noise level
-    timesteps=timesteps,  # [B, seq_len] — per-token (sigma * denoise_mask)
+    timesteps=TokenTimesteps(timesteps),  # [B, seq_len] — per-token (sigma * denoise_mask)
     positions=positions,  # [B, 3, seq_len, 2]
     context=context,  # text embeddings from embeddings_processor
     context_mask=None,
 )
 
 # Update (immutable — must use replace)
-video = replace(video, latent=new_latent, sigma=new_sigma, timesteps=new_timesteps)
+video = replace(
+    video, latent=new_latent, sigma=new_sigma, timesteps=TokenTimesteps(new_timesteps)
+)
 
 # Disable a modality
 audio = replace(audio, enabled=False)

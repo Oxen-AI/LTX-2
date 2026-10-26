@@ -7,7 +7,6 @@ This package provides ready-to-use pipelines for video generation:
 - DistilledPipeline: Fast distilled two-stage generation
 - DubItPipeline: Dub-It with IC-LoRA and audio conditioning
 - ICLoraPipeline: Image/video conditioning with distilled LoRA
-- KeyframeInterpolationPipeline: Keyframe-based video interpolation
 - DFRPipeline: keyframe slots → spatial detailing → optional tiled temporal x2 (Diffusion Fidelity Rendering)
 - RetakePipeline: Regenerate a time region (retake) of an existing video
 For more detailed components and utilities, import from specific submodules
@@ -27,7 +26,6 @@ if TYPE_CHECKING:
     from ltx_pipelines.distilled import DistilledPipeline
     from ltx_pipelines.dubit import DubItPipeline
     from ltx_pipelines.ic_lora import ICLoraPipeline
-    from ltx_pipelines.keyframe_interpolation import KeyframeInterpolationPipeline
     from ltx_pipelines.retake import RetakePipeline
     from ltx_pipelines.t2a_one_stage import T2AOneStagePipeline
     from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
@@ -42,7 +40,6 @@ _EXPORTS = {
     "DistilledPipeline": "ltx_pipelines.distilled",
     "DubItPipeline": "ltx_pipelines.dubit",
     "ICLoraPipeline": "ltx_pipelines.ic_lora",
-    "KeyframeInterpolationPipeline": "ltx_pipelines.keyframe_interpolation",
     "RetakePipeline": "ltx_pipelines.retake",
     "T2AOneStagePipeline": "ltx_pipelines.t2a_one_stage",
     "TI2VidOneStagePipeline": "ltx_pipelines.ti2vid_one_stage",
@@ -55,7 +52,6 @@ __all__ = [
     "DistilledPipeline",
     "DubItPipeline",
     "ICLoraPipeline",
-    "KeyframeInterpolationPipeline",
     "PipelineOutput",
     "RetakePipeline",
     "T2AOneStagePipeline",
