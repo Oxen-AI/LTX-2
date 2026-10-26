@@ -162,7 +162,7 @@ def _to_host(frames: torch.Tensor) -> np.ndarray:
 
 def _open_video_stream(
     container: av.container.Container,
-    fps: int,
+    fps: float,
     height: int,
     width: int,
     frame_converter: FrameConverter,
@@ -170,7 +170,9 @@ def _open_video_stream(
     preset: str,
     thread_count: int,
 ) -> av.video.VideoStream:
-    stream = container.add_stream("libx264", rate=int(fps), options={"crf": str(crf), "preset": preset})
+    # A bound of 1001 keeps NTSC rates, which are multiples of 1000/1001, exact.
+    rate = Fraction(fps).limit_denominator(1001)
+    stream = container.add_stream("libx264", rate=rate, options={"crf": str(crf), "preset": preset})
     stream.width = width
     stream.height = height
     stream.pix_fmt = "yuv420p"
@@ -186,7 +188,7 @@ def _open_video_stream(
 def encode_sdr_h264(  # noqa: PLR0913
     video: Iterator[torch.Tensor],
     *,
-    fps: int,
+    fps: float,
     output_path: str,
     video_chunks_number: int,
     audio: Iterator[Audio] | None = None,
@@ -232,7 +234,8 @@ def encode_sdr_h264(  # noqa: PLR0913
         width = first_slice.shape[-1]
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    container = av.open(output_path, mode="w")
+    # The index goes before the frames so a player can start before the whole file has arrived.
+    container = av.open(output_path, mode="w", options={"movflags": "+faststart"})
     success = False
     try:
         stream = _open_video_stream(container, fps, height, width, frame_converter, crf, preset, thread_count)
@@ -275,7 +278,7 @@ def encode_sdr_h264(  # noqa: PLR0913
 
 def encode_video(  # noqa: PLR0913
     video: torch.Tensor | Iterator[torch.Tensor],
-    fps: int,
+    fps: float,
     audio: Audio | Iterator[Audio] | None,
     output_path: str,
     video_chunks_number: int,

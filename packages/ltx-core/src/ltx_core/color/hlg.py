@@ -153,7 +153,8 @@ class HlgPyAVEncoder:
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         threads = _resolve_x265_thread_count(thread_count)
         container = av.open(str(out_path), mode="w", options={"movflags": "+faststart"})
-        stream = container.add_stream("libx265", rate=Fraction(fps).limit_denominator(1000))
+        # A bound of 1001 keeps NTSC rates, which are multiples of 1000/1001, exact.
+        stream = container.add_stream("libx265", rate=Fraction(fps).limit_denominator(1001))
         stream.width = width
         stream.height = height
         stream.pix_fmt = "yuv420p10le"
